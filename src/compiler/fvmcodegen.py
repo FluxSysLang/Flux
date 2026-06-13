@@ -53,6 +53,7 @@ from fast import (
     ExternBlock,
     FluxVMBlock,
     UsingStatement, NotUsingStatement,
+    InlineAsm,
 )
 from ftypesys import DataType, Operator
 
@@ -533,14 +534,16 @@ class FVMCodegen:
                 self._visit_expr(node.value)
                 self._emit(_instr(Op.GLOBAL_SET, name))
                 return
+            # Any assignment at comptime scope is also a global so inner
+            # function bodies (compiled as separate fn_cg instances) can
+            # access it via GLOBAL_GET.
+            self._block_globals.add(name)
             self._visit_expr(node.value)
             slot = self._alloc_local(name)
-            if name in self._block_globals:
-                self._emit(_instr(Op.DUP))
-                self._emit(_instr(Op.LOCAL_SET, slot))
-                self._emit(_instr(Op.GLOBAL_SET, name))
-            else:
-                self._emit(_instr(Op.LOCAL_SET, slot))
+            self._emit(_instr(Op.DUP))
+            self._emit(_instr(Op.LOCAL_SET, slot))
+            self._emit(_instr(Op.GLOBAL_SET, name))
+            return
         elif isinstance(node.target, MemberAccess):
             # struct.field = value -> LOCAL_GET + val + STRUCT_STORE field + LOCAL_SET
             if node.target.member == '_':
@@ -702,6 +705,7 @@ class FVMCodegen:
         elif t is InExpression:        return self._visit_in_expression(node)
         elif t is CastExpression:      return self._visit_cast(node)
         elif t is TypeConvertExpression: return self._visit_cast(node)
+        elif t is InlineAsm:           return self._visit_inline_asm(node)
         else:
             raise FVMCodegenError(
                 f'fvmcodegen: unsupported expression in comptime: {type(node).__name__}',
@@ -1225,6 +1229,50 @@ class FVMCodegen:
         self._emit(_instr(Op.PUSH, Val(TTag.PTR, slot)))
         return True
 
+    def _visit_inline_asm(self, node: InlineAsm) -> bool:
+        """
+        Emit an INLINE_ASM instruction for an inline asm block.
+        Parses constraints to determine input/output operands and pushes
+        input values onto the stack before the instruction.
+        """
+        import re as _re
+
+        constraints = node.constraints or ''
+
+        # Split constraints into outputs:inputs:clobbers
+        parts = constraints.split(':')
+        outputs_str = parts[0].strip() if len(parts) > 0 else ''
+        inputs_str  = parts[1].strip() if len(parts) > 1 else ''
+
+        # Parse output operands: "=r"(varname)
+        output_names = []
+        if outputs_str:
+            for m in _re.finditer(r'"=r"\((\w+)\)', outputs_str):
+                output_names.append(m.group(1))
+
+        # Parse input operands: "r"(varname)
+        input_names = []
+        if inputs_str:
+            for m in _re.finditer(r'"r"\((\w+)\)', inputs_str):
+                input_names.append(m.group(1))
+
+        n_outputs = len(output_names)
+        n_inputs  = len(input_names)
+
+        # Push input values onto the stack
+        for name in input_names:
+            if name in self._locals:
+                self._emit(_instr(Op.LOCAL_GET, self._locals[name]))
+            elif name in self._outer_globals or name in self._block_globals:
+                self._emit(_instr(Op.GLOBAL_GET, name))
+            else:
+                self._emit(_instr(Op.PUSH, Val(TTag.LONG, 0)))
+
+        self._emit(_instr(Op.INLINE_ASM, node.body, constraints, n_inputs, n_outputs, output_names))
+
+        # If there are outputs, the op pushes a value
+        return n_outputs > 0
+
     def _visit_cast(self, node) -> bool:
         """
         Type cast / type conversion expression: ulong(x), int(y), float(z), etc.
@@ -1281,6 +1329,8 @@ class FVMCodegen:
             'compiler.io.writefile':         Op.COMPILER_WRITEFILE,
             'compiler.fvm.dump':             Op.COMPILER_FVM_DUMP,
             'compiler__fvm__dump':           Op.COMPILER_FVM_DUMP,
+            'compiler.fvm.loadlib':          Op.COMPILER_LOADLIB,
+            'compiler__fvm__loadlib':        Op.COMPILER_LOADLIB,
             'compiler.import.stdlib':        Op.COMPILER_IMPORT_STDLIB,
             'compiler__import__stdlib':      Op.COMPILER_IMPORT_STDLIB,
             'compiler.import.local':         Op.COMPILER_IMPORT_LOCAL,
@@ -1309,7 +1359,10 @@ class FVMCodegen:
             self._emit(_instr(Op.LOCAL_DEREF))
             self._emit(_instr(Op.CALL_PTR, len(node.arguments)))
             return True
-        # Try active using-namespaces for unqualified function names
+        # Try active using-namespaces for unqualified function names.
+        # If known at codegen time, use the qualified name directly.
+        # Otherwise keep the bare name -- the VM suffix-match (__name)
+        # will find it at runtime after imports have registered functions.
         resolved_name = name
         for ns in reversed(self._using_namespaces):
             qualified = f'{ns}__{name}'
@@ -1344,6 +1397,7 @@ class FVMCodegen:
             'compiler.import.stdlib':     Op.COMPILER_IMPORT_STDLIB,
             'compiler.import.local':      Op.COMPILER_IMPORT_LOCAL,
             'compiler.fpm.package':       Op.COMPILER_FPM_PACKAGE,
+            'compiler.fvm.loadlib':        Op.COMPILER_LOADLIB,
         }
         _PUSHES = {Op.COMPILER_INPUT, Op.COMPILER_READFILE}
 
@@ -1454,6 +1508,21 @@ class FVMCodegen:
                     self._emit(_instr(Op.MUL))
                 self._emit(_instr(Op.ADD))
                 self._emit(_instr(Op.LOAD, elem_ttag, elem_bytes))
+                return True
+        # Check if array is a pointer to a known struct type (e.g. BlockEntry*)
+        # Mirror LLVM GEP: offset = index * sizeof(struct), then load struct-sized bytes
+        if isinstance(node.array, Identifier):
+            _arr_name = node.array.name
+            _type_name = self._local_types.get(_arr_name) or self._local_typespecs.get(_arr_name)
+            if isinstance(_type_name, str) and _type_name in self._struct_layouts:
+                _layout = self._struct_layouts[_type_name]
+                _struct_size = _layout.total_size
+                self._visit_expr(node.array)
+                self._visit_expr(node.index)
+                self._emit(_instr(Op.PUSH, Val(TTag.UINT, _struct_size)))
+                self._emit(_instr(Op.MUL))
+                self._emit(_instr(Op.ADD))
+                self._emit(_instr(Op.LOAD, TTag.STRUCT, _struct_size, _type_name))
                 return True
         self._visit_expr(node.array)
         self._visit_expr(node.index)
@@ -1615,8 +1684,12 @@ class FVMCodegen:
         can register it with the VM before execute().
         Parameters are pre-loaded into local slots 0..N-1 by the VM _call() mechanism.
         """
-        fn_cg = FVMCodegen()
+        fn_cg = FVMCodegen(known_functions=dict(self._known_functions))
         fn_cg._outer_globals = set(self._block_globals)
+        fn_cg._using_namespaces = list(self._using_namespaces)
+        fn_cg._struct_layouts = dict(self._struct_layouts)
+        fn_cg._enum_names = set(self._enum_names)
+        fn_cg._macro_table = dict(self._macro_table)
         # Allocate a slot for each parameter so LOCAL_GET/SET work by name
         for param in node.parameters:
             fn_cg._alloc_local(param.name)
@@ -1660,7 +1733,12 @@ class FVMCodegen:
         TypeFuncCall sites can find it by the same mangled name.
         The implicit receiver parameter '_' occupies slot 0.
         """
-        fn_cg = FVMCodegen()
+        fn_cg = FVMCodegen(known_functions=dict(self._known_functions))
+        fn_cg._outer_globals = set(self._block_globals)
+        fn_cg._using_namespaces = list(self._using_namespaces)
+        fn_cg._struct_layouts = dict(self._struct_layouts)
+        fn_cg._enum_names = set(self._enum_names)
+        fn_cg._macro_table = dict(self._macro_table)
         # Slot 0: implicit receiver '_'
         fn_cg._alloc_local('_')
         # Explicit parameters follow
