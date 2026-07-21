@@ -737,7 +737,7 @@ namespace standard
             def print() -> void
             {
 #ifdef __WINDOWS__
-                win_print("\r\n", 1);
+                win_print("\r\n", 2);
 #endif;
 #ifdef __LINUX__
                 nix_print("\n", 1);

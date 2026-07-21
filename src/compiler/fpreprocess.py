@@ -111,25 +111,6 @@ class FXPreprocessor:
         while i < n:
             c = content[i]
 
-            # ── String literal: skip over it intact ──────────────────────────
-            if c == '"' or c == "'":
-                quote = c
-                result.append(c)
-                i += 1
-                while i < n:
-                    sc = content[i]
-                    result.append(sc)
-                    if sc == '\\' and i + 1 < n:
-                        # Escaped character — consume both chars so an escaped
-                        # quote doesn't end the string prematurely.
-                        i += 1
-                        result.append(content[i])
-                    elif sc == quote:
-                        break
-                    i += 1
-                i += 1
-                continue
-
             # ── Block comment: /// ... /// ────────────────────────────────────
             if i + 2 < n and c == '/' and content[i+1] == '/' and content[i+2] == '/':
                 i += 3

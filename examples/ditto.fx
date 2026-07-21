@@ -2,14 +2,22 @@
 
 using standard::io::console;
 
+
+def foo(int a, int b, int c) -> void
+{
+    println(f"{a} {b} {c}");
+};
+
 def main() -> int
 {
-	int i;
-	int x = ++i,
-		y = #",
-		z = #";
+    int i;
+    int x = ++i,
+        y = #",
+        z = #";
 
-	println(z);
-	
-	return 0;
+    foo(x, y, z);
+    foo(y, #", #");
+    foo(z, #", #");
+
+    return 0;
 };

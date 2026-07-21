@@ -483,6 +483,13 @@ class FluxParser:
         self._in_comptime: int = 0  # Nesting depth inside comptime blocks
         # Populated by from_file after preprocessing; maps global line index (0-based) -> (filename, local_line 1-based)
         self._line_map: List[tuple] = []
+        # Ditto-in-args context.
+        # _last_call_expr       -- FunctionCall from the most recent call statement.
+        # _last_noncall_src     -- raw source text of the most recent non-call expression
+        #                          statement that cleared _last_call_expr; shown as the
+        #                          preceding context line in the ditto error message.
+        self._last_call_expr: Optional['FunctionCall'] = None
+        self._last_noncall_src: str = ''
 
     @contextmanager
     def _template_scope(self, params: List[str]):
@@ -544,9 +551,9 @@ class FluxParser:
             self.position = saved_pos
             self.current_token = saved_token
     
-    def error(self, message: str, expected_type=None, prev_token=None, annotation: str = "") -> None:
+    def error(self, message: str, expected_type=None, prev_token=None, annotation: str = "", prev_source_line: str = "") -> None:
         """Raise a parse error with current token context"""
-        raise FluxParseError(message, self.current_token, self._source_lines, expected_type, prev_token, self._line_map, annotation)
+        raise FluxParseError(message, self.current_token, self._source_lines, expected_type, prev_token, self._line_map, annotation, prev_source_line=prev_source_line)
 
     def warn(self, message: str) -> None:
         """Emit a non-fatal compiler warning to stderr with source location context."""
@@ -6231,6 +6238,18 @@ class FluxParser:
         tok = self.current_token
         expr = self.expression()
         self.consume(TokenType.SEMICOLON)
+        # Track ditto-in-args context across statements.
+        if isinstance(expr, FunctionCall):
+            self._last_call_expr = expr
+            self._last_noncall_src = ''
+        else:
+            self._last_call_expr = None
+            # Capture the raw source text of this invalidating statement so the
+            # ditto error can show it as a preceding context line.
+            if self._source_lines and 1 <= tok.line <= len(self._source_lines):
+                self._last_noncall_src = self._source_lines[tok.line - 1].rstrip('\r\n')
+            else:
+                self._last_noncall_src = ''
         return ExpressionStatement(expr).set_location(tok.line, tok.column)
     
     def expression(self) -> Expression:
@@ -8102,8 +8121,11 @@ class FluxParser:
                 tok = self.current_token
                 self.advance()
                 args = []
+                # Determine the callee name (if a plain identifier) so that ditto
+                # tokens inside the argument list can be validated against _last_call_expr.
+                _callee_name_for_ditto = expr.name if isinstance(expr, Identifier) else None
                 if not self.expect(TokenType.RIGHT_PAREN):
-                    args = self.argument_list()
+                    args = self.argument_list(callee_name=_callee_name_for_ditto)
                 self.consume(TokenType.RIGHT_PAREN)
                 if isinstance(expr, Identifier):
                     if expr.name in self._macros:
@@ -8359,16 +8381,54 @@ class FluxParser:
         
         return expr
     
-    def argument_list(self) -> List[Expression]:
+    def argument_list(self, callee_name: str = None) -> List[Expression]:
         """
         argument_list -> expression (',' expression)*
+
+        When callee_name is provided, a DITTO token ('#"') may appear in place of
+        an argument expression.  It repeats the argument at the same position from
+        the most recent function-call expression statement (_last_call_expr).
+
+        Rules (all produce a compiler error on violation):
+          - _last_call_expr must be a FunctionCall (previous statement was a call).
+          - _last_call_expr.name must equal callee_name (same function).
+          - _last_call_expr must have the same arity as the current call being parsed
+            (checked lazily as each ditto is encountered).
         """
-        args = [self.expression()]
-        
+        import copy
+
+        def _parse_one_arg(pos: int) -> Expression:
+            """Parse one argument at position `pos`, handling DITTO."""
+            if callee_name is not None and self.expect(TokenType.DITTO):
+                prev = self._last_call_expr
+                if prev is None or not isinstance(prev, FunctionCall):
+                    self.error(
+                        "Ditto '#\"' in argument list: previous statement is not a function call",
+                        annotation="DITTO disallowed here",
+                        prev_source_line=self._last_noncall_src,
+                    )
+                if isinstance(prev.name, str) and prev.name != callee_name:
+                    self.error(
+                        f"Ditto '#\"' in argument list: previous call was to '{prev.name}', "
+                        f"but current call is to '{callee_name}'",
+                        annotation="DITTO disallowed here",
+                    )
+                if pos >= len(prev.arguments):
+                    self.error(
+                        f"Ditto '#\"' in argument list: argument position {pos} is out of range "
+                        f"(previous call to '{prev.name}' had {len(prev.arguments)} argument(s))",
+                        annotation="DITTO disallowed here",
+                    )
+                self.advance()  # consume DITTO
+                return copy.deepcopy(prev.arguments[pos])
+            return self.expression()
+
+        args = [_parse_one_arg(0)]
+
         while self.expect(TokenType.COMMA):
             self.advance()
-            args.append(self.expression())
-        
+            args.append(_parse_one_arg(len(args)))
+
         return args
 
     def parse_f_string(self, f_string_content: str) -> FStringLiteral:

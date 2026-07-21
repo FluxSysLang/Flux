@@ -201,8 +201,8 @@ def test_multi_stub() -> bool
            f5(ulong) -> ulong = (@)p5;
 
     bool ok = true;
-    ulong x = (ulong)10;
-
+    ulong x = 10ul;
+    
     // --- Round A: initial assignment ---
     print("  Round A (initial patch):\n");
 

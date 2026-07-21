@@ -1990,8 +1990,7 @@ Alternatively you may void cast.
 ---
 
 <a id="the-ditto-operator"></a>
-
-## **The Ditto Operator `#"`**  
+## **The Ditto Operator `#"`**
 The ditto operator repeats the previous initializer expression in a multi-declarator variable declaration. It is shorthand for writing the same expression again.
 ```
 ulong p0 = alloc_stub_page(),
@@ -2019,7 +2018,52 @@ int x = ++i,   // 1
 ```
 Each `#"` produces an independent evaluation of the repeated expression — it is not a reference to the prior variable's value.
 
-`#"` must be followed immediately by `,` or `;`. It is not valid as part of a larger expression (for now).
+`#"` must be followed immediately by `,` or `;` in variable declarations. It is not valid as part of a larger expression (for now).
+
+---
+
+### **Parameterized Ditto in Function Calls**
+
+`#"` may also appear as a function call argument, where it repeats the argument at the same position from the immediately preceding statement, provided that statement was a call to the same function with the same arity.
+
+```
+foo(x, y, z);
+foo(y, #", z);   // identical to foo(y, y, z)
+```
+
+Each `#"` is replaced by a copy of the corresponding positional argument from the previous call — independently evaluated, not a reference.
+
+```
+foo(x, y, z);
+foo(#", #", #");  // identical to foo(x, y, z)
+```
+
+The previous statement must satisfy all of the following, or it is a compiler error:
+
+- It must be a function call statement (not an expression like `a + b`, a variable declaration, a control statement, etc.)
+- It must be a call to the same function name
+- It must have the same number of arguments
+
+```
+foo(x, y, z);
+bar();
+foo(x, #", #");   // error: previous statement was bar, not foo
+
+foo(x, y);
+foo(x, #", #");   // error: arity mismatch (2 vs 3)
+
+foo(x, y, z);
+a + b;
+foo(x, #", #");   // error: previous statement is not a function call
+```
+
+Ditto in argument lists always refers to the **previous statement**, not the previous argument. Chaining across multiple calls works naturally:
+
+```
+foo(x, y, z);   // prints "1 2 3"
+foo(#", #", #"); // prints "1 2 3"
+foo(#", #", #"); // prints "1 2 3"
+```
 
 ---
 

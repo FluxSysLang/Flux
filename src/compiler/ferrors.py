@@ -214,6 +214,7 @@ def _render_diagnostic(
     prev_token=None,
     annotation: str = '',
     fix: Optional[SuggestedFix] = None,
+    prev_source_line: str = '',
 ) -> tuple:
     """
     Render a diagnostic into a formatted string.
@@ -283,15 +284,24 @@ def _render_diagnostic(
 
     header = f"{message} at {display_line_no}:{display_col}"
 
+    # Optional preceding context line. Pass through _expand_tabs in case the
+    # raw line contains literal tab characters; if it is already space-expanded
+    # (as preprocessed source_lines may be) this is a no-op.
+    if prev_source_line:
+        ctx_prev = prev_source_line.expandtabs(TAB_WIDTH)
+        ctx_prefix = f"{ctx_prev}\n"
+    else:
+        ctx_prefix = ""
+
     if suggestion:
-        formatted = f"{header}\n{src_line}\n{caret_line}\n{suggestion}"
+        formatted = f"{header}\n{ctx_prefix}{src_line}\n{caret_line}\n{suggestion}"
     elif annotation:
         if annotation.startswith('//'):
-            formatted = f"{header}\n{src_line}\n{caret_line} {annotation}"
+            formatted = f"{header}\n{ctx_prefix}{src_line}\n{caret_line} {annotation}"
         else:
-            formatted = f"{header}\n{src_line}\n{annotation}\n{caret_line}"
+            formatted = f"{header}\n{ctx_prefix}{src_line}\n{caret_line} {annotation}"
     else:
-        formatted = f"{header}\n{src_line}\n{caret_line}"
+        formatted = f"{header}\n{ctx_prefix}{src_line}\n{caret_line}"
 
     return formatted, display_line_no, display_col
 
@@ -324,28 +334,31 @@ class FluxDiagnosticBase(Exception):
         annotation: str = '',
         fix: Optional[SuggestedFix] = None,
         code: str = None,
+        prev_source_line: str = '',
     ):
-        self.message       = message
-        self.token         = token
-        self.source_lines  = source_lines
-        self.expected_type = expected_type
-        self.prev_token    = prev_token
-        self.line_map      = line_map or []
-        self.annotation    = annotation
-        self.fix           = fix
-        self.code          = code or self.default_code
+        self.message          = message
+        self.token            = token
+        self.source_lines     = source_lines
+        self.expected_type    = expected_type
+        self.prev_token       = prev_token
+        self.line_map         = line_map or []
+        self.annotation       = annotation
+        self.fix              = fix
+        self.code             = code or self.default_code
+        self.prev_source_line = prev_source_line
 
         formatted, self.display_line, self.display_col = _render_diagnostic(
-            severity     = self.severity,
-            code         = self.code,
-            message      = self.message,
-            token        = self.token,
-            source_lines = self.source_lines,
-            line_map     = self.line_map,
-            expected_type= self.expected_type,
-            prev_token   = self.prev_token,
-            annotation   = self.annotation,
-            fix          = self.fix,
+            severity         = self.severity,
+            code             = self.code,
+            message          = self.message,
+            token            = self.token,
+            source_lines     = self.source_lines,
+            line_map         = self.line_map,
+            expected_type    = self.expected_type,
+            prev_token       = self.prev_token,
+            annotation       = self.annotation,
+            fix              = self.fix,
+            prev_source_line = self.prev_source_line,
         )
         super().__init__(formatted)
 
