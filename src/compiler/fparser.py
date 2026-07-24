@@ -490,6 +490,14 @@ class FluxParser:
         #                          preceding context line in the ditto error message.
         self._last_call_expr: Optional['FunctionCall'] = None
         self._last_noncall_src: str = ''
+        # Ditto-as-statement context.
+        # Holds the concrete AST node of the most recently parsed statement so
+        # that a bare `#";` can deep-copy and re-insert it.  Updated by the
+        # statement-loop callers (parse() and block()) after each call to
+        # statement().  When `#";` itself resolves, it stores the copy back here
+        # so that chained `#";` repeat the original, not a meta-ditto node.
+        self._last_stmt: Optional[Statement] = None
+
 
     @contextmanager
     def _template_scope(self, params: List[str]):
@@ -977,8 +985,11 @@ class FluxParser:
                 stmt = self.statement()
                 if isinstance(stmt, list):
                     statements.extend(stmt)
+                    if stmt:
+                        self._last_stmt = stmt[-1]
                 elif stmt:
                     statements.append(stmt)
+                    self._last_stmt = stmt
             except FluxParseError as e:
                 raise
         # Append template instantiations after all other statements so that
@@ -1202,6 +1213,17 @@ class FluxParser:
                          TokenType.FLOAT_KW, TokenType.DOUBLE_KW, TokenType.BOOL_KW, TokenType.VOID,
                          TokenType.SLONG, TokenType.ULONG):
             return self.variable_declaration_statement()
+        elif self.expect(TokenType.DITTO):
+            import copy
+            tok = self.current_token
+            self.advance()  # consume DITTO
+            self.consume(TokenType.SEMICOLON)
+            if self._last_stmt is None:
+                self.error("Ditto operator '#\"' used as a statement before any preceding statement to repeat")
+            duplicated = copy.deepcopy(self._last_stmt)
+            # Store the concrete copy so chained `#";` repeats the original.
+            self._last_stmt = duplicated
+            return duplicated
         elif self.expect(TokenType.SEMICOLON):
             self.advance()
             return None
@@ -5549,8 +5571,10 @@ class FluxParser:
                 # Handle multiple declarations returned as a list
                 if isinstance(stmt, list):
                     statements.extend(stmt)
+                    self._last_stmt = stmt[-1]
                 else:
                     statements.append(stmt)
+                    self._last_stmt = stmt
         
         self.consume(TokenType.RIGHT_BRACE)
         

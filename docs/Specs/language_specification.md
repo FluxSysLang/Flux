@@ -2022,6 +2022,24 @@ Each `#"` produces an independent evaluation of the repeated expression — it i
 
 ---
 
+### **Repeating Statements With Ditto**  
+Using `#"` on its own line will repeat the statement previous to it.  
+Here's a simple example that should be straightforward enough to understand in all applications. Try not to invent edge cases, they don't exist. If the parser would error, it's not an edge case, it's an error.
+```
+#import <standard.fx>;
+
+using standard::io::console;
+
+def main() -> int
+{
+    println("Hello!");
+    #";
+    return 0;
+};
+```
+
+---
+
 ### **Parameterized Ditto in Function Calls**
 
 `#"` may also appear as a function call argument, where it repeats the argument at the same position from the immediately preceding statement, provided that statement was a call to the same function with the same arity.

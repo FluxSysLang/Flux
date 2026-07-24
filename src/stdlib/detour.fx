@@ -46,7 +46,7 @@
 //   d.uninstall();                 // restores the original bytes
 
 #ifndef __FLUX_STANDARD_TYPES__
-#import "types.fx", "datautils.fx";
+#import <types.fx>, <datautils.fx>;
 #endif;
 
 // ============================================================================
@@ -92,6 +92,11 @@ object Detour
         this.hook_addr       = (ulong)0;
         this.trampoline_page = (ulong)0;
         this.installed       = false;
+        return this;
+    };
+    
+    def __expr() -> Detour*
+    {
         return this;
     };
 

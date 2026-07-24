@@ -1,4 +1,4 @@
-#import "standard.fx", "detour.fx";
+#import <standard.fx>, <detour.fx>;
 
 using standard::io::console;
 

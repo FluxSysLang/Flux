@@ -16,7 +16,7 @@ def main() -> int
         z = #";
 
     foo(x, y, z);
-    foo(y, #", #");
+    foo(y, #", 5);
     foo(z, #", #");
 
     return 0;

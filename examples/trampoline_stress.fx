@@ -173,6 +173,13 @@ def test_rapid_retarget() -> bool
                                write_stub(e); #
                                write_stub(f);
 
+#psub patch_targets(a,b,c,d,e,f) patch_target(a, (ulong)@op_double);   #
+                                 patch_target(b, (ulong)@op_add100);   #
+                                 patch_target(c, (ulong)@op_square);   #
+                                 patch_target(d, (ulong)@op_sub7);     #
+                                 patch_target(e, (ulong)@op_xor);      #
+                                 patch_target(f, (ulong)@op_identity);
+
 def test_multi_stub() -> bool
 {
     print("\n[TEST 2] Multi-stub independence (6 concurrent stubs)\n");
@@ -186,12 +193,7 @@ def test_multi_stub() -> bool
 
     write_stubs(p0,p1,p2,p3,p4,p5);
 
-    patch_target(p0, (ulong)@op_double);
-    patch_target(p1, (ulong)@op_add100);
-    patch_target(p2, (ulong)@op_square);
-    patch_target(p3, (ulong)@op_sub7);
-    patch_target(p4, (ulong)@op_xor);
-    patch_target(p5, (ulong)@op_identity);
+    patch_targets(p0,p1,p2,p3,p4,p5);
 
     def{}* f0(ulong) -> ulong = (@)p0,
            f1(ulong) -> ulong = (@)p1,
@@ -253,11 +255,11 @@ def test_multi_stub() -> bool
     ok = pass(f5(x), 20ul)    & ok;
 
     VirtualFree(p0, 0, 0x8000);
-    VirtualFree(p1, 0, 0x8000);
-    VirtualFree(p2, 0, 0x8000);
-    VirtualFree(p3, 0, 0x8000);
-    VirtualFree(p4, 0, 0x8000);
-    VirtualFree(p5, 0, 0x8000);
+    VirtualFree(p1, 0, #");
+    VirtualFree(p2, 0, #");
+    VirtualFree(p3, 0, #");
+    VirtualFree(p4, 0, #");
+    VirtualFree(p5, 0, #");
 
     return ok;
 };
