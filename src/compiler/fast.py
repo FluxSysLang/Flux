@@ -12,7 +12,6 @@ Contributors:
 from dataclasses import dataclass, field
 from typing import List, Any, Optional, Union, Dict, Tuple, ClassVar
 from enum import Enum
-from llvmlite import ir
 from pathlib import Path
 import os, sys
 
@@ -37,11 +36,11 @@ class ASTNode:
         self.source_col  = col
         return self
 
-    def accept(self, visitor, builder: ir.IRBuilder, module: ir.Module) -> Any:
+    def accept(self, visitor, builder, module) -> Any:
         """Dispatch this node through a CodegenVisitor."""
         return visitor.visit(self, builder, module)
 
-    def codegen(self, builder: ir.IRBuilder, module: ir.Module) -> Any:
+    def codegen(self, builder, module) -> Any:
         # Once a node's codegen is removed during migration, this base
         # implementation routes it through the module-level visitor singleton.
         # Nodes that still have their own codegen() override this and never
@@ -142,27 +141,10 @@ class ArrayLiteral(Expression):
             storage_class=storage_class
         )
     
-    def create_global_string(self, module: ir.Module, string_val: str, name_hint: str = "") -> ir.Value:
-        """Create a global string constant."""
-        string_bytes = string_val.encode('ascii')
-        str_array_ty = ir.ArrayType(ir.IntType(8), len(string_bytes))
-        str_val = ir.Constant(str_array_ty, bytearray(string_bytes))
-        
-        # Create unique name
-        if not name_hint:
-            name_hint = f"str_{ArrayLiteral._string_counter}"
-            ArrayLiteral._string_counter += 1
-        
-        gname = f".str.{name_hint}"
-        gv = ir.GlobalVariable(module, str_val.type, name=gname)
-        gv.linkage = 'internal'
-        gv.global_constant = True
-        gv.initializer = str_val
-        
-        # Mark as array pointer for downstream logic
-        gv.type._is_array_pointer = True
-        
-        return gv
+    def create_global_string(self, module, string_val: str, name_hint: str = ""):
+        """Create a global string constant. Delegates to fcodegen."""
+        from fcodegen import _create_global_string as _cgs
+        return _cgs(module, string_val, name_hint, ArrayLiteral)
     
 
 
@@ -343,37 +325,10 @@ class MemberAccess(Expression):
         obj_repr = self.object.name if isinstance(self.object, Identifier) else repr(self.object)
         return f"{obj_repr}.{self.member}"
 
-    def _get_member_ptr(self, builder: ir.IRBuilder, module: ir.Module) -> ir.Value:
+    def _get_member_ptr(self, builder, module):
         """Return the GEP pointer to the member without loading it. Used by ++ and --."""
-        if isinstance(self.object, Identifier):
-            var_name = self.object.name
-            if var_name == "this":
-                obj_val = self.object.codegen(builder, module)
-                if MemberAccessTypeHandler.is_this_double_pointer(obj_val):
-                    obj_val = builder.load(obj_val, name="this_ptr")
-            elif not module.symbol_table.is_global_scope() and module.symbol_table.get_llvm_value(var_name) is not None:
-                obj_val = module.symbol_table.get_llvm_value(var_name)
-            elif var_name in module.globals:
-                obj_val = module.globals[var_name]
-            else:
-                obj_val = self.object.codegen(builder, module)
-        else:
-            obj_val = self.object.codegen(builder, module)
-        # If obj_val is a pointer-to-pointer-to-struct (e.g. local var of pointer type),
-        # load once to get the actual struct pointer before GEP-ing
-        if (isinstance(obj_val.type, ir.PointerType) and
-                isinstance(obj_val.type.pointee, ir.PointerType) and
-                MemberAccessTypeHandler.is_struct_pointer(obj_val.type.pointee)):
-            obj_val = builder.load(obj_val, name="struct_ptr")
-        if isinstance(obj_val.type, ir.PointerType) and MemberAccessTypeHandler.is_struct_pointer(obj_val.type):
-            struct_type = obj_val.type.pointee
-            member_index = MemberAccessTypeHandler.get_member_index(struct_type, self.member)
-            return builder.gep(
-                obj_val,
-                [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), member_index)],
-                inbounds=True
-            )
-        raise ValueError(f"Cannot get member pointer for: {obj_val.type} [{self.source_line}:{self.source_col}]")
+        from fcodegen import _member_access_get_ptr as _mgp
+        return _mgp(self, builder, module)
 
 
 @dataclass
@@ -388,28 +343,10 @@ class MethodCall(Expression):
 
 
 
-def _emit_va_arg(builder: ir.IRBuilder, va_list_i8ptr: ir.Value, arg_type: ir.Type, name: str = '') -> ir.Value:
-    """
-    Emit a va_arg instruction using llvmlite's low-level instruction API.
-    llvmlite's IRBuilder does not expose va_arg directly, so we construct
-    the instruction manually and insert it via builder._insert().
-    The LLVM IR text produced is:  %name = va_arg i8* %ap, <type>
-    """
-    from llvmlite.ir import instructions as _insns
-
-    class _VaArgInstr(_insns.Instruction):
-        """Custom instruction that emits: %name = va_arg <ptr>, <type>"""
-        def __init__(self, parent, typ, ptr, name=''):
-            super().__init__(parent, typ, 'va_arg', [ptr], name)
-            self._va_type = typ
-
-        def descr(self, buf):
-            # Emit:  va_arg <ptr_type> <ptr_value>, <result_type>
-            buf.append(f'va_arg {self.operands[0].type} {self.operands[0].get_reference()}, {self._va_type}\n')
-
-    instr = _VaArgInstr(builder.block, arg_type, va_list_i8ptr, name)
-    builder._insert(instr)
-    return instr
+def _emit_va_arg(builder, va_list_i8ptr, arg_type, name: str = ''):
+    """Emit a va_arg instruction. Delegates to fcodegen."""
+    from fcodegen import _emit_va_arg as _eva
+    return _eva(builder, va_list_i8ptr, arg_type, name)
 
 
 @dataclass
@@ -1015,20 +952,15 @@ class FunctionPointerDeclaration(Statement):
         return f"{cc}{{}}* {self.name}{self.fp_type}"
 
     @staticmethod
-    def get_llvm_type(func_ptr, module: ir.Module) -> ir.FunctionType:
-        """Convert to LLVM function type"""
-        ret_type = func_ptr.return_type.get_llvm_type(func_ptr, module)
-        param_types = [param.get_llvm_type(func_ptr, module) for param in func_ptr.parameter_types]
-        return ir.FunctionType(ret_type, param_types)
+    def get_llvm_type(func_ptr, module):
+        """Convert to LLVM function type. Delegates to fcodegen."""
+        from fcodegen import _fp_decl_get_llvm_type as _fgt
+        return _fgt(func_ptr, module)
 
 def _get_fp_cconv(pointer_expr, module) -> Optional[str]:
     """Look up the LLVM calling convention for an indirect call through a named function pointer."""
-    name = None
-    if isinstance(pointer_expr, Identifier):
-        name = pointer_expr.name
-    if name and hasattr(module, '_flux_fp_calling_convs'):
-        return module._flux_fp_calling_convs.get(name)
-    return None
+    from fcodegen import _get_fp_cconv as _gfc
+    return _gfc(pointer_expr, module)
 
 @dataclass
 class FunctionPointerCall(Expression):
@@ -1147,46 +1079,12 @@ class StructVTable:
     total_bytes: int
     alignment: int
     fields: List[Tuple[str, int, int, int]]  # (name, bit_offset, bit_width, alignment)
-    field_types: Dict[str, ir.Type] = field(default_factory=dict)  # field_name -> LLVM type
-    
-    def to_llvm_constant(self, module: ir.Module) -> ir.Constant:
-        """
-        Generate LLVM IR constant for vtable metadata.
-        
-        Format:
-        {
-            i32 total_bits,
-            i32 field_count,
-            [N x {i32 offset, i32 width, i32 alignment}] fields
-        }
-        """
-        i32 = ir.IntType(32) # REPLACE WITH CODE TO EVALUATE INSTEAD OF HARD-CODE
-        
-        # Create field metadata array type
-        field_type = ir.LiteralStructType([i32, i32, i32])
-        field_array_type = ir.ArrayType(field_type, len(self.fields))
-        
-        # Build field array
-        field_constants = []
-        for name, offset, width, alignment in self.fields:
-            field_constants.append(ir.Constant(field_type, [
-                ir.Constant(i32, offset),
-                ir.Constant(i32, width),
-                ir.Constant(i32, alignment)
-            ]))
-        
-        # Build vtable struct
-        vtable_type = ir.LiteralStructType([
-            i32,              # total_bits
-            i32,              # field_count
-            field_array_type  # fields
-        ])
-        
-        return ir.Constant(vtable_type, [
-            ir.Constant(i32, self.total_bits),
-            ir.Constant(i32, len(self.fields)),
-            ir.Constant(field_array_type, field_constants)
-        ])
+    field_types: Dict[str, Any] = field(default_factory=dict)  # field_name -> LLVM type (managed by fcodegen)
+
+    def to_llvm_constant(self, module):
+        """Generate LLVM IR constant for vtable metadata. Delegates to fcodegen."""
+        from fcodegen import _struct_vtable_to_llvm_constant as _svtc
+        return _svtc(self, module)
 
 # Struct definition
 @dataclass
@@ -1205,7 +1103,7 @@ class StructDef(ASTNode):
     template_params: List[str] = field(default_factory=list)
     comptime_blocks: List = field(default_factory=list)  # (insert_index, ComptimeBlock) pairs
     
-    def calculate_vtable(self, module: ir.Module) -> StructVTable:
+    def calculate_vtable(self, module) -> 'StructVTable':
             """Calculate struct layout and generate TLD."""
             vtable = StructTypeHandler.calculate_vtable(self.members, module)
             vtable.struct_name = self.name
@@ -1251,26 +1149,15 @@ class StructRecast(Expression):
 # Helper Functions
 # ============================================================================
 
-def register_struct_type(module: ir.Module, type_name: str, bit_width: int, alignment: int):
-    """
-    Register a custom type in the module's type registry.
-    
-    Used for `unsigned data{N:M} as typename` declarations.
-    """
-    if not hasattr(module, '_custom_types'):
-        module._custom_types = {}
-    
-    module._custom_types[type_name] = {
-        'bit_width': bit_width,
-        'alignment': alignment
-        #'endianness': endianness
-    }
+def register_struct_type(module, type_name: str, bit_width: int, alignment: int):
+    """Register a custom type in the module's type registry. Delegates to fcodegen."""
+    from fcodegen import register_struct_type as _rst
+    return _rst(module, type_name, bit_width, alignment)
 
-def get_struct_vtable(module: ir.Module, struct_name: str) -> Optional[StructVTable]:
-    """Get vtable for a struct type"""
-    if not hasattr(module, '_struct_vtables'):
-        return None
-    return module._struct_vtables.get(struct_name)
+def get_struct_vtable(module, struct_name: str) -> Optional['StructVTable']:
+    """Get vtable for a struct type. Delegates to fcodegen."""
+    from fcodegen import get_struct_vtable as _gsv
+    return _gsv(module, struct_name)
 
 # Trait definition (compile-time only, no IR output)
 @dataclass
@@ -1335,52 +1222,11 @@ class ObjectDef(ASTNode):
     template_params: List[str] = field(default_factory=list)
     interfaces: List[Tuple[str, List[str]]] = field(default_factory=list)
 
-    def codegen_type_only(self, module: ir.Module) -> ir.Type:
+    def codegen_type_only(self, module):
         """Register the struct type and symbol table entry for this object without emitting method bodies.
         Called as a pre-pass so namespace-level functions can reference object types."""
-        ObjectTypeHandler.initialize_object_storage(module)
-
-        # Already registered (e.g. forward declaration processed earlier) - skip
-        if hasattr(module, '_struct_types') and self.name in module._struct_types:
-            existing_type = module._struct_types[self.name]
-            if existing_type.elements:
-                # Full definition already registered - nothing to do
-                return existing_type
-            # Opaque forward-decl exists; fill it in now if we have members
-            if not self.members:
-                return existing_type
-
-        # Forward declaration with no members - create opaque type
-        if not self.members and not self.methods:
-            opaque_struct = ir.global_context.get_identified_type(self.name)
-            opaque_struct.names = []
-            if not hasattr(module, '_struct_types'):
-                module._struct_types = {}
-            module._struct_types[self.name] = opaque_struct
-            if hasattr(module, 'symbol_table'):
-                module.symbol_table.define(
-                    self.name, SymbolKind.STRUCT,
-                    type_spec=None, llvm_type=opaque_struct, llvm_value=None)
-            return opaque_struct
-
-        # Create member types and register struct
-        member_types, member_names = ObjectTypeHandler.create_member_types(self.members, module)
-        struct_type = ObjectTypeHandler.create_struct_type(self.name, member_types, member_names, module)
-        fields = ObjectTypeHandler.calculate_field_layout(self.members, member_types)
-        ObjectTypeHandler.create_vtable(self.name, fields, module)
-
-        if hasattr(module, 'symbol_table'):
-            module.symbol_table.define(
-                self.name, SymbolKind.STRUCT,
-                type_spec=None, llvm_type=struct_type, llvm_value=None)
-
-        # Predeclare methods so they are in module.globals for cross-references
-        for method in self.methods:
-            func_type, func_name = ObjectTypeHandler.create_method_signature(
-                self.name, method.name, method, struct_type, module)
-            ObjectTypeHandler.predeclare_method(func_type, func_name, method, module)
-
-        return struct_type
+        from fcodegen import _object_def_codegen_type_only as _oct
+        return _oct(self, module)
 
 @dataclass
 class ExternBlock(Statement):
@@ -1445,62 +1291,11 @@ class NamespaceDef(ASTNode):
         return result
 
     @staticmethod
-    def preregister_all_types(ns: 'NamespaceDef', module: ir.Module, excluded: set = None) -> None:
+    def preregister_all_types(ns: 'NamespaceDef', module, excluded: set = None) -> None:
         """Recursively walk the namespace tree and pre-register every object struct type
-        before any method bodies are emitted.  Uses a retry loop so forward references
-        between objects (e.g. FreeNode* inside another object) resolve in dependency order."""
-        from fcodegen import visitor as _visitor
-        if excluded is None:
-            excluded = getattr(module, '_excluded_namespaces', set())
-
-        # Pre-register namespace global variables (constants) before resolving struct/object
-        # member types.  Object members may use namespace-scoped constants as array dimensions
-        # (e.g. ArgDef[ARGPARSE_MAX_DEFS] defs), and get_llvm_type resolves those by looking
-        # them up in module.globals.  Without this step the constant is not in module.globals
-        # yet when struct layout runs, and the array member degrades to a pointer.
-        def _preregister_ns_vars(sub_ns, parent_path=''):
-            full_name = f"{parent_path}__{sub_ns.name}" if parent_path else sub_ns.name
-            if full_name in excluded:
-                return
-            for excl in excluded:
-                if full_name.startswith(excl + "__"):
-                    return
-            for var in sub_ns.variables:
-                try:
-                    _visitor._ns_variable(full_name, var, module)
-                except Exception:
-                    pass  # silently skip; will be retried properly in visit_NamespaceDef
-            for nested in sub_ns.nested_namespaces:
-                _preregister_ns_vars(nested, full_name)
-        _preregister_ns_vars(ns)
-
-        pending = NamespaceDef._collect_all_ns_objects(ns, excluded)
-        max_passes = len(pending) + 1
-        for _ in range(max_passes):
-            if not pending:
-                break
-            still_pending = []
-            for entry in pending:
-                kind, ns_name, item = entry
-                try:
-                    if kind == 'struct':
-                        _visitor._ns_struct(ns_name, item, None, module)
-                    else:
-                        _visitor._ns_object_type_only(ns_name, item, module)
-                except Exception:
-                    still_pending.append(entry)
-            if len(still_pending) == len(pending):
-                # No progress made - run once more without catching to surface the real error
-                for entry in still_pending:
-                    kind, ns_name, item = entry
-                    if kind == 'struct':
-                        _visitor._ns_struct(ns_name, item, None, module)
-                    else:
-                        _visitor._ns_object_type_only(ns_name, item, module)
-                break
-            pending = still_pending
-
-        return None
+        before any method bodies are emitted. Delegates to fcodegen."""
+        from fcodegen import _namespace_preregister_all_types as _npat
+        return _npat(ns, module, excluded)
 
 # Import statement
 @dataclass

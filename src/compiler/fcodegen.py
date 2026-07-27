@@ -209,6 +209,211 @@ def get_struct_vtable(module: ir.Module, struct_name: str):
 
 
 # ---------------------------------------------------------------------------
+# Functions moved from fast.py to decouple LLVM from the AST
+# ---------------------------------------------------------------------------
+
+def _create_global_string(module: ir.Module, string_val: str, name_hint: str, array_literal_cls) -> ir.Value:
+    """Create a global string constant (formerly ArrayLiteral.create_global_string)."""
+    string_bytes = string_val.encode('ascii')
+    str_array_ty = ir.ArrayType(ir.IntType(8), len(string_bytes))
+    str_val = ir.Constant(str_array_ty, bytearray(string_bytes))
+
+    if not name_hint:
+        name_hint = f"str_{array_literal_cls._string_counter}"
+        array_literal_cls._string_counter += 1
+
+    gname = f".str.{name_hint}"
+    gv = ir.GlobalVariable(module, str_val.type, name=gname)
+    gv.linkage = 'internal'
+    gv.global_constant = True
+    gv.initializer = str_val
+
+    # Mark as array pointer for downstream logic
+    gv.type._is_array_pointer = True
+
+    return gv
+
+
+def _member_access_get_ptr(node, builder: ir.IRBuilder, module: ir.Module) -> ir.Value:
+    """Return the GEP pointer to the member without loading it. Used by ++ and --.
+    (Formerly MemberAccess._get_member_ptr.)"""
+    from fast import Identifier
+    if isinstance(node.object, Identifier):
+        var_name = node.object.name
+        if var_name == "this":
+            obj_val = node.object.codegen(builder, module)
+            if MemberAccessTypeHandler.is_this_double_pointer(obj_val):
+                obj_val = builder.load(obj_val, name="this_ptr")
+        elif not module.symbol_table.is_global_scope() and module.symbol_table.get_llvm_value(var_name) is not None:
+            obj_val = module.symbol_table.get_llvm_value(var_name)
+        elif var_name in module.globals:
+            obj_val = module.globals[var_name]
+        else:
+            obj_val = node.object.codegen(builder, module)
+    else:
+        obj_val = node.object.codegen(builder, module)
+    # If obj_val is a pointer-to-pointer-to-struct (e.g. local var of pointer type),
+    # load once to get the actual struct pointer before GEP-ing
+    if (isinstance(obj_val.type, ir.PointerType) and
+            isinstance(obj_val.type.pointee, ir.PointerType) and
+            MemberAccessTypeHandler.is_struct_pointer(obj_val.type.pointee)):
+        obj_val = builder.load(obj_val, name="struct_ptr")
+    if isinstance(obj_val.type, ir.PointerType) and MemberAccessTypeHandler.is_struct_pointer(obj_val.type):
+        struct_type = obj_val.type.pointee
+        member_index = MemberAccessTypeHandler.get_member_index(struct_type, node.member)
+        return builder.gep(
+            obj_val,
+            [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), member_index)],
+            inbounds=True
+        )
+    raise ValueError(
+        f"Cannot get member pointer for: {obj_val.type} [{node.source_line}:{node.source_col}]")
+
+
+def _struct_vtable_to_llvm_constant(vtable, module: ir.Module) -> ir.Constant:
+    """Generate LLVM IR constant for vtable metadata. (Formerly StructVTable.to_llvm_constant.)
+
+    Format: { i32 total_bits, i32 field_count, [N x {i32 offset, i32 width, i32 alignment}] fields }
+    """
+    i32 = ir.IntType(32)  # REPLACE WITH CODE TO EVALUATE INSTEAD OF HARD-CODE
+
+    field_type = ir.LiteralStructType([i32, i32, i32])
+    field_array_type = ir.ArrayType(field_type, len(vtable.fields))
+
+    field_constants = []
+    for name, offset, width, alignment in vtable.fields:
+        field_constants.append(ir.Constant(field_type, [
+            ir.Constant(i32, offset),
+            ir.Constant(i32, width),
+            ir.Constant(i32, alignment)
+        ]))
+
+    vtable_type = ir.LiteralStructType([
+        i32,              # total_bits
+        i32,              # field_count
+        field_array_type  # fields
+    ])
+
+    return ir.Constant(vtable_type, [
+        ir.Constant(i32, vtable.total_bits),
+        ir.Constant(i32, len(vtable.fields)),
+        ir.Constant(field_array_type, field_constants)
+    ])
+
+
+def _fp_decl_get_llvm_type(func_ptr, module: ir.Module) -> ir.FunctionType:
+    """Convert a FunctionPointerDeclaration to LLVM function type.
+    (Formerly FunctionPointerDeclaration.get_llvm_type.)"""
+    ret_type = func_ptr.return_type.get_llvm_type(func_ptr, module)
+    param_types = [param.get_llvm_type(func_ptr, module) for param in func_ptr.parameter_types]
+    return ir.FunctionType(ret_type, param_types)
+
+
+def _object_def_codegen_type_only(node, module: ir.Module):
+    """Register the struct type and symbol table entry for an ObjectDef without emitting method bodies.
+    Called as a pre-pass so namespace-level functions can reference object types.
+    (Formerly ObjectDef.codegen_type_only.)"""
+    ObjectTypeHandler.initialize_object_storage(module)
+
+    # Already registered (e.g. forward declaration processed earlier) - skip
+    if hasattr(module, '_struct_types') and node.name in module._struct_types:
+        existing_type = module._struct_types[node.name]
+        if existing_type.elements:
+            return existing_type
+        if not node.members:
+            return existing_type
+
+    # Forward declaration with no members - create opaque type
+    if not node.members and not node.methods:
+        opaque_struct = ir.global_context.get_identified_type(node.name)
+        opaque_struct.names = []
+        if not hasattr(module, '_struct_types'):
+            module._struct_types = {}
+        module._struct_types[node.name] = opaque_struct
+        if hasattr(module, 'symbol_table'):
+            module.symbol_table.define(
+                node.name, SymbolKind.STRUCT,
+                type_spec=None, llvm_type=opaque_struct, llvm_value=None)
+        return opaque_struct
+
+    # Create member types and register struct
+    member_types, member_names = ObjectTypeHandler.create_member_types(node.members, module)
+    struct_type = ObjectTypeHandler.create_struct_type(node.name, member_types, member_names, module)
+    fields = ObjectTypeHandler.calculate_field_layout(node.members, member_types)
+    ObjectTypeHandler.create_vtable(node.name, fields, module)
+
+    if hasattr(module, 'symbol_table'):
+        module.symbol_table.define(
+            node.name, SymbolKind.STRUCT,
+            type_spec=None, llvm_type=struct_type, llvm_value=None)
+
+    # Predeclare methods so they are in module.globals for cross-references
+    for method in node.methods:
+        func_type, func_name = ObjectTypeHandler.create_method_signature(
+            node.name, method.name, method, struct_type, module)
+        ObjectTypeHandler.predeclare_method(func_type, func_name, method, module)
+
+    return struct_type
+
+
+def _namespace_preregister_all_types(ns, module: ir.Module, excluded: set = None) -> None:
+    """Recursively walk the namespace tree and pre-register every object struct type
+    before any method bodies are emitted. Uses a retry loop so forward references
+    between objects (e.g. FreeNode* inside another object) resolve in dependency order.
+    (Formerly NamespaceDef.preregister_all_types.)"""
+    from fast import NamespaceDef
+    if excluded is None:
+        excluded = getattr(module, '_excluded_namespaces', set())
+
+    # Pre-register namespace global variables (constants) before resolving struct/object
+    # member types. Object members may use namespace-scoped constants as array dimensions
+    # (e.g. ArgDef[ARGPARSE_MAX_DEFS] defs), and get_llvm_type resolves those by looking
+    # them up in module.globals. Without this step the constant is not in module.globals
+    # yet when struct layout runs, and the array member degrades to a pointer.
+    def _preregister_ns_vars(sub_ns, parent_path=''):
+        full_name = f"{parent_path}__{sub_ns.name}" if parent_path else sub_ns.name
+        if full_name in excluded:
+            return
+        for excl in excluded:
+            if full_name.startswith(excl + "__"):
+                return
+        for var in sub_ns.variables:
+            try:
+                visitor._ns_variable(full_name, var, module)
+            except Exception:
+                pass  # silently skip; will be retried properly in visit_NamespaceDef
+        for nested in sub_ns.nested_namespaces:
+            _preregister_ns_vars(nested, full_name)
+    _preregister_ns_vars(ns)
+
+    pending = NamespaceDef._collect_all_ns_objects(ns, excluded)
+    max_passes = len(pending) + 1
+    for _ in range(max_passes):
+        if not pending:
+            break
+        still_pending = []
+        for entry in pending:
+            kind, ns_name, item = entry
+            try:
+                if kind == 'struct':
+                    visitor._ns_struct(ns_name, item, None, module)
+                else:
+                    visitor._ns_object_type_only(ns_name, item, module)
+            except Exception:
+                still_pending.append(entry)
+        if len(still_pending) == len(pending):
+            # No progress made - run once more without catching to surface the real error
+            for entry in still_pending:
+                kind, ns_name, item = entry
+                if kind == 'struct':
+                    visitor._ns_struct(ns_name, item, None, module)
+                else:
+                    visitor._ns_object_type_only(ns_name, item, module)
+            break
+        pending = still_pending
+
+
+# ---------------------------------------------------------------------------
 # Source location helper
 # ---------------------------------------------------------------------------
 
