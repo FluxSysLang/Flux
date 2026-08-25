@@ -70,7 +70,7 @@ def main():
     original_stdout = sys.stdout
     debug_file = None
 
-    with open("version.txt", "r") as f:
+    with open(FLUXC_SRCDIR / "version.txt", "r") as f:
         f.seek(0)
         data = f.read()
         print(data)
