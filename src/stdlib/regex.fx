@@ -311,7 +311,7 @@ namespace standard
 				int i;
 				while (i < REGEX_MAX_CLASS)
 				{
-					cls.bytes[i] = cls.bytes[i] `^^ (byte)0xFF;
+					cls.bytes[i] = cls.bytes[i] `^| (byte)0xFF;
 					i++;
 				};
 				// Remove \n from negated class so [^x] doesn't match newlines.
@@ -443,7 +443,7 @@ namespace standard
 						int fi;
 						while (fi < REGEX_MAX_CLASS)
 						{
-							cls.bytes[fi] = cls.bytes[fi] `^^ (byte)0xFF;
+							cls.bytes[fi] = cls.bytes[fi] `^| (byte)0xFF;
 							fi++;
 						};
 						int nl_byte = 10 >> 3;

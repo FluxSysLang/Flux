@@ -42,9 +42,9 @@ def main() -> int
     int x = 5;
     int y = 0;
 
-    x ^^= y;
-    y ^^= x;
-    x ^^= y;
+    x ^|= y;
+    y ^|= x;
+    x ^|= y;
 
     switch (x)
     {

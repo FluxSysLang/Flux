@@ -13,7 +13,7 @@
    - set_bnd deferred to end of lin_solve iteration loop
 ///
 
-#import <standard.fx>, <vectors.fx>, <windows.fx>, <opengl.fx>, <threading.fx>;
+#import <standard.fx>, <opengl.fx>, <vectors.fx>, <threading.fx>;
 
 using standard::math,
       standard::vectors,
@@ -1658,8 +1658,11 @@ def int_to_str(int val, byte* buf) -> int
     if (val < 0) { val = 0; };
     if (val == 0)
     {
-        buf[0] = 48;   // '0'
-        buf[1] = 0;
+        buf
+        {
+            [0] = 48;   // '0'
+            [1] = 0;
+        };
         return 1;
     };
 
@@ -1680,8 +1683,11 @@ def int_to_str(int val, byte* buf) -> int
     while (i < j)
     {
         t       = buf[i];
-        buf[i]  = buf[j];
-        buf[j]  = t;
+        buf
+        {
+            [i]  = buf[j];
+            [j]  = t;
+        };
         i++;
         j--;
     };

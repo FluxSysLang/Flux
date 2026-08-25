@@ -45,8 +45,8 @@ def fhf_hmac(byte* key, int key_len,
     for (i = 0; i < 64; i++)
     {
         byte k = (i < key_len) ? key[i] : (byte)0;
-        ipad[i] = k ^^ (byte)0x36;
-        opad[i] = k ^^ (byte)0x5C;
+        ipad[i] = k ^| (byte)0x36;
+        opad[i] = k ^| (byte)0x5C;
     };
 
     // inner = SHA256(ipad || msg)
@@ -77,7 +77,7 @@ def fhf_sig_equal(byte* a, byte* b) -> bool
     int i;
     for (i = 0; i < 32; i++)
     {
-        acc = acc | (a[i] ^^ b[i]);
+        acc = acc | (a[i] ^| b[i]);
     };
     return acc == (byte)0;
 };
@@ -148,8 +148,8 @@ def fhf_sign_bundle(FHFManager*      mgr,
     for (i = 0; i < 64; i++)
     {
         byte k = mgr.hmac_key[i];
-        ipad[i] = k ^^ (byte)0x36;
-        opad[i] = k ^^ (byte)0x5C;
+        ipad[i] = k ^| (byte)0x36;
+        opad[i] = k ^| (byte)0x5C;
     };
 
     // inner = SHA256(ipad || all_entry_headers || all_payloads)
@@ -191,8 +191,8 @@ def fhf_verify_bundle(FHFManager*      mgr,
     for (i = 0; i < 64; i++)
     {
         byte k = mgr.hmac_key[i];
-        ipad[i] = k ^^ (byte)0x36;
-        opad[i] = k ^^ (byte)0x5C;
+        ipad[i] = k ^| (byte)0x36;
+        opad[i] = k ^| (byte)0x5C;
     };
 
     byte[32] inner;

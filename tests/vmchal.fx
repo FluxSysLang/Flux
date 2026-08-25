@@ -10,12 +10,12 @@ def main() -> int
 
     for (b in bytes)
     {
-        println(int(b `^^ 0x55));
+        println(int(b `^| 0x55));
     };
 
     for (b in bytes2)
     {
-        print_hex(int(b `^^ 0x55)); print();
+        print_hex(int(b `^| 0x55)); print();
     };
 
     return 0;

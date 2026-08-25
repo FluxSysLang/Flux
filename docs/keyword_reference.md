@@ -12,7 +12,29 @@ Not all keywords have examples just yet.
 **`alignof`**
 Returns the alignment requirement of a type in bits.
 ```
-alignof(int)   // 32, dependent on target system, and configurable.
+#import <standard.fx>;
+
+using standard::io::console;
+
+def main() -> int
+{
+    data{32:64} as u32_a64; // Unsigned 32-bit int, 64-bit aligned.
+
+    u32_a64 trees = 200;
+
+    while (trees-- > alignof(u32_a64))
+    {
+        println(f"Chopping a tree! {trees--} left!");
+    };
+
+    return 0;
+};
+```
+Last 3 lines of output:
+```
+Chopping a tree! 69 left!
+Chopping a tree! 67 left!
+Chopping a tree! 65 left!
 ```
 
 ---
@@ -20,7 +42,44 @@ alignof(int)   // 32, dependent on target system, and configurable.
 **`and`**
 Logical AND operator. Equivalent to `&`.
 ```
-if (x > 0 and y > 0) { ... };
+#import <standard.fx>;
+
+using standard::io::console;
+
+struct Point2D
+{
+    int x, y;
+};
+
+def main() -> int
+{
+    Point2D a = {20, 50};
+    Point2D b = {10, 100};
+
+    float x = a.x / b.x,
+          y = a.y / b.y;
+
+    if (x > 0f and y > 0f)
+    {
+        println(x);
+        println(y);
+    }
+    else
+    {
+        println("Integer division of floats will fail. Convert beforehand.");
+    };
+
+    x = float(a.x) / float(b.x);
+    y = float(a.y) / float(b.y);
+
+    if (x > 0f and y > 0f)
+    {
+        println(x);
+        println(y);
+    };
+
+    return 0;
+};
 ```
 
 ---
@@ -476,7 +535,7 @@ fastcall foo(int x) -> int { return x; };
 ---
 
 **`float`**
-64-bit floating point type. Same as `double`.
+32-bit floating point type.
 ```
 float x = 3.14159;
 ```
@@ -992,7 +1051,7 @@ void* p = (void*)void; // (void*)0;
 ---
 
 **`volatile`**
-Prevents the compiler from optimizing accesses to a variable or assembly block.
+Prevents the compiler from optimizing accesses to a variable or assembly block. Use this when you have assembly you do not want modified at all through optimization. You may have desired side effects get removed by optimization, and `volatile` prevents that.
 ```
 volatile int x = 0;
 volatile asm { ... };

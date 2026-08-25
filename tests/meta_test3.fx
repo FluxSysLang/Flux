@@ -1,0 +1,186 @@
+#import <standard.fx>;
+
+using standard::io::console;
+
+// -------------------------------------------------------------------
+// Compile-time bitfield generator
+// -------------------------------------------------------------------
+
+comptime
+{
+    struct FieldSpec
+    {
+        byte* name;
+        int width;
+        int is_signed;
+        int default_val;
+    };
+
+    FieldSpec[4] color_fields =
+    [
+        {name = g"r", width = 8, is_signed = 0, default_val = 0},
+        {name = g"g", width = 8, is_signed = 0, default_val = 0},
+        {name = g"b", width = 8, is_signed = 0, default_val = 0},
+        {name = g"a", width = 8, is_signed = 0, default_val = 255}
+    ];
+
+    FieldSpec[5] control_fields =
+    [
+        {name = g"enable",   width = 1,  is_signed = 0, default_val = 0},
+        {name = g"mode",     width = 3,  is_signed = 0, default_val = 0},
+        {name = g"speed",    width = 8,  is_signed = 1, default_val = 0},
+        {name = g"gain",     width = 8,  is_signed = 1, default_val = 10},
+        {name = g"reserved", width = 12, is_signed = 0, default_val = 0}
+    ];
+
+    // -------------------------------------------------------------------
+    // Generate a bitfield object from a field spec
+    // -------------------------------------------------------------------
+    def gen_bitfield(byte* name, FieldSpec[] fields) -> void
+    {
+        int total_bits = 0;
+        int i = 0;
+        while (i < fields.len())
+        {
+            total_bits += fields[i].width;
+            i++;
+        };
+
+        int total_bytes = (total_bits + 7) / 8;
+        int align_bits = 8;
+        if      (total_bytes > 8) { align_bits = 64; }
+        elif    (total_bytes > 4) { align_bits = 32; }
+        elif    (total_bytes > 2) { align_bits = 16; }
+        else                      { align_bits = 8;  };
+
+        // Emit raw backing type alias and open the object
+        emitflux
+        {
+            unsigned data{~$f"{total_bits}" : ~$f"{align_bits}"} as ~$i"{}_raw":{name;};
+
+            object ~$i"{}":{name;}
+            {
+                ~$i"{}_raw":{name;} raw;
+
+                def __init() -> this
+                {
+                    this.raw = 0;
+                    return this;
+                };
+
+                def __init(~$i"{}_raw":{name;} val) -> this
+                {
+                    this.raw = val;
+                    return this;
+                };
+
+                def __expr() -> ~$i"{}":{name;}* { return this; };
+
+                def __exit() -> void { (void)this; };
+        }#;
+
+        // Emit getters and setters per field
+        int offset = 0;
+        i = 0;
+        while (i < fields.len())
+        {
+            byte* fname    = fields[i].name;
+            int   width    = fields[i].width;
+            int   is_signed = fields[i].is_signed;
+            int   start_bit = offset;
+            int   end_bit   = offset + width - 1;
+
+            if (is_signed == 1)
+            {
+                emitflux
+                {
+                    def ~$f"get_{fname}"() -> signed data{~$f"{width}"}
+                    {
+                        return (signed data{~$f"{width}"})(this.raw[~$f"{start_bit}"``~$f"{end_bit}"]);
+                    };
+
+                    def ~$f"set_{fname}"(signed data{~$f"{width}"} val) -> void
+                    {
+                        this.raw[~$f"{start_bit}"``~$f"{end_bit}"] = (unsigned data{~$f"{width}"})val;
+                    };
+                };
+            }
+            else
+            {
+                emitflux
+                {
+                    def ~$f"get_{fname}"() -> unsigned data{~$f"{width}"}
+                    {
+                        return this.raw[~$f"{start_bit}"``~$f"{end_bit}"];
+                    };
+
+                    def ~$f"set_{fname}"(unsigned data{~$f"{width}"} val) -> void
+                    {
+                        this.raw[~$f"{start_bit}"``~$f"{end_bit}"] = val;
+                    };
+                };
+            };
+
+            offset += width;
+            i++;
+        };
+
+        // Close the object
+        emitflux
+        {
+            #};
+        };
+
+        compiler.io.console.println(f"[comptime] generated bitfield '{name}' ({total_bits} bits, {total_bytes} bytes)");
+    };
+
+    // -------------------------------------------------------------------
+    // Generate both bitfields
+    // -------------------------------------------------------------------
+    gen_bitfield(g"Color", color_fields);
+    gen_bitfield(g"Control", control_fields);
+};
+
+// -------------------------------------------------------------------
+// Runtime
+// -------------------------------------------------------------------
+
+def main() -> int
+{
+    Color c(0xFFFF0000u);
+
+    named_print(c.get_r());
+    named_print(c.get_g());
+    named_print(c.get_b());
+    named_print(c.get_a());
+
+    c.set_g(128);
+    c.set_b(64);
+
+    named_print(c.get_g());
+    named_print(c.get_b());
+
+    Control ctrl;
+    ctrl.set_enable(1);
+    ctrl.set_mode(5);
+    ctrl.set_speed(-3);
+    ctrl.set_gain(12);
+
+    named_print(ctrl.get_enable());
+    named_print(ctrl.get_mode());
+    named_print(ctrl.get_speed());
+    named_print(ctrl.get_gain());
+
+    u32 raw = ctrl.raw;
+    if (raw == 0x10050C00u)
+    {
+        println(g"Control register correctly packed!");
+    }
+    else
+    {
+        println(g"Control register mispacked!");
+        print(f"raw = 0x{raw:X}");
+    };
+
+    return 0;
+};

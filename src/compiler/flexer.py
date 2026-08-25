@@ -138,7 +138,7 @@ class TokenType(Enum):
     VOID = auto()         # "        void
     VOLATILE = auto()     # "        volatile
     WHILE = auto()        # "        while
-    XOR = auto()          # "        xor            Represents operator: ^^
+    XOR = auto()          # "        xor            Represents operator: ^|
 
     # Calling conventions (used in place of 'def' to declare a function with a specific ABI)
     CDECL = auto()        # "        cdecl
@@ -161,13 +161,14 @@ class TokenType(Enum):
     MULTIPLY = auto()       # *
     DIVIDE = auto()         # /
     MODULO = auto()         # %
-    POWER = auto()          # ^
+    EXPONENT = auto()          # ^
     # Logical
     LOGICAL_AND = auto()    # &
     LOGICAL_OR = auto()     # |
     NAND_OP = auto()        # !&
     NOR_OP = auto()         # !|
-    XOR_OP = auto()         # ^^
+    XOR_OP = auto()         # ^|
+    #XNOR_OP = auto()        # ^!|
     # Comparison
     EQUAL = auto()          # ==
     NOT_EQUAL = auto()      # !=
@@ -182,7 +183,7 @@ class TokenType(Enum):
     MULTIPLY_ASSIGN = auto()# *=
     DIVIDE_ASSIGN = auto()  # /=
     MODULO_ASSIGN = auto()  # %=
-    POWER_ASSIGN = auto()   # ^=
+    EXPONENT_ASSIGN = auto()   # ^=
     # Bitwise Operators
     BACKTICK = auto()       # `
     # Logical
@@ -191,22 +192,22 @@ class TokenType(Enum):
     BITOR_OP = auto()       # `|
     BITNAND_OP = auto()     # `!&
     BITNOR_OP = auto()      # `!|
-    BITXOR_OP = auto()      # `^^
-    BITXNOT = auto()        # `^^!
-    BITXNAND = auto()       # `^^!&
-    BITXNOR = auto()        # `^^!|
+    BITXOR_OP = auto()      # `^|
+    BITXNOT = auto()        # `^|!
+    BITXNAND = auto()       # `^|!&
+    BITXNOR = auto()        # `^|!|
     # Assignment
     AND_ASSIGN = auto()      # &=
     OR_ASSIGN = auto()       # |=
-    XOR_ASSIGN = auto()      # ^^=
+    XOR_ASSIGN = auto()      # ^|=
     BITAND_ASSIGN = auto()   # `&=
     BITOR_ASSIGN = auto()    # `|=
     BITNAND_ASSIGN = auto()  # `!&=
     BITNOR_ASSIGN = auto()   # `!|=
-    BITXOR_ASSIGN = auto()   # `^^=
-    BITXNOT_ASSIGN = auto()  # `^^!=
-    BITXNAND_ASSIGN = auto() # `^^!&=
-    BITXNOR_ASSIGN = auto()  # `^^!|=
+    BITXOR_ASSIGN = auto()   # `^|=
+    BITXNOT_ASSIGN = auto()  # `^|!=
+    BITXNAND_ASSIGN = auto() # `^|!&=
+    BITXNOR_ASSIGN = auto()  # `^|!|=
 
     
     # Shift
@@ -263,23 +264,23 @@ class TokenType(Enum):
 
 
 sextuple_binary_tokens = {
-    "`^^!&=": TokenType.BITXNAND_ASSIGN,
-    "`^^!|=": TokenType.BITXNOR_ASSIGN
+    "`^|!&=": TokenType.BITXNAND_ASSIGN,
+    "`^|!|=": TokenType.BITXNOR_ASSIGN
 }
 
 quintuple_binary_tokens = {
-    "`^^!&": TokenType.BITXNAND,
-    "`^^!|": TokenType.BITXNOR,
-    "`^^!=": TokenType.BITXNOT_ASSIGN
+    "`^|!&": TokenType.BITXNAND,
+    "`^|!|": TokenType.BITXNOR,
+    "`^|!=": TokenType.BITXNOT_ASSIGN
 }
 
 
 # Quad-character tokens dictionary - Watch out!
 quadruple_binary_tokens = {
-    "`^^!": TokenType.BITXNOT,
+    "`^|!": TokenType.BITXNOT,
     '`!&=': TokenType.BITNAND_ASSIGN,
     '`!|=': TokenType.BITNOR_ASSIGN,
-    '`^^=': TokenType.BITXOR_ASSIGN
+    '`^|=': TokenType.BITXOR_ASSIGN
 }
 
 triple_binary_tokens = {
@@ -287,14 +288,14 @@ triple_binary_tokens = {
     '`!|': TokenType.BITNOR_OP,
     '`&=': TokenType.BITAND_ASSIGN,
     '`|=': TokenType.BITOR_ASSIGN,
-    '`^^': TokenType.BITXOR_OP
+    '`^|': TokenType.BITXOR_OP
 }
 
 # Triple-character tokens dictionary
 triple_char_tokens = {
     '<<=': TokenType.BITSHIFT_LEFT_ASSIGN,
     '>>=': TokenType.BITSHIFT_RIGHT_ASSIGN,
-    '^^=': TokenType.XOR_ASSIGN,
+    '^|=': TokenType.XOR_ASSIGN,
     '{}*': TokenType.FUNCTION_POINTER,
     '(@)': TokenType.ADDRESS_CAST,
     '...': TokenType.ELLIPSIS,
@@ -321,12 +322,12 @@ double_char_tokens = {
     '*=': TokenType.MULTIPLY_ASSIGN,
     '/=': TokenType.DIVIDE_ASSIGN,
     '%=': TokenType.MODULO_ASSIGN,
-    '^=': TokenType.POWER_ASSIGN,
+    '^=': TokenType.EXPONENT_ASSIGN,
     '&=': TokenType.AND_ASSIGN,
     '|=': TokenType.OR_ASSIGN,
     '!&': TokenType.NAND_OP,
     '!|': TokenType.NOR_OP,
-    '^^': TokenType.XOR_OP,
+    '^|': TokenType.XOR_OP,
     '!!': TokenType.NO_MANGLE,
     '??': TokenType.NULL_COALESCE,
     '->': TokenType.RETURN_ARROW,
@@ -349,7 +350,7 @@ single_char_tokens = {
     '*': TokenType.MULTIPLY,
     '/': TokenType.DIVIDE,
     '%': TokenType.MODULO,
-    '^': TokenType.POWER,
+    '^': TokenType.EXPONENT,
     '<': TokenType.LESS_THAN,
     '>': TokenType.GREATER_THAN,
     '&': TokenType.LOGICAL_AND,
@@ -774,7 +775,7 @@ class FluxLexer:
                 
                 while self.current_char() and brace_count > 0:
                     if self.current_char() == '"':
-                        # Closing quote before '}' — unterminated interpolation.
+                        # Closing quote before '}' - unterminated interpolation.
                         err_line   = self.line
                         err_col    = self.column  # 1-based, pointing at the '"'
                         src_lines  = self.source.splitlines()
@@ -903,13 +904,19 @@ class FluxLexer:
                 return Token(TokenType.SINT_LITERAL, result, start_pos[0], start_pos[1])
             
             elif self.current_char() and self.current_char().lower() == 'b':
-                # Binary
+                # Could be a binary literal (0b101) or the byte suffix on 0 (0b == 0 as byte).
+                # Consume the 'b' speculatively.
                 result += self.current_char()
                 self.advance()
                 while self.current_char() and self.current_char() in '01':
                     result += self.current_char()
                     self.advance()
-                
+
+                # If no binary digits followed the 'b', this is `0b` meaning the
+                # byte-suffix form of the integer 0, i.e. equivalent to `0b` -> byte(0).
+                if result == '0b':
+                    return Token(TokenType.BYTE_LITERAL, '0', start_pos[0], start_pos[1])
+
                 # Check for ul (unsigned long) or u (unsigned) suffix
                 if self.current_char() and self.current_char() == 'u':
                     self.advance()  # consume 'u'
@@ -921,7 +928,7 @@ class FluxLexer:
                 if self.current_char() and self.current_char() == 'l':
                     self.advance()  # consume 'l'
                     return Token(TokenType.SLONG_LITERAL, result, start_pos[0], start_pos[1])
-                
+
                 return Token(TokenType.SINT_LITERAL, result, start_pos[0], start_pos[1])
         
         # Read decimal digits
@@ -1261,7 +1268,7 @@ class FluxLexer:
             if not char.isascii():
                 print(
                     f"[LEXER] WARNING: non-ASCII character {char!r} (U+{ord(char):04X}) "
-                    f"at line {start_pos[0]}, col {start_pos[1]} is only valid inside string literals — skipped.",
+                    f"at line {start_pos[0]}, col {start_pos[1]} is only valid inside string literals - skipped.",
                     file=sys.stderr,
                 )
             self.advance()

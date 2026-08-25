@@ -1,20 +1,43 @@
-#import "standard.fx";
+#import <standard.fx>;
 
 using standard::io::console;
 
-struct Test
+noopstr[3] test =
+[
+    "String 1", // this is a list of items, not assignment statements
+    "string 2",
+    "string 3!"
+];
+
+test
 {
-    int[3][3] a;
+    [0] = "New string!";    // these desugar to individual assignments
+    [1] = "Another one!";   // like test[0] = "New string!"; <- would be required here, so sugar requires it
+    [2] = "Changed again?"; //
+};
+
+struct ax
+{
+    noopstr[2] B;
 };
 
 def main() -> int
 {
-    Test t;
+    int i;
+    println(test[i++]);
+    #";
+    #";
 
-    t.a = [[1,2,3],[4,5,6],[7,8,9]];
+    ax A;
 
-    print(t.a[0][1]);
-    print(t.a[1][1]);
-    print(t.a[2][1]);
-    return 0;
+    A
+    {
+        .B
+        {
+            [0] = "TESTING!";
+        };
+    };
+
+    println(A.B[0]);
+    -> 0;
 };

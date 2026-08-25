@@ -1,6 +1,6 @@
 // Author: Karac V. Thweatt
 
-// OS Detection Library
+// System Information Detection Library
 #ifndef FLUX_STANDARD
 #def FLUX_STANDARD 1;
 #endif;
@@ -9,12 +9,6 @@
 #def FLUX_STANDARD_SYSTEM 1;
 #endif;
 
-///
-global const int OS_UNKNOWN = 0;
-global const int OS_WINDOWS = 1;
-global const int OS_LINUX = 2;
-global const int OS_MACOS = 3;
-///
 #ifdef __WINDOWS__
 #def CURRENT_OS 1;
 extern
@@ -61,6 +55,201 @@ namespace standard
 {
     namespace system
     {
+        namespace cpu
+        {
+            // Cached CPUID results -- queried once, reused forever
+#ifdef __ARCH_X86_64__
+            global singinit ulong g_l2_bytes;
+            global singinit bool  g_ermsb,
+                                  g_cpuid_run = false;
+
+            def cpuid_query() -> void
+            {
+                switch (g_cpuid_run) { case (1) { return; } default {}; };
+
+                ulong eax, ebx, ecx, edx;
+
+                // Leaf 7 subleaf 0 -- ERMSB is EBX bit 9
+                volatile asm
+                {
+                    movq $$7,  %rax
+                    xorq %rcx, %rcx
+                    cpuid
+                    movq %rax, $0
+                    movq %rbx, $1
+                    movq %rcx, $2
+                    movq %rdx, $3
+                } : "=r"(eax), "=r"(ebx), "=r"(ecx), "=r"(edx) :
+                  : "rax","rbx","rcx","rdx","memory";
+
+                g_ermsb = (bool)((ebx >> 9) `& 1ul);
+
+                // Leaf 0x80000006 -- L2 cache size in KB is ECX bits 31:16
+                volatile asm
+                {
+                    movq $$0x80000006, %rax
+                    cpuid
+                    movq %rcx, $0
+                } : "=r"(ecx) :
+                  : "rax","rbx","rcx","rdx","memory";
+
+                g_l2_bytes = ((ecx >> 16) `& 0xFFFFul) << 10;
+
+                // Fallback if CPUID returned 0
+                switch (g_l2_bytes == 0ul)
+                {
+                    case (1) { g_l2_bytes = 262144ul; } // default 256KB
+                    default  {};
+                };
+
+                g_cpuid_run = true;
+            };
+#endif;
+
+
+#ifdef __ARCH_ARM64__
+
+#ifdef __MACOS__
+extern def !!sysctlbyname(byte*, void*, ulong*, void*, ulong) -> int;
+#endif;
+
+#ifdef __WINDOWS__
+extern def !!GetLogicalProcessorInformation(void*, u32*) -> bool;
+#endif;
+
+            def cpuid_query() -> void
+            {
+                switch (g_cpuid_run) { case (1) { return; } default {}; };
+
+#ifdef __LINUX__
+                ulong fd, buf_addr, bytes_read, size_val, mul;
+                byte[64] path = "/sys/devices/system/cpu/cpu0/cache/index2/size\0";
+                byte[16] buf;
+                buf_addr = (ulong)@buf[0];
+
+                volatile asm
+                {
+                    mov x8, #56
+                    mov x0, $0
+                    mov x1, #0
+                    mov x2, #0
+                    svc #0
+                    mov $1, x0
+                } : "=r"(fd) : "r"(@path[0]) : "x0","x1","x2","x8","memory";
+
+                switch ((i64)fd < 0)
+                {
+                    case (1) { g_l2_bytes = 262144ul; g_cpuid_run = true; return; }
+                    default  {};
+                };
+
+                volatile asm
+                {
+                    mov x8, #63
+                    mov x0, $0
+                    mov x1, $1
+                    mov x2, #15
+                    svc #0
+                    mov $2, x0
+                } : "=r"(bytes_read) : "r"(fd), "r"(buf_addr) : "x0","x1","x2","x8","memory";
+
+                volatile asm
+                {
+                    mov x8, #57
+                    mov x0, $0
+                    svc #0
+                } : : "r"(fd) : "x0","x8","memory";
+
+                size_val = 0ul;
+                mul      = 1ul;
+                int i;
+                while (i < (int)bytes_read)
+                {
+                    byte c = buf[i];
+                    switch (c == 'K' | c == 'k')
+                    {
+                        case (1) { mul = 1024ul; break; }
+                        default  {};
+                    };
+                    switch (c >= '0' & c <= '9')
+                    {
+                        case (1) { size_val = size_val * 10ul + (ulong)(c - '0'); }
+                        default  {};
+                    };
+                    i++;
+                };
+                g_l2_bytes = size_val * mul;
+                switch (g_l2_bytes == 0ul) { case (1) { g_l2_bytes = 262144ul; } default {}; };
+#endif;
+
+#ifdef __MACOS__
+                ulong val, val_size;
+                val      = 0ul;
+                val_size = 8ul;
+                sysctlbyname("hw.l2cachesize\0", @val, @val_size, (void*)0, 0ul);
+                g_l2_bytes = val;
+                switch (g_l2_bytes == 0ul) { case (1) { g_l2_bytes = 262144ul; } default {}; };
+#endif;
+
+#ifdef __WINDOWS__
+                // GetLogicalProcessorInformation returns an array of
+                // SYSTEM_LOGICAL_PROCESSOR_INFORMATION structs.
+                // Each entry is 64 bytes; cache entries have Relationship == 2 (RelationCache).
+                // Cache descriptor is at offset 32: Level (byte), Associativity (byte),
+                // LineSize (u16), Size (u32), Type (u32).
+                // We want Level == 2.
+                u32  buf_size;
+                GetLogicalProcessorInformation((void*)0, @buf_size);
+                heap byte info = fmalloc((ulong)buf_size);
+                GetLogicalProcessorInformation(info, @buf_size);
+
+                u32 offset;
+                while (offset < buf_size)
+                {
+                    // Relationship is first u32 in each entry
+                    u32* rel = (u32*)(info + offset);
+                    switch (*rel == 2u)  // RelationCache
+                    {
+                        case (1)
+                        {
+                            byte  level = *(info + offset + 32);
+                            switch (level == 2b)
+                            {
+                                case (1)
+                                {
+                                    u32* sz = (u32*)(info + offset + 36);
+                                    g_l2_bytes = (ulong)*sz;
+                                }
+                                default {};
+                            };
+                        }
+                        default {};
+                    };
+                    offset += 64u;
+                };
+
+                (void)info;
+                switch (g_l2_bytes == 0ul) { case (1) { g_l2_bytes = 262144ul; } default {}; };
+#endif;
+
+                g_ermsb     = false;
+                g_cpuid_run = true;
+            };
+#endif;
+
+            def l2_bytes() -> ulong
+            {
+                cpuid_query();
+                return g_l2_bytes;
+            };
+
+            def ermsb() -> bool
+            {
+                cpuid_query();
+                return g_ermsb;
+            };
+        };
+
         namespace Windows
         {
         };

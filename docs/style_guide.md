@@ -13,19 +13,19 @@ or code. Multi-file imports are on one line, comma-separated,
 left to right in dependency order.
 
 ```
-#import "standard.fx", "math.fx", "windows.fx", "opengl.fx";
+#import <standard.fx>, <math.fx>, <windows.fx>, <opengl.fx>;
 ```
 
 Platform-conditional imports use `#ifdef`/`#endif` blocks immediately
 after any unconditional imports:
 
 ```
-#import "standard.fx";
+#import <standard.fx>;
 #ifdef __WINDOWS__
-#import "net_windows.fx";
+#import <net_windows.fx>;
 #endif;
 #ifdef __LINUX__
-#import "net_linux.fx";
+#import <net_linux.fx>;
 #endif;
 ```
 
@@ -219,10 +219,12 @@ Heap pointer globals are initialized to `(T*)0` at declaration
 and allocated in `main` or an explicit init function:
 
 ```
-heap double* g_dens,
-             g_dens_prev,
-             g_vx;
+global heap double g_dens,
+                   g_dens_prev,
+                   g_vx;
 ```
+
+Types that are heap allocated are a pointer. You must free these.
 
 Use `global` for mutable shared state. Use `const` for immutable values.
 Do not use bare global declarations for values that change at runtime
@@ -262,6 +264,7 @@ def advect_band(int row_start, int row_end,
            max_x, max_y,
            bx, by,
            s0, s1, t0, t1;
+
     int jstart, jend,
         i, j, i0, j0, i1, j1,
         base, base00, base01;
@@ -317,7 +320,7 @@ Long parameter lists break after the opening parenthesis and align
 on the first parameter of each continuation line:
 
 ```
-def hmac_sha256(byte* key, int key_len,
+def hmac_sha256(byte* key,   int key_len,
                 byte* xdata, int xdata_len,
                 byte* out) -> void
 {
@@ -373,10 +376,10 @@ written inline:
 ```
 switch (t.kind)
 {
-    case (kinds.TOK_IDENT)  { kind_name = "IDENT \0"; }
-    case (kinds.TOK_NUMBER) { kind_name = "NUMBER\0"; }
-    case (kinds.TOK_END)    { kind_name = "END   \0"; }
-    default                 { kind_name = "??????\0"; };
+    case (kinds.TOK_IDENT)  { kind_name = "IDENT "; }
+    case (kinds.TOK_NUMBER) { kind_name = "NUMBER"; }
+    case (kinds.TOK_END)    { kind_name = "END   "; }
+    default                 { kind_name = "??????"; };
 };
 ```
 
@@ -387,9 +390,9 @@ switch (e._)
 {
     case (ErrorUnionEnum.BOOL_ACTIVE)
     {
-        print("Bool active in error union!\n\0");
+        print("Bool active in error union!\n");
     }
-    default { print("No active tag set!\n\0"); };
+    default { print("No active tag set!\n"); };
 };
 ```
 
@@ -423,11 +426,11 @@ u16 flags = raw `& 0x00FF;                          // bitwise
 
 ### XOR
 
-Use `^^` for bitwise XOR of values. Never use `^` for XOR — `^` is
+Use `^|` for bitwise XOR of values. Never use `^` for XOR — `^` is
 exponentiation in Flux:
 
 ```
-ipad_key[i] = k ^^ byte(0x36);
+ipad_key[i] = k ^| byte(0x36);
 ```
 
 ### Address-of
@@ -491,21 +494,21 @@ byte* some_byte = (@)val;
 
 ## Strings and Byte Arrays
 
-All string literals used as C strings are null-terminated with `\0`
+All string literals used as C strings are null-terminated with ``
 at the end of the literal:
 
 ```
-print("Hotpatch Server\n\0");
-byte* class_name = "FluidSim\0";
+print("Hotpatch Server\n");
+byte* class_name = "FluidSim";
 ```
 
-Do not rely on implicit null termination. The `\0` is always explicit.
+Do not rely on implicit null termination. The `` is always explicit.
 
 `noopstr` is defined as `byte[] as noopstr;` and `noop` stands for "non-OOP".
 
 ```
-noopstr cls = "FluxNotepad\0",
-        ttl = "Flux Notepad - Untitled\0";
+noopstr cls = "FluxNotepad",
+        ttl = "Flux Notepad - Untitled";
 ```
 
 ---
@@ -714,9 +717,9 @@ stdcall NotepadWndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) -> LRESULT
   Declaring a variable inside a loop allocates a new stack slot every
   iteration and will overflow the stack on any significant loop count.
 
-- **`^` for XOR.** `^` is exponentiation. Use `^^` for bitwise XOR.
+- **`^` for XOR.** `^` is exponentiation. Use `^|` for bitwise XOR.
 
-- **Implicit null termination.** Always write `\0` at the end of string
+- **Implicit null termination.** Always write `` at the end of string
   literals that are treated as C strings.
 
 - **`sizeof` as bytes.** `sizeof` returns bits. Divide by `8` or by

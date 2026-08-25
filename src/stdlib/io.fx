@@ -64,6 +64,7 @@ namespace standard
                 print(noopstr) -> void,
                 print(bool) -> void,
                 printchar(noopstr) -> void,
+                print(char) -> void,
                 print(byte) -> void,
                 print(i8) -> void,
                 print(i16) -> void,
@@ -84,6 +85,7 @@ namespace standard
                 print(double,int) -> void,
                 println(noopstr) -> void,   // newline print overloads
                 println(byte) -> void,
+                println(char) -> void,
                 println(bool) -> void,
                 println(i8) -> void,
                 println(i16) -> void,
@@ -506,6 +508,12 @@ namespace standard
                 print(x);
                 return;
             };
+            def print(char s) -> void
+            {
+                char[2] x = [s, 0];
+                print(x);
+                return;
+            };
             def print(int x) -> void
             {
                 byte[21] buf;
@@ -602,6 +610,11 @@ namespace standard
                 standard::io::console::print();
             };
             def println(byte s) -> void
+            {
+                standard::io::console::print(s);
+                standard::io::console::print();
+            };
+            def println(char s) -> void
             {
                 standard::io::console::print(s);
                 standard::io::console::print();

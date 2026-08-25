@@ -12,7 +12,7 @@ def print_password() -> void
 
     for (x in encrypted)
     {
-        print(x ^^ KEY + '\x00');
+        print(x ^| KEY + '\x00');
     };
 };
 

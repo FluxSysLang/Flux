@@ -19,16 +19,16 @@ namespace standard
         ///
         operator (int* a, int* b)[<>] -> void
         {
-            *a `^^= *b;
-            *b `^^= *a;
-            *a `^^= *b;
+            *a `^|= *b;
+            *b `^|= *a;
+            *a `^|= *b;
         };
 
         operator (int a, int b)[<>] -> void
         {
-            a ^^= b;
-            b ^^= a;
-            a ^^= b;
+            a ^|= b;
+            b ^|= a;
+            a ^|= b;
         };
 
         ///
@@ -39,17 +39,17 @@ namespace standard
         operator (int* a, int* b)[<?>] -> void
         {
             if (a is void | b is void) { return; };
-            *a `^^= *b;
-            *b `^^= *a;
-            *a `^^= *b;
+            *a `^|= *b;
+            *b `^|= *a;
+            *a `^|= *b;
         };
 
         operator (int a, int b)[<?>] -> void
         {
             if (a is void | b is void) { return; };
-            a ^^= b;
-            b ^^= a;
-            a ^^= b;
+            a ^|= b;
+            b ^|= a;
+            a ^|= b;
         };
     };
 };

@@ -139,7 +139,7 @@ namespace standard
                 u64 t0 = fss_rdtsc();
                 u64 qpc = 0;
                 QueryPerformanceCounter(@qpc);
-                FSS_CANARY = t0 ^^ (qpc << 17) ^^ (qpc >> 47) ^^ 0xA3B4C5D6E7F80192u;
+                FSS_CANARY = t0 ^| (qpc << 17) ^| (qpc >> 47) ^| 0xA3B4C5D6E7F80192u;
 
                 return true;
             };
@@ -163,7 +163,7 @@ namespace standard
 
                 FSSFrame* frame = FSS_BASE + FSS_TOP;
                 frame.canary    = FSS_CANARY;
-                frame.saved_ra  = ra ^^ FSS_CANARY;
+                frame.saved_ra  = ra ^| FSS_CANARY;
                 frame.saved_rsp = rsp;
 
                 FSS_TOP = FSS_TOP + 1;
@@ -195,7 +195,7 @@ namespace standard
                 };
 
                 // Decode and compare return address
-                u64 expected_ra = frame.saved_ra ^^ FSS_CANARY;
+                u64 expected_ra = frame.saved_ra ^| FSS_CANARY;
                 if (expected_ra != ra)
                 {
                     return false;
@@ -291,7 +291,7 @@ contract FSS_Protect_Frame
     volatile bool __fss_frame_active;
     if (FSS_BASE != (FSSFrame*)NULL)
     {
-        u64 __fss_frame_canary = fss_rdtsc() ^^ FSS_CANARY;
+        u64 __fss_frame_canary = fss_rdtsc() ^| FSS_CANARY;
         __fss_canary_local = __fss_frame_canary;
         __fss_frame_slot = fss_push(__fss_frame_canary, __fss_frame_canary);
         __fss_frame_active = true;
@@ -443,7 +443,7 @@ namespace standard
                 // zero canary.
                 u64 t0  = fss_rdtsc();
                 u64 rng = fss_getrandom();
-                FSS_CANARY = t0 ^^ (rng << 17) ^^ (rng >> 47) ^^ 0xA3B4C5D6E7F80192u;
+                FSS_CANARY = t0 ^| (rng << 17) ^| (rng >> 47) ^| 0xA3B4C5D6E7F80192u;
 
                 return true;
             };
@@ -467,7 +467,7 @@ namespace standard
 
                 FSSFrame* frame = FSS_BASE + FSS_TOP;
                 frame.canary    = FSS_CANARY;
-                frame.saved_ra  = ra ^^ FSS_CANARY;
+                frame.saved_ra  = ra ^| FSS_CANARY;
                 frame.saved_rsp = rsp;
 
                 FSS_TOP = FSS_TOP + 1;
@@ -499,7 +499,7 @@ namespace standard
                 };
 
                 // Decode and compare return address
-                u64 expected_ra = frame.saved_ra ^^ FSS_CANARY;
+                u64 expected_ra = frame.saved_ra ^| FSS_CANARY;
                 if (expected_ra != ra)
                 {
                     return false;
@@ -595,7 +595,7 @@ contract FSS_Protect_Frame
     volatile bool __fss_frame_active;
     if (FSS_BASE != (FSSFrame*)NULL)
     {
-        u64 __fss_frame_canary = fss_rdtsc() ^^ FSS_CANARY;
+        u64 __fss_frame_canary = fss_rdtsc() ^| FSS_CANARY;
         __fss_canary_local = __fss_frame_canary;
         __fss_frame_slot = fss_push(__fss_frame_canary, __fss_frame_canary);
         __fss_frame_active = true;

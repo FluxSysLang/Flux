@@ -270,7 +270,7 @@ def fp256_mul(fp256* a, fp256* b, fp256* r) -> void
 
     sign_a = (a.hi >> 63) `& (u64)1;
     sign_b = (b.hi >> 63) `& (u64)1;
-    sign_r = sign_a `^^ sign_b;
+    sign_r = sign_a `^| sign_b;
 
     // Compute |a|
     abs_a.lo = a.lo; abs_a.m1 = a.m1; abs_a.m2 = a.m2; abs_a.hi = a.hi;

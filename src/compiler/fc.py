@@ -522,7 +522,7 @@ class FluxCompiler:
                     "-enable-misched",                  # Enable machine instruction scheduler
                     "-enable-tail-merge",               # Merge similar tail code
                     "-optimize-regalloc",               # Optimize register allocation
-                    "-relocation-model=pic",         # Static relocation (no PIC)
+                    "-relocation-model=pic",            # Static relocation (no PIC)
                     "-tail-dup-size=3",                 # Tail duplication threshold
                     "-tailcallopt",                     # Enable tail call optimization
                     "-x86-asm-syntax=intel",            # Intel syntax assembly
@@ -706,7 +706,7 @@ class FluxCompiler:
                     self.logger.error(f"Linking failed: {e.stderr}", "linker")
                     raise
             elif self.platform == "Windows":
-                # Use LLD — resolve the full path so non-default LLVM installs work.
+                # Use LLD - resolve the full path so non-default LLVM installs work.
                 linker_name = config['linker']
                 try:
                     linker_exe = resolve_llvm_tool(linker_name)

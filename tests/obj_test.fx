@@ -2,7 +2,19 @@
 
 using standard::io::console;
 
-object test
+trait MyT1
+{
+    def pv() -> void;
+};
+
+trait MyT2
+{
+    def vp() -> void;
+};
+
+trait MyT3 = MyT1 & MyT2;
+
+MyT3 object test
 {
     def __init() -> this
     {
@@ -16,7 +28,8 @@ object test
 
     def __exit() -> void { (void)this; };
 
-    def pv() -> void { print("TEST\n\0"); };
+    def pv() -> void { println("TEST"); };
+    def vp() -> void {};
 };
 
 def main() -> int

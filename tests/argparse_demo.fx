@@ -1,80 +1,44 @@
-// argparse_demo.fx
-// Demonstrates argparse.fx: flags, options, positionals, defaults, required args.
-//
-// Try:
-//   argparse_demo -v -o out.txt input.txt
-//   argparse_demo --output result.bin -n 8 file1.txt file2.txt
-//   argparse_demo --help
-//   argparse_demo              (missing required --output -> error)
+// argparse_example.fx
 
 #import <standard.fx>, <argparse.fx>;
 
-using standard::io::console,
-      argparse;
+using argparse;
 
 def main(int argc, byte** argv) -> int
 {
-    ArgParser parser();
-    parser.set_description(g"A demo tool that processes files.");
+    Parser ap();
 
-    parser.add_flag  (g"-v",  g"--verbose", g"Enable verbose output");
-    parser.add_flag  (g"-d",  g"--dry-run", g"Simulate without writing anything");
-    parser.add_option(g"-o",  g"--output",  g"Output file",        true,  (byte*)0);
-    parser.add_option(g"-n",  g"--count",   g"Number of passes",   false, g"1");
-    parser.add_option((byte*)0, g"--format", g"Output format",     false, g"binary");
+    ap.add_flag("--verbose\0",  "-v\0", "Enable verbose output\0");
+    ap.add_flag("--help\0",     "-h\0", "Show this help message\0");
+    ap.add_value("--input\0",   "-i\0", "Input file path\0",  true);
+    ap.add_value_default("--output\0", "-o\0", "Output file path\0", "stdout\0");
+    ap.add_int_default("--count\0",    "-c\0", "Number of iterations\0", 1);
 
-    if (parser.parse(argc, argv) != ERR_OK)
+    if (!ap.parse(argc, argv))
     {
+        ap.print_help();
         return 1;
     };
 
-    // Verbose flag
-    if (parser.is_set(g"-v"))
+    if (ap.get_flag("--help\0"))
     {
-        println(g"[verbose] Verbose mode enabled.");
+        ap.print_help();
+        return 0;
     };
 
-    // Dry-run flag
-    if (parser.is_set(g"--dry-run"))
+    bool  verbose = ap.get_flag("--verbose\0");
+    byte* input   = ap.get_value("--input\0");
+    byte* output  = ap.get_value("--output\0");
+    int   count   = ap.get_int("--count\0");
+
+    if (verbose)
     {
-        println(g"[dry-run] No files will be written.");
-    };
-
-    // Required option --output
-    byte* outfile = parser.get_value(g"--output");
-    print(g"Output file : ");
-    if ((u64)outfile != 0) { println(outfile); }
-    else                   { println(g"(none)"); };
-
-    // Option with default --count
-    byte* count = parser.get_value(g"--count");
-    print(g"Pass count  : ");
-    if ((u64)count != 0) { println(count); }
-    else                 { println(g"(none)"); };
-
-    // Option with default --format
-    byte* fmt = parser.get_value(g"--format");
-    print(g"Format      : ");
-    if ((u64)fmt != 0) { println(fmt); }
-    else               { println(g"(none)"); };
-
-    // Positional arguments
-    int npos = parser.positional_count_get();
-    if (npos == 0)
-    {
-        println(g"No input files provided.");
-    }
-    else
-    {
-        print(g"Input files : ");
-        println(npos);
-        for (int i; i < npos; i = i + 1)
-        {
-            print(g"  [");
-            print(i);
-            print(g"] ");
-            println(parser.get_positional(i));
-        };
+        print("Input:  \0"); println(input);
+        print("Output: \0"); println(output);
+        print("Count:  \0");
+        byte[32] cbuf;
+        i32str(count, @cbuf[0]);
+        println(@cbuf[0]);
     };
 
     return 0;

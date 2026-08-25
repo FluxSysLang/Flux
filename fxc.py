@@ -69,6 +69,11 @@ def main():
     # Setup debug output redirection - ALWAYS ENABLED
     original_stdout = sys.stdout
     debug_file = None
+
+    with open("version.txt", "r") as f:
+        f.seek(0)
+        data = f.read()
+        print(data)
     
     try:
         # Create build directory if it doesn't exist

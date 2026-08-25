@@ -1,4 +1,4 @@
-#import <standard.fx>, <vectors.fx>, <windows.fx>, <opengl.fx>, <threading.fx>, <decimal.fx>;
+#import <standard.fx>, <opengl.fx>, <vectors.fx>, <threading.fx>, <decimal.fx>;
 
 using standard::io::console,
       standard::system::windows,

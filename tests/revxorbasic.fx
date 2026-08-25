@@ -8,7 +8,7 @@ def main() -> int
 
     for (x in enc)
     {
-        println(int(x `^^ byte(0x42)));
+        println(int(x `^| byte(0x42)));
     };
     return 0;
 };

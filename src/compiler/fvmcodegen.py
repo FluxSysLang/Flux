@@ -263,7 +263,7 @@ class FVMCodegen:
         # True when this codegen instance is compiling a nested function
         # body (created via _visit_function_def / _visit_namespace_def).
         # Ordinary assignments to local variables in a function body must
-        # stay local — they must NOT be mirrored into the VM's global
+        # stay local - they must NOT be mirrored into the VM's global
         # namespace, since that namespace is shared across every function
         # call and would let same-named locals in different functions (or
         # different invocations of the same function) alias each other.
@@ -925,7 +925,7 @@ class FVMCodegen:
     def _visit_type_decl(self, node: TypeDeclaration):
         """
         Type alias declaration: data{8} as nbyte; or int as myint;
-        At comptime this has no runtime effect — register the alias name so
+        At comptime this has no runtime effect - register the alias name so
         that subsequent variable declarations using it resolve correctly.
         If an initial value is present treat it like a variable declaration.
         """
@@ -944,11 +944,11 @@ class FVMCodegen:
 
     def _visit_var_decl(self, node: VariableDeclaration):
         slot = self._alloc_local(node.name)
-        # Track local storage class — local variables cannot escape scope
+        # Track local storage class - local variables cannot escape scope
         if (node.type_spec is not None and
                 getattr(node.type_spec, 'is_local', False)):
             self._local_vars.add(node.name)
-        # Handle heap storage class — allocate on VM heap, slot holds PTR, reads auto-deref
+        # Handle heap storage class - allocate on VM heap, slot holds PTR, reads auto-deref
         from ftypesys import StorageClass as _SC
         from fast import ArrayLiteral as _AL
         if (node.type_spec is not None and
@@ -990,7 +990,7 @@ class FVMCodegen:
                     self._emit(_instr(Op.STORE, ttag, byte_size))
                 self._emit(_instr(Op.LOCAL_SET, slot))
             return
-        # Handle singinit storage class — initialize once, persist in _globals
+        # Handle singinit storage class - initialize once, persist in _globals
         from ftypesys import StorageClass as _SC2
         if (node.type_spec is not None and
                 getattr(node.type_spec, 'storage_class', None) == _SC2.SINGINIT):
@@ -1074,22 +1074,18 @@ class FVMCodegen:
                     node.type_spec.base_type in _pack_targets):
                 self._emit_pack(node.initial_value, node.type_spec)
             else:
-                self._visit_expr(node.initial_value)
-                # Coerce the initializer's value to the declared type, the
-                # same way the compiler implicitly converts an initializer
-                # expression to the target variable's type (e.g. `long x = 5;`
-                # must store 5 as a 64-bit value, not as the literal's
-                # default 32-bit int).  Only applies to plain numeric scalar
-                # declarations -- pointers, structs, enums and arrays are
-                # handled separately above/below.
+                # Propagate struct element type into StructLiteral nodes inside
+                # array initializers so _visit_struct_literal can find struct_type.
+                from fast import ArrayLiteral as _AL2, StructLiteral as _SL2
                 if (node.type_spec is not None and
-                        not getattr(node.type_spec, 'is_array', False) and
-                        not getattr(node.type_spec, 'is_pointer', False)):
-                    _decl_ttag = self._type_ttag_from_ts(node.type_spec)
-                    if _decl_ttag in (TTag.INT, TTag.UINT, TTag.LONG, TTag.ULONG,
-                                       TTag.BYTE, TTag.CHAR, TTag.FLOAT, TTag.DOUBLE,
-                                       TTag.BOOL):
-                        self._emit(_instr(Op.CAST, _decl_ttag))
+                        node.type_spec.is_array and
+                        node.type_spec.custom_typename is not None and
+                        isinstance(node.initial_value, _AL2)):
+                    elem_type_name = node.type_spec.custom_typename
+                    for elem in node.initial_value.elements:
+                        if isinstance(elem, _SL2) and elem.struct_type is None:
+                            elem.struct_type = elem_type_name
+                self._visit_expr(node.initial_value)
             # If the declared type is a pointer to a named struct (e.g. BlockEntry* entry = ...),
             # tag the result with CAST PTR typename so STRUCT_LOAD can read fields through it.
             if (node.type_spec is not None and
@@ -1215,22 +1211,50 @@ class FVMCodegen:
                                   getattr(self._local_typespecs.get(_arr_name), 'custom_typename', None))
                     _layout = self._struct_layouts[_type_name]
                     _struct_size = _layout.total_size
-                    # compute GEP address
-                    self._visit_expr(_obj.array)
-                    self._visit_expr(_obj.index)
-                    self._emit(_instr(Op.PUSH, Val(TTag.UINT, _struct_size)))
-                    self._emit(_instr(Op.MUL))
-                    self._emit(_instr(Op.ADD))
-                    # DUP: one copy for LOAD, one for STORE writeback
-                    self._emit(_instr(Op.DUP))
-                    # load current struct value
-                    self._emit(_instr(Op.LOAD, TTag.STRUCT, _struct_size, _type_name))
-                    # push the new field value
-                    self._visit_expr(node.value)
-                    # modify the field in the Val
-                    self._emit(_instr(Op.STRUCT_STORE, node.target.member))
-                    # stack: addr, modified_struct -> STORE back to heap
-                    self._emit(_instr(Op.STORE, TTag.STRUCT, _struct_size, _type_name))
+                    if _arr_name in self._heap_vars:
+                        # Heap-allocated struct array: use GEP + LOAD/STORE
+                        self._visit_expr(_obj.array)
+                        self._visit_expr(_obj.index)
+                        self._emit(_instr(Op.PUSH, Val(TTag.UINT, _struct_size)))
+                        self._emit(_instr(Op.MUL))
+                        self._emit(_instr(Op.ADD))
+                        self._emit(_instr(Op.DUP))
+                        self._emit(_instr(Op.LOAD, TTag.STRUCT, _struct_size, _type_name))
+                        self._visit_expr(node.value)
+                        self._emit(_instr(Op.STRUCT_STORE, node.target.member))
+                        self._emit(_instr(Op.STORE, TTag.STRUCT, _struct_size, _type_name))
+                    else:
+                        # VM ARRAY value (e.g. A[] g_tbl = [a,b,c]): use ARRAY_LOAD + STRUCT_STORE + ARRAY_STORE.
+                        # arr[idx].field = val:
+                        #   1. Load element:  push array, push idx -> ARRAY_LOAD -> struct
+                        #   2. Update field:  push val -> STRUCT_STORE field -> updated_struct
+                        #   3. Write back:    push array, push idx, push updated_struct -> ARRAY_STORE -> updated_array
+                        #   4. Save array:    LOCAL_SET (and GLOBAL_SET if global)
+                        _is_global = (_arr_name in self._block_globals or
+                                      _arr_name in self._outer_globals)
+                        # Step 1: load the element
+                        self._visit_expr(_obj.array)
+                        self._visit_expr(_obj.index)
+                        self._emit(_instr(Op.ARRAY_LOAD))
+                        # Step 2: update the field
+                        self._visit_expr(node.value)
+                        self._emit(_instr(Op.STRUCT_STORE, node.target.member))
+                        # Step 3: stash updated struct, reload array+idx, then ARRAY_STORE
+                        _tmp = self._alloc_local('__mae_tmp__')
+                        self._emit(_instr(Op.LOCAL_SET, _tmp))
+                        self._visit_expr(_obj.array)
+                        self._visit_expr(_obj.index)
+                        self._emit(_instr(Op.LOCAL_GET, _tmp))
+                        self._emit(_instr(Op.ARRAY_STORE))
+                        # Step 4: write updated array back to the variable
+                        if _is_global:
+                            self._emit(_instr(Op.DUP))
+                            _slot = self._alloc_local(_arr_name)
+                            self._emit(_instr(Op.LOCAL_SET, _slot))
+                            self._emit(_instr(Op.GLOBAL_SET, _arr_name))
+                        else:
+                            _slot = self._alloc_local(_arr_name)
+                            self._emit(_instr(Op.LOCAL_SET, _slot))
                 else:
                     self._visit_expr(node.target.object)
                     self._visit_expr(node.value)
@@ -1388,7 +1412,7 @@ class FVMCodegen:
             TokenType.MULTIPLY_ASSIGN:        Op.MUL,
             TokenType.DIVIDE_ASSIGN:          Op.DIV,
             TokenType.MODULO_ASSIGN:          Op.MOD,
-            TokenType.POWER_ASSIGN:           Op.POW,
+            TokenType.EXPONENT_ASSIGN:        Op.POW,
             TokenType.AND_ASSIGN:             Op.BAND,
             TokenType.OR_ASSIGN:              Op.BOR,
             TokenType.XOR_ASSIGN:             Op.BXOR,
@@ -1461,6 +1485,16 @@ class FVMCodegen:
         elif t is TernaryOp:           return self._visit_ternary_op(node)
         elif t is IfExpression:        return self._visit_if_expression(node)
         elif t is Stringify:           return self._visit_stringify(node)
+        elif t is Block:
+            # Struct field-assign block: e.g.  g_tbl[0] { .x = 1; .y = 2; }
+            # The parser wraps the brace-delimited field assignments in a Block
+            # and places it as the .expression of an ExpressionStatement.
+            # Each child is a StructFieldAssign (or any other statement); just
+            # visit them all sequentially.  No value is left on the stack.
+            for stmt in (node.statements or []):
+                if stmt is not None:
+                    self._visit_stmt(stmt)
+            return False
         else:
             raise FVMCodegenError(
                 f'fvmcodegen: unsupported expression in comptime: {type(node).__name__}',
@@ -1520,7 +1554,7 @@ class FVMCodegen:
                 or part.name in self._block_globals
                 or part.name in self._outer_globals
             ):
-                # Identifier not in scope — emit as "{name}" placeholder.
+                # Identifier not in scope - emit as "{name}" placeholder.
                 placeholder = '{' + part.name + '}'
                 self._emit(_instr(Op.PUSH, Val(TTag.BYTES, placeholder.encode('utf-8'))))
             else:
@@ -1618,7 +1652,7 @@ class FVMCodegen:
             self._emit(_instr(Op.GLOBAL_GET, name))
             self._emit(_instr(Op.INT_TO_STR))
             return True
-        # Not found — push the name itself as a string literal
+        # Not found - push the name itself as a string literal
         self._emit(_instr(Op.PUSH, Val(TTag.BYTES, name.encode("utf-8"))))
         return True
 
@@ -1674,7 +1708,7 @@ class FVMCodegen:
             Operator.NOR:      Op.BOR,    # !(a | b)
             Operator.BITNAND:  Op.BAND,   # ~(a `& b)
             Operator.BITNOR:   Op.BOR,    # ~(a `| b)
-            Operator.BITXNOT:  Op.BXOR,   # ~(a `^^ b)
+            Operator.BITXNOT:  Op.BXOR,   # ~(a `^| b)
             Operator.BITXNAND: Op.BAND,   # ~(xor(a,b) & ...)
             Operator.BITXNOR:  Op.BOR,    # ~(xor(a,b) | ...)
         }
@@ -1814,7 +1848,7 @@ class FVMCodegen:
                 bits = _prim_bits[target.base_type]
 
         elif isinstance(target, Identifier):
-            # Check heap vars first — they carry full type info
+            # Check heap vars first - they carry full type info
             if target.name in self._heap_vars:
                 heap_info = self._heap_vars[target.name]
                 if len(heap_info) == 3:  # array: (elem_ttag, elem_bytes, count)
@@ -1844,7 +1878,7 @@ class FVMCodegen:
                     bits = layout.total_bits if layout.total_bits else layout.total_size * 8
 
         if bits is None:
-            bits = 0  # unknown — emit 0 rather than crash
+            bits = 0  # unknown - emit 0 rather than crash
 
         self._emit(_instr(Op.PUSH, Val(TTag.ULONG, bits)))
         return True
@@ -2018,7 +2052,7 @@ class FVMCodegen:
 
     def _visit_in_expression(self, node: InExpression) -> bool:
         """
-        needle in haystack — linear scan of the array for needle.
+        needle in haystack - linear scan of the array for needle.
         Strategy: evaluate needle and haystack once, then emit a counted
         loop that INDEX_GETs each element, CMP_EQs with needle, and BORs
         the result into an accumulator.  Leaves a BOOL on the stack.
@@ -2038,7 +2072,7 @@ class FVMCodegen:
         arr_slot = self._alloc_local('__in_arr__')
         self._emit(_instr(Op.LOCAL_SET, arr_slot))
 
-        # Get array length via STR_LEN workaround — use ARRAY_LEN if it exists,
+        # Get array length via STR_LEN workaround - use ARRAY_LEN if it exists,
         # otherwise push the count from meta via a dedicated op.
         # Since the VM doesn't have ARRAY_LEN, we use a Python-level count stored
         # as an inline literal by pushing the array PTR and reading meta at runtime.
@@ -2166,10 +2200,10 @@ class FVMCodegen:
 
     def _visit_address_of(self, node: AddressOf) -> bool:
         """
-        @x — push Val(TTag.PTR, slot_index).
+        @x - push Val(TTag.PTR, slot_index).
         For variables: slot holds the variable value.
         For functions: allocate a slot holding Val(BYTES, func_name), push PTR to it.
-        @arr[idx] — evaluate arr[idx], store result in a temp slot, push PTR to that slot.
+        @arr[idx] - evaluate arr[idx], store result in a temp slot, push PTR to that slot.
         """
         if isinstance(node.expression, PointerDeref):
             # @(*ptr) -- fcodegen visits the inner pointer directly, not the deref.
@@ -2344,7 +2378,7 @@ class FVMCodegen:
         elif (ts.base_type is not None and ts.base_type == _DT.DATA
                 and not getattr(ts, 'is_pointer', False)):
             # data{N} types (and aliases such as i16/u16/wchar) are scalar
-            # integers of N bits — map to the closest integer TTag based on
+            # integers of N bits - map to the closest integer TTag based on
             # bit width and signedness rather than falling through to PTR.
             bits = getattr(ts, 'bit_width', None) or 32
             is_signed = getattr(ts, 'is_signed', False)
@@ -2353,7 +2387,7 @@ class FVMCodegen:
             else:
                 target_ttag = TTag.LONG if is_signed else TTag.ULONG
         else:
-            # Pointer cast or unknown — treat as PTR
+            # Pointer cast or unknown - treat as PTR
             target_ttag = TTag.PTR
         # For pointer-to-struct casts (e.g. (Slab*)raw), tag the resulting
         # PTR value with the struct type so STRUCT_LOAD/STRUCT_STORE on the
@@ -2704,10 +2738,10 @@ class FVMCodegen:
         return node
 
     def _visit_array_access(self, node):
-        # Check if array is a heap-allocated var — use typed LOAD instead of ARRAY_LOAD
+        # Check if array is a heap-allocated var - use typed LOAD instead of ARRAY_LOAD
         if isinstance(node.array, Identifier) and node.array.name in self._heap_vars:
             heap_info = self._heap_vars[node.array.name]
-            if len(heap_info) == 3:  # (elem_ttag, elem_bytes, count) — array
+            if len(heap_info) == 3:  # (elem_ttag, elem_bytes, count) - array
                 elem_ttag, elem_bytes, _count = heap_info
                 # ptr + index * elem_bytes -> LOAD elem_ttag elem_bytes
                 self._emit(_instr(Op.LOCAL_GET, self._locals[node.array.name]))
@@ -2885,7 +2919,7 @@ class FVMCodegen:
         """
         Function pointer declaration: def{}* pb() -> void = @bar;
         @bar stores Val(TTag.BYTES, func_name) in a named slot, then
-        pb holds Val(TTag.PTR, that_slot) — same as @x for variables.
+        pb holds Val(TTag.PTR, that_slot) - same as @x for variables.
         """
         fp_slot = self._alloc_local(node.name)
         if node.initializer is not None:
@@ -3007,7 +3041,7 @@ class FVMCodegen:
     def _type_bit_width(self, ts) -> int:
         """
         Compute the bit width of a TypeSystem without llvmlite.
-        Flux structs are tightly packed — no padding.
+        Flux structs are tightly packed - no padding.
         """
         from ftypesys import DataType as _DT
         if ts is None:
@@ -3025,7 +3059,7 @@ class FVMCodegen:
         if ts.base_type is not None:
             return self._type_bit_width_base(ts.base_type, ts)
         if ts.custom_typename is not None:
-            # Nested struct — look up in our own registry
+            # Nested struct - look up in our own registry
             layout = self._struct_layouts.get(ts.custom_typename)
             if layout is not None:
                 return layout.total_bits if layout.total_bits else layout.total_size * 8
@@ -3075,7 +3109,7 @@ class FVMCodegen:
     def _visit_struct_def(self, node: StructDef, prefix: str = ''):
         """
         Compute a StructLayout for this struct and register it.
-        Flux structs are tightly packed — zero padding between fields.
+        Flux structs are tightly packed - zero padding between fields.
         Handles nested structs recursively.
         """
         from fvm import StructLayout as _SL
@@ -3119,7 +3153,7 @@ class FVMCodegen:
 
     def _visit_struct_literal(self, node: StructLiteral) -> bool:
         """
-        Struct literal {field=val, ...} — requires struct_type to be set.
+        Struct literal {field=val, ...} - requires struct_type to be set.
         """
         if node.struct_type is None:
             raise FVMCodegenError(
@@ -3309,7 +3343,7 @@ class FVMCodegen:
         Functions are registered under their fully-qualified mangled name
         (e.g. A__foo for namespace A { def foo... }).  Nested namespaces
         are recursed with the accumulated prefix.  Structs, objects, enums,
-        and unions are ignored — they have no runtime representation in the VM.
+        and unions are ignored - they have no runtime representation in the VM.
         """
         ns_name = f'{prefix}__{node.name}' if prefix else node.name
         node._is_comptime_only = True
@@ -3613,7 +3647,7 @@ class FVMCodegen:
 
     def _visit_jump(self, node: JumpStatement):
         """
-        jump expr — low-level jump to an address expression.
+        jump expr - low-level jump to an address expression.
         In the VM context, if the expression is a label address we resolve it;
         otherwise treat as a goto to whatever the expression evaluates to.
         """
@@ -3624,7 +3658,7 @@ class FVMCodegen:
             patch_idx = self._emit(_instr(Op.JMP, 0))
             self._goto_patches.append((patch_idx, node.target.name))
         else:
-            # Dynamic address — evaluate and jump (best-effort)
+            # Dynamic address - evaluate and jump (best-effort)
             self._visit_expr(node.target)
             # No direct indirect-jump in VM; fall through silently
 

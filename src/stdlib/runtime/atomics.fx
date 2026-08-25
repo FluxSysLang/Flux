@@ -497,7 +497,7 @@ namespace standard
             do
             {
                 old     = load32(ptr);
-                desired = old `^^ mask;
+                desired = old `^| mask;
             }
             while (!cas32(ptr, old, desired));
             return old;
@@ -509,7 +509,7 @@ namespace standard
             do
             {
                 old     = load64(ptr);
-                desired = old `^^ mask;
+                desired = old `^| mask;
             }
             while (!cas64(ptr, old, desired));
             return old;

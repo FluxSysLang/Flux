@@ -37,6 +37,288 @@ def !!memset(void* dst, int c, size_t n) -> void*
     return dst;
 };
 
+def fmemcpy(void* dest, void* src, ulong count) -> void*
+{
+    void* ret = dest;
+
+#ifdef __ARCH_X86_64__
+    volatile asm
+    {
+        movq $0, %rdi
+        movq $1, %rsi
+        movq $2, %rcx
+
+        // Small: < 16 bytes -- scalar
+        cmpq $$16, %rcx
+        jae .Lcheck_ermsb
+        testq %rcx, %rcx
+        jz .Ldone
+    .Lsmall:
+        movb (%rsi), %al
+        movb %al, (%rdi)
+        incq %rsi
+        incq %rdi
+        decq %rcx
+        jnz .Lsmall
+        jmp .Ldone
+
+        // If ERMSB, skip SSE/AVX -- rep movsb is optimal
+    .Lcheck_ermsb:
+        cmpb $$1, $3
+        je .Lermsb
+
+        // Medium: 16-128 bytes -- SSE unrolled
+        cmpq $$128, %rcx
+        jae .Llarge
+        movq %rcx, %rax
+    .Lmed_loop:
+        cmpq $$16, %rax
+        jb .Lmed_tail
+        movdqu (%rsi), %xmm0
+        movdqu %xmm0, (%rdi)
+        addq $$16, %rsi
+        addq $$16, %rdi
+        subq $$16, %rax
+        jmp .Lmed_loop
+    .Lmed_tail:
+        testq %rax, %rax
+        jz .Ldone
+    .Lmed_byte:
+        movb (%rsi), %al
+        movb %al, (%rdi)
+        incq %rsi
+        incq %rdi
+        decq %rax
+        jnz .Lmed_byte
+        jmp .Ldone
+
+        // Large: 128 bytes to L2 threshold -- AVX2 unrolled, 256 bytes/iter
+    .Llarge:
+        movq $4, %r11
+        cmpq %r11, %rcx
+        jae .Lnt
+
+        // Alignment prologue -- copy until dst is 32-byte aligned
+        movq %rdi, %rax
+        andq $$31, %rax
+        testq %rax, %rax
+        jz .Lbulk
+        movq $$32, %r10
+        subq %rax, %r10
+        cmpq %rcx, %r10
+        cmovaq %rcx, %r10
+    .Lalign_loop:
+        testq %r10, %r10
+        jz .Lbulk
+        movb (%rsi), %al
+        movb %al, (%rdi)
+        incq %rsi
+        incq %rdi
+        decq %rcx
+        decq %r10
+        jmp .Lalign_loop
+
+    .Lbulk:
+        movq %rcx, %rax
+        shrq $$8, %rax
+        testq %rax, %rax
+        jz .Llarge_tail
+    .Lbulk_loop:
+        prefetcht0  256(%rsi)
+        prefetcht0  288(%rsi)
+        vmovdqu   (%rsi),    %ymm0
+        vmovdqu   32(%rsi),  %ymm1
+        vmovdqu   64(%rsi),  %ymm2
+        vmovdqu   96(%rsi),  %ymm3
+        vmovdqu   128(%rsi), %ymm4
+        vmovdqu   160(%rsi), %ymm5
+        vmovdqu   192(%rsi), %ymm6
+        vmovdqu   224(%rsi), %ymm7
+        vmovdqa   %ymm0,     (%rdi)
+        vmovdqa   %ymm1,     32(%rdi)
+        vmovdqa   %ymm2,     64(%rdi)
+        vmovdqa   %ymm3,     96(%rdi)
+        vmovdqa   %ymm4,     128(%rdi)
+        vmovdqa   %ymm5,     160(%rdi)
+        vmovdqa   %ymm6,     192(%rdi)
+        vmovdqa   %ymm7,     224(%rdi)
+        addq      $$256,     %rsi
+        addq      $$256,     %rdi
+        decq      %rax
+        jnz       .Lbulk_loop
+    .Llarge_tail:
+        movq %rcx, %rax
+        andq $$255, %rax
+        movq %rax, %rcx
+        rep movsb
+        jmp .Ldone
+
+        // Huge: > L2 threshold -- non-temporal, 256 bytes/iter
+    .Lnt:
+        movq %rcx, %rax
+        shrq $$8, %rax
+        testq %rax, %rax
+        jz .Lnt_tail
+    .Lnt_loop:
+        prefetchnta 256(%rsi)
+        prefetchnta 288(%rsi)
+        vmovdqu    (%rsi),    %ymm0
+        vmovdqu    32(%rsi),  %ymm1
+        vmovdqu    64(%rsi),  %ymm2
+        vmovdqu    96(%rsi),  %ymm3
+        vmovdqu    128(%rsi), %ymm4
+        vmovdqu    160(%rsi), %ymm5
+        vmovdqu    192(%rsi), %ymm6
+        vmovdqu    224(%rsi), %ymm7
+        vmovntdq   %ymm0,     (%rdi)
+        vmovntdq   %ymm1,     32(%rdi)
+        vmovntdq   %ymm2,     64(%rdi)
+        vmovntdq   %ymm3,     96(%rdi)
+        vmovntdq   %ymm4,     128(%rdi)
+        vmovntdq   %ymm5,     160(%rdi)
+        vmovntdq   %ymm6,     192(%rdi)
+        vmovntdq   %ymm7,     224(%rdi)
+        addq       $$256,     %rsi
+        addq       $$256,     %rdi
+        decq       %rax
+        jnz        .Lnt_loop
+        sfence
+    .Lnt_tail:
+        movq %rcx, %rax
+        andq $$255, %rax
+        movq %rax, %rcx
+        rep movsb
+        jmp .Ldone
+
+        // ERMSB path -- rep movsb optimal on this CPU
+    .Lermsb:
+        rep movsb
+
+    .Ldone:
+        vzeroupper
+    } : : "r"(dest), "r"(src), "r"(count), "r"(ermsb), "r"(nt_threshold)
+      : "rax","rcx","rdi","rsi","r10","r11",
+        "xmm0","ymm0","ymm1","ymm2","ymm3","ymm4","ymm5","ymm6","ymm7",
+        "memory";
+#endif;
+#ifdef __ARCH_ARM64__
+    volatile asm
+    {
+        mov x0, $0
+        mov x1, $1
+        mov x2, $2
+
+        // Small: < 16 bytes -- scalar
+        cmp x2, #16
+        bge .Lmedium
+        cbz x2, .Ldone
+    .Lsmall:
+        ldrb w3, [x1], #1
+        strb w3, [x0], #1
+        subs x2, x2, #1
+        bne .Lsmall
+        b .Ldone
+
+        // Medium: 16-128 bytes -- NEON 16-byte unrolled
+    .Lmedium:
+        cmp x2, #128
+        bge .Llarge
+        mov x3, x2
+    .Lmed_loop:
+        cmp x3, #16
+        blt .Lmed_tail
+        ldr q0, [x1], #16
+        str q0, [x0], #16
+        sub x3, x3, #16
+        b .Lmed_loop
+    .Lmed_tail:
+        cbz x3, .Ldone
+    .Lmed_byte:
+        ldrb w4, [x1], #1
+        strb w4, [x0], #1
+        subs x3, x3, #1
+        bne .Lmed_byte
+        b .Ldone
+
+        // Large: 128 bytes to NT threshold -- NEON 128 bytes/iter, aligned
+    .Llarge:
+        mov x4, $3
+        cmp x2, x4
+        bge .Lnt
+
+        // Alignment prologue -- copy until dst is 16-byte aligned
+        and x3, x0, #15
+        cbz x3, .Lbulk
+        mov x4, #16
+        sub x4, x4, x3
+        cmp x4, x2
+        csel x4, x2, x4, hi
+    .Lalign_loop:
+        cbz x4, .Lbulk
+        ldrb w3, [x1], #1
+        strb w3, [x0], #1
+        sub x2, x2, #1
+        subs x4, x4, #1
+        bne .Lalign_loop
+
+    .Lbulk:
+        lsr x3, x2, #7         // 128 bytes per iter
+        cbz x3, .Llarge_tail
+    .Lbulk_loop:
+        prfm pldl1keep, [x1, #256]
+        ld1 {v0.16b, v1.16b, v2.16b, v3.16b}, [x1], #64
+        ld1 {v4.16b, v5.16b, v6.16b, v7.16b}, [x1], #64
+        st1 {v0.16b, v1.16b, v2.16b, v3.16b}, [x0], #64
+        st1 {v4.16b, v5.16b, v6.16b, v7.16b}, [x0], #64
+        subs x3, x3, #1
+        bne .Lbulk_loop
+    .Llarge_tail:
+        and x3, x2, #127
+        mov x2, x3
+        cbz x2, .Ldone
+    .Ltail_byte:
+        ldrb w3, [x1], #1
+        strb w3, [x0], #1
+        subs x2, x2, #1
+        bne .Ltail_byte
+        b .Ldone
+
+        // Huge: > NT threshold -- non-temporal stores
+    .Lnt:
+        lsr x3, x2, #7
+        cbz x3, .Lnt_tail
+    .Lnt_loop:
+        prfm pldl1strm, [x1, #256]
+        ld1 {v0.16b, v1.16b, v2.16b, v3.16b}, [x1], #64
+        ld1 {v4.16b, v5.16b, v6.16b, v7.16b}, [x1], #64
+        stnp q0, q1, [x0]
+        stnp q2, q3, [x0, #32]
+        stnp q4, q5, [x0, #64]
+        stnp q6, q7, [x0, #96]
+        add x0, x0, #128
+        subs x3, x3, #1
+        bne .Lnt_loop
+        dsb st
+    .Lnt_tail:
+        and x3, x2, #127
+        mov x2, x3
+        cbz x2, .Ldone
+    .Lnt_tail_byte:
+        ldrb w3, [x1], #1
+        strb w3, [x0], #1
+        subs x2, x2, #1
+        bne .Lnt_tail_byte
+
+    .Ldone:
+    } : : "r"(dest), "r"(src), "r"(count), "r"(nt_threshold)
+      : "x0","x1","x2","x3","x4","x5",
+        "v0","v1","v2","v3","v4","v5","v6","v7",
+        "memory";
+#endif;
+
+    return ret;
+};
+
 def !!memcpy(void* dst, void* src, size_t n) -> void*
 {
     byte* d = (byte*)dst,

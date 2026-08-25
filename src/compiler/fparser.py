@@ -90,13 +90,13 @@ _TOKEN_SYMBOL_MAP = {
     TokenType.GREATER_EQUAL:      '>=',
     TokenType.NAND_OP:            '!&',
     TokenType.NOR_OP:             '!|',
-    TokenType.XOR_OP:             '^^',
+    TokenType.XOR_OP:             '^|',
     TokenType.BITSHIFT_LEFT:      '<<',
     TokenType.BITSHIFT_RIGHT:     '>>',
     TokenType.BITNAND_OP:         '`!&',
     TokenType.BITNOR_OP:          '`!|',
-    TokenType.BITXNAND:           '`^^!&',
-    TokenType.BITXNOR:            '`^^!|',
+    TokenType.BITXNAND:           '`^|!&',
+    TokenType.BITXNOR:            '`^|!|',
     # Punctuation / delimiters
     TokenType.LEFT_PAREN:         '(',
     TokenType.RIGHT_PAREN:        ')',
@@ -466,10 +466,9 @@ class FluxParser:
         self._namespace_stack = []  # Track current namespace path for symbol registration
         self._object_init_params = {}  # object_name -> __init parameter count (excluding 'this')
         self._templates = TemplateRegistry()  # all template state (functions/structs/objects/operators)
-        self._template_instantiations = []  # concrete FunctionDef nodes to inject into program
-        self._template_struct_instances = []      # concrete StructDefs to inject
-        self._template_object_instances = []      # concrete ObjectDefs to inject
+        self._pending_template_instances = []  # (kind, node) tuples: 'struct' | 'object' | 'function'
         self._parsed_objects = {}  # object_name -> ObjectDef AST node
+        self._parsed_traits = {}   # trait_name -> TraitDef AST node
         self._custom_operators: Dict[str, str] = {}  # symbol string -> base function name
         self._active_template_params: set = set()  # template param names in scope during current def/struct parse
         self._contracts: Dict[str, Block] = {}  # name -> Block of statements to inject
@@ -497,6 +496,13 @@ class FluxParser:
         # statement().  When `#";` itself resolves, it stores the copy back here
         # so that chained `#";` repeat the original, not a meta-ditto node.
         self._last_stmt: Optional[Statement] = None
+        # Set by function_def/struct_def/object_def when they register a template so
+        # namespace_def can read the bare name without diffing the registry.
+        self._last_template_registered: Optional[str] = None
+        # Names of template objects currently being parsed (pre-registration forward decls).
+        # Allows type_spec() to recognise self-referential return types like Tensor<T>*
+        # inside method signatures without a sentinel ObjectDef in the registry.
+        self._template_object_forward_decls: set = set()
 
 
     @contextmanager
@@ -994,12 +1000,10 @@ class FluxParser:
                 raise
         # Append template instantiations after all other statements so that
         # namespace functions they depend on are registered before their bodies run.
-        if self._template_struct_instances:
-            statements = statements + self._template_struct_instances
-        if self._template_object_instances:
-            statements = statements + self._template_object_instances
-        if self._template_instantiations:
-            statements = statements + self._template_instantiations
+        # Order: structs first, then objects, then functions (invariant enforced here).
+        _KIND_ORDER = {'struct': 0, 'object': 1, 'function': 2}
+        for _, node in sorted(self._pending_template_instances, key=lambda t: _KIND_ORDER[t[0]]):
+            statements.append(node)
         return Program(self.symbol_table, statements=statements)
     
     def has_errors(self) -> bool:
@@ -1177,6 +1181,8 @@ class FluxParser:
             return self.try_statement()
         elif self.expect(TokenType.RETURN):
             return self.return_statement()
+        elif self.expect(TokenType.RETURN_ARROW):
+            return self.return_arrow_ret()
         elif self.expect(TokenType.BREAK):
             return self.break_statement()
         elif self.expect(TokenType.CONTINUE):
@@ -2070,19 +2076,11 @@ class FluxParser:
         # Use lookahead to confirm this is actually a template list (all IDENTIFIERs,
         # with optional ': ...' constraint clauses) before consuming anything, to
         # avoid misreading comparison operators.
-        def _ts_repr_simple(ts):
-            """Produce a readable source-like string for a TypeSystem (for constraint error messages)."""
-            name = ts.custom_typename if ts.custom_typename else (ts.base_type.value if hasattr(ts.base_type, 'value') else str(ts.base_type))
-            if ts.is_pointer:
-                name += '*' * ts.pointer_depth
-            if ts.is_array:
-                name += '[]'
-            return name
         template_params = []
-        _func_constraints = {}  # param_name -> list of (TypeSystem, source_text)
-        _func_relations = []    # list of (lhs_names, op: str, rhs_names)
-        _func_defaults = {}     # param_name -> TypeSystem (the default type)
-        _func_no_default = set()  # param_names marked <!+
+        _func_constraints = {}
+        _func_relations = []
+        _func_defaults = {}
+        _func_no_default = set()
         if self.expect(TokenType.LESS_THAN):
             with self._lookahead():
                 is_template = False
@@ -2234,180 +2232,9 @@ class FluxParser:
                         is_template = True
 
             if is_template:
-                self.advance()  # consume '<'
-                # Helper: parse one side of a relation: IDENTIFIER ('&' IDENTIFIER)*
-                def _parse_id_list():
-                    names = [self.consume(TokenType.IDENTIFIER).value]
-                    while self.expect(TokenType.LOGICAL_AND):
-                        self.advance()
-                        names.append(self.consume(TokenType.IDENTIFIER).value)
-                    return names
-                # Helper: parse a ':{' ... '}' constraint set and collect relational constraints
-                def _parse_constraint_set_fd():
-                    self.consume(TokenType.COLON)
-                    self.consume(TokenType.LEFT_BRACE)
-                    # Parse one or more comma-separated entries: raw relation or named constra
-                    def _parse_one_cs_entry():
-                        # Peek: IDENTIFIER followed by '~', '!~', '&', or '(' -> constra ref or relation
-                        _entry_tok = self.current_token
-                        _entry_name = self.consume(TokenType.IDENTIFIER).value
-                        if self.expect(TokenType.LEFT_PAREN):
-                            # Named constra with explicit args: MyCS(T, U)
-                            if _entry_name not in self._constras:
-                                self.current_token = _entry_tok
-                                self.error(f"Unknown named constraint set '{_entry_name}'")
-                            cs_params, cs_relations = self._constras[_entry_name]
-                            self.advance()  # consume '('
-                            call_args = []
-                            if not self.expect(TokenType.RIGHT_PAREN):
-                                call_args.append(self.consume(TokenType.IDENTIFIER).value)
-                                while self.expect(TokenType.COMMA):
-                                    self.advance()
-                                    call_args.append(self.consume(TokenType.IDENTIFIER).value)
-                            self.consume(TokenType.RIGHT_PAREN)
-                            if len(call_args) != len(cs_params):
-                                self.current_token = _entry_tok
-                                self.error(
-                                    f"Named constraint set '{_entry_name}' expects "
-                                    f"{len(cs_params)} argument(s), got {len(call_args)}"
-                                )
-                            for arg in call_args:
-                                if arg not in template_params:
-                                    self.error(
-                                        f"'{arg}' is not a template parameter; "
-                                        f"valid parameters are: {', '.join(template_params)}"
-                                    )
-                            mapping = dict(zip(cs_params, call_args))
-                            for lhs_f, compat_f, rhs_f in cs_relations:
-                                _func_relations.append(
-                                    ([mapping.get(n, n) for n in lhs_f], compat_f,
-                                     [mapping.get(n, n) for n in rhs_f])
-                                )
-                        elif _entry_name in self._constras and not (
-                                self.expect(TokenType.LOGICAL_AND) or
-                                self._is_relconstraint_op()):
-                            # Bare constra name - map template params in order of appearance
-                            cs_params, cs_relations = self._constras[_entry_name]
-                            # Collect template params seen so far (in declaration order)
-                            ordered_tparams = [p for p in template_params]
-                            if len(cs_params) != len(ordered_tparams):
-                                self.current_token = _entry_tok
-                                self.error(
-                                    f"Named constraint set '{_entry_name}' has {len(cs_params)} "
-                                    f"parameter(s) but the template has {len(ordered_tparams)} "
-                                    f"parameter(s); use explicit arguments: '{_entry_name}(...)'"
-                                )
-                            mapping = dict(zip(cs_params, ordered_tparams))
-                            for lhs_f, compat_f, rhs_f in cs_relations:
-                                _func_relations.append(
-                                    ([mapping.get(n, n) for n in lhs_f], compat_f,
-                                     [mapping.get(n, n) for n in rhs_f])
-                                )
-                        else:
-                            # Raw relation: lhs already started with _entry_name
-                            lhs = [_entry_name]
-                            while self.expect(TokenType.LOGICAL_AND):
-                                self.advance()
-                                lhs.append(self.consume(TokenType.IDENTIFIER).value)
-                            op = self._consume_relconstraint_op()
-                            rhs = _parse_id_list()
-                            _func_relations.append((lhs, op, rhs))
-                    _parse_one_cs_entry()
-                    while self.expect(TokenType.COMMA):
-                        self.advance()
-                        _parse_one_cs_entry()
-                    self.consume(TokenType.RIGHT_BRACE)
-                # Helper: parse a param entry with optional <!+ prefix and constraint with optional + default
-                def _parse_param_entry(param_name):
-                    if self.expect(TokenType.COLON):
-                        template_params.append(param_name)
-                        self.advance()
-                        _allowed = []
-                        _default_ts = None
-                        _saw_default = False
-                        _default_tok = None
-                        # parse first alternative
-                        _is_default = self.expect(TokenType.PLUS)
-                        if _is_default:
-                            _default_tok = self.current_token
-                            self.advance()
-                            _saw_default = True
-                        _src = '""' if self.expect(TokenType.STRING_LITERAL) else None
-                        _ts = self.type_spec()
-                        _allowed.append((_ts, _src or _ts_repr_simple(_ts)))
-                        if _is_default:
-                            _default_ts = _ts
-                        while self.expect(TokenType.LOGICAL_OR):
-                            self.advance()
-                            _is_default = self.expect(TokenType.PLUS)
-                            if _is_default:
-                                if _default_tok is None:
-                                    _default_tok = self.current_token
-                                self.advance()
-                                _saw_default = True
-                            _src = '""' if self.expect(TokenType.STRING_LITERAL) else None
-                            _ts = self.type_spec()
-                            _allowed.append((_ts, _src or _ts_repr_simple(_ts)))
-                            if _is_default:
-                                _default_ts = _ts
-                        _func_constraints[param_name] = _allowed
-                        if _saw_default:
-                            if param_name in _func_no_default:
-                                _saved_err_tok = self.current_token
-                                if _default_tok is not None:
-                                    self.current_token = _default_tok
-                                self.error(
-                                    f"Template parameter '{param_name}' is marked '!+' (no default) "
-                                    f"but a default type was supplied with '+'"
-                                )
-                                self.current_token = _saved_err_tok
-                            _func_defaults[param_name] = _default_ts
-                    else:
-                        template_params.append(param_name)
-                # Parse first entry: ':{...}' constraint set, or identifier param entry
-                if self.expect(TokenType.COLON):
-                    _parse_constraint_set_fd()
-                else:
-                    _no_default_first = False
-                    if self.expect(TokenType.NOT):
-                        self.advance()
-                        self.consume(TokenType.PLUS)
-                        _no_default_first = True
-                    if self.expect(TokenType.CODIFY):
-                        _first_id = self._consume_codify()
-                    else:
-                        _first_id = self.consume(TokenType.IDENTIFIER).value
-                    if _no_default_first:
-                        _func_no_default.add(_first_id)
-                    if self.expect(TokenType.LOGICAL_AND) or self._is_relconstraint_op():
-                        self.error(
-                            f"Relational template constraints must be wrapped in a constraint set as :{{T ~= U}}. "
-                            f"Did you mean :{{{_first_id} ~= ...}}, or did you intend a type constraint {_first_id}: ?"
-                        )
-                    _parse_param_entry(_first_id)
-                while self.expect(TokenType.COMMA):
-                    self.advance()
-                    if self.expect(TokenType.COLON):
-                        _parse_constraint_set_fd()
-                    else:
-                        _no_default_next = False
-                        if self.expect(TokenType.NOT):
-                            self.advance()
-                            self.consume(TokenType.PLUS)
-                            _no_default_next = True
-                        if self.expect(TokenType.CODIFY):
-                            _next_id = self._consume_codify()
-                        else:
-                            _next_id = self.consume(TokenType.IDENTIFIER).value
-                        if _no_default_next:
-                            _func_no_default.add(_next_id)
-                        if self.expect(TokenType.LOGICAL_AND) or self._is_relconstraint_op():
-                            self.error(
-                                f"Relational template constraints must be wrapped in a constraint set: :{{T ~= U}}. "
-                                f"Did you mean :{{{_next_id} ~= ...}}, or did you intend a type constraint {_next_id}: ?"
-                            )
-                        _parse_param_entry(_next_id)
-                self.consume(TokenType.GREATER_THAN)
+                (template_params, _func_constraints,
+                 _func_relations, _func_defaults,
+                 _func_no_default) = self._parse_template_param_list(allow_codify=False)
 
         # Expose template param names so type_spec() can detect and defer
         # myStru<T>-style type arguments that are still unresolved template params.
@@ -2653,11 +2480,9 @@ class FluxParser:
                                    is_recursive, is_inline, is_deprecated)
             if self._in_comptime > 0:
                 func_def._is_comptime_only = True
-            self._templates.register(name, 'function', template_params, func_def,
-                                     constraints=_func_constraints or {},
-                                     relational=_func_relations or [],
-                                     defaults=_func_defaults or {},
-                                     no_default=_func_no_default or set())
+            self._register_template_function(name, template_params, func_def,
+                                              _func_constraints, _func_relations,
+                                              _func_defaults, _func_no_default)
             # Comptime template functions must be returned so the VM codegen sees
             # the definition and compiles it into compiled_functions.
             if self._in_comptime > 0:
@@ -3225,6 +3050,7 @@ class FluxParser:
         sd.set_location(tok.line, tok.column)
         if template_params:
             self._templates.register(name, 'struct', template_params, sd)
+            self._last_template_registered = name
             if self._in_comptime > 0:
                 sd._is_comptime_only = True
                 return sd
@@ -3277,10 +3103,34 @@ class FluxParser:
     def trait_def(self) -> 'TraitDef':
         """
         trait_def -> 'trait' IDENTIFIER '{' (function_prototype ';')* '}' ';'
+                   | 'trait' IDENTIFIER '=' IDENTIFIER ('&' IDENTIFIER)* ';'
         """
         tok = self.current_token
         self.consume(TokenType.TRAIT)
         name = self.consume(TokenType.IDENTIFIER).value
+
+        # Trait composition: trait Foo = Bar & Baz & Qux;
+        if self.expect(TokenType.ASSIGN):
+            self.advance()
+            composed = [self.consume(TokenType.IDENTIFIER).value]
+            while self.expect(TokenType.LOGICAL_AND):
+                self.advance()
+                composed.append(self.consume(TokenType.IDENTIFIER).value)
+            self.consume(TokenType.SEMICOLON)
+            # Flatten the prototypes of all named traits into a new TraitDef
+            prototypes = []
+            for base_name in composed:
+                base = self._parsed_traits.get(base_name)
+                if base is None:
+                    self.error(
+                        f"Trait composition error: '{base_name}' must be defined "
+                        f"before it can be composed into '{name}'"
+                    )
+                prototypes.extend(base.prototypes)
+            trait = TraitDef(name, prototypes).set_location(tok.line, tok.column)
+            self._parsed_traits[name] = trait
+            return trait
+
         self.consume(TokenType.LEFT_BRACE)
         prototypes = []
         self._in_trait += 1
@@ -3304,7 +3154,9 @@ class FluxParser:
         self._in_trait -= 1
         self.consume(TokenType.RIGHT_BRACE)
         self.consume(TokenType.SEMICOLON)
-        return TraitDef(name, prototypes).set_location(tok.line, tok.column)
+        trait = TraitDef(name, prototypes).set_location(tok.line, tok.column)
+        self._parsed_traits[name] = trait
+        return trait
 
     def interface_def(self) -> 'InterfaceDef':
         """
@@ -3511,13 +3363,11 @@ class FluxParser:
         if len(names) > 1:
             self.error("Comma-separated names are only allowed for prototypes (forward declarations)")
 
-        # Pre-register in _templates before parsing the body so that
-        # type_spec() can resolve self-referential return types like Tensor<T>*
-        # inside method signatures (e.g. def __expr() -> Tensor<T>*).
-        # We store a sentinel now and overwrite with the real ObjectDef after.
+        # Add to the forward-decl set before parsing the body so that type_spec()
+        # can resolve self-referential return types like Tensor<T>* inside method
+        # signatures without needing a sentinel ObjectDef in the registry.
         if template_params:
-            _sentinel = ObjectDef(name, [], [], [], [], traits=traits, template_params=template_params)
-            self._templates.register(name, 'object', template_params, _sentinel)
+            self._template_object_forward_decls.add(name)
 
         self.consume(TokenType.LEFT_BRACE)
         
@@ -3543,18 +3393,18 @@ class FluxParser:
                         _is_override = True
                         self.advance()  # consume '+'
                     if self.expect(TokenType.INLINE) or self.expect(TokenType.DEF) or self.current_token.type in _CALLING_CONV_TOKENS:
-                        _obj_tmpl_keys_before = set(self._templates.all_of_kind('function').keys())
+                        self._last_template_registered = None
                         method = self.function_def()
                         if method is None:
                             # Template method: re-register under qualified ObjectName.methodname key
                             # and record a stub in methods so trait compliance can see the name.
-                            _new_method_names = [k for k in self._templates.all_of_kind('function')
-                                                 if k not in _obj_tmpl_keys_before]
-                            for bare_name in _new_method_names:
+                            bare_name = self._last_template_registered
+                            if bare_name:
                                 qualified = f"{name}.{bare_name}"
                                 self._templates.register_alias(qualified, bare_name)
-                            bare_name = _new_method_names[-1] if _new_method_names else next(reversed(self._templates.all_of_kind('function')))
-                            recovered = self._templates.lookup(bare_name).node
+                            recovered = self._templates.lookup(bare_name).node if bare_name else None
+                            if recovered is None:
+                                self.error("Internal: template method registered no name")
                             stub = FunctionDef(recovered.name, [], recovered.return_type,
                                                Block([]), is_prototype=True)
                             stub._is_template_method = True
@@ -3626,18 +3476,18 @@ class FluxParser:
                     _is_override = True
                     self.advance()  # consume '+'
                 if self.expect(TokenType.INLINE) or self.expect(TokenType.DEF) or self.current_token.type in _CALLING_CONV_TOKENS:
-                    _obj_tmpl_keys_before = set(self._templates.all_of_kind('function').keys())
+                    self._last_template_registered = None
                     method = self.function_def()
                     if method is None:
                         # Template method: re-register under qualified ObjectName.methodname key
                         # and record a stub in methods so trait compliance can see the name.
-                        _new_method_names = [k for k in self._templates.all_of_kind('function')
-                                             if k not in _obj_tmpl_keys_before]
-                        for bare_name in _new_method_names:
+                        bare_name = self._last_template_registered
+                        if bare_name:
                             qualified = f"{name}.{bare_name}"
                             self._templates.register_alias(qualified, bare_name)
-                        bare_name = _new_method_names[-1] if _new_method_names else next(reversed(self._templates.all_of_kind('function')))
-                        recovered = self._templates.lookup(bare_name).node
+                        recovered = self._templates.lookup(bare_name).node if bare_name else None
+                        if recovered is None:
+                            self.error("Internal: template method registered no name")
                         stub = FunctionDef(recovered.name, [], recovered.return_type,
                                            Block([]), is_prototype=True)
                         stub._is_template_method = True
@@ -3732,8 +3582,54 @@ class FluxParser:
                 self._object_init_params[name] = len(explicit_params)
                 break
 
-        # __expr is mandatory on every fully-defined object (not prototypes).
-        # Validate its signature if present; error if absent.
+        # __init, __exit, and __expr are all mandatory on every fully-defined object.
+        # Validate presence and signatures for each.
+
+        # --- __init ---
+        init_method = next((m for m in methods if isinstance(m, FunctionDef) and m.name == '__init'), None)
+        if init_method is None:
+            self.error(
+                f"Object '{name}' is missing a __init() method. "
+                f"Every object must define 'def __init(...) -> this {{ ... }};' "
+                f"to specify its constructor."
+            )
+        else:
+            ret = init_method.return_type
+            is_this_return = (
+                ret is not None
+                and getattr(ret, 'base_type', None) == DataType.THIS
+            )
+            if not is_this_return:
+                self.error(
+                    f"Object '{name}': __init() must return 'this'"
+                )
+
+        # --- __exit ---
+        exit_method = next((m for m in methods if isinstance(m, FunctionDef) and m.name == '__exit'), None)
+        if exit_method is None:
+            self.error(
+                f"Object '{name}' is missing a __exit() method. "
+                f"Every object must define 'def __exit() -> void {{ ... }};' "
+                f"to specify its destructor."
+            )
+        else:
+            explicit_params = [p for p in exit_method.parameters if p.name != 'this']
+            if explicit_params:
+                self.error(
+                    f"Object '{name}': __exit() must take no parameters "
+                    f"(got {len(explicit_params)})"
+                )
+            ret = exit_method.return_type
+            is_void = (
+                ret is None
+                or (ret.base_type == DataType.VOID and not getattr(ret, 'is_pointer', False))
+            )
+            if not is_void:
+                self.error(
+                    f"Object '{name}': __exit() must return void"
+                )
+
+        # --- __expr ---
         expr_method = next((m for m in methods if isinstance(m, FunctionDef) and m.name == '__expr'), None)
         if expr_method is None:
             self.error(
@@ -3758,12 +3654,30 @@ class FluxParser:
                     f"Object '{name}': __expr() must have a non-void return type"
                 )
 
+        # Trait compliance: verify the object implements every non-template
+        # prototype required by each trait it declares.
+        implemented_names = {m.name for m in methods if isinstance(m, FunctionDef)}
+        for trait_name in traits:
+            trait_def_node = self._parsed_traits.get(trait_name)
+            if trait_def_node is None:
+                self.error(f"Object '{name}' declares trait '{trait_name}' which has not been defined")
+            for proto in trait_def_node.prototypes:
+                if getattr(proto, '_is_trait_template_proto', False):
+                    continue  # template protos are checked at instantiation time
+                if proto.name not in implemented_names:
+                    self.error(
+                        f"Object '{name}' doesn't implement required function '{proto.name}' "
+                        f"from trait '{trait_name}'"
+                    )
+
         obj_def = ObjectDef(name, methods, members, nested_objects, nested_structs, traits=traits, template_params=template_params, interfaces=interface_attachments)
         obj_def.base_objects = base_objects
         obj_def = obj_def.set_location(tok.line, tok.column)
         _obj_tmpl_scope_ctx.__exit__(None, None, None)
+        self._template_object_forward_decls.discard(name)
         if template_params:
             self._templates.register(name, 'object', template_params, obj_def)
+            self._last_template_registered = name
             return None
         self._parsed_objects[name] = obj_def
         return obj_def
@@ -3826,15 +3740,14 @@ class FluxParser:
                     func_ptr = self.function_pointer_declaration(calling_conv=cc_str)
                     variables.append(func_ptr)
                 else:
-                    _ns_tmpl_keys_before = set(self._templates.all_of_kind('function').keys())
+                    self._last_template_registered = None
                     func = self.function_def()
                     # function_def() returns None for template functions (deferred instantiation).
                     if func is None:
                         # Register the template under its namespace-qualified names so that
                         # call-site lookup resolves correctly.
-                        _new_bare_names = [k for k in self._templates.all_of_kind('function')
-                                           if k not in _ns_tmpl_keys_before]
-                        for bare_name in _new_bare_names:
+                        bare_name = self._last_template_registered
+                        if bare_name:
                             ns_mangled = f"{current_namespace}__{bare_name}"
                             ns_scoped  = f"{current_namespace}::{bare_name}"
                             self._templates.register_alias(ns_mangled, bare_name)
@@ -3856,13 +3769,11 @@ class FluxParser:
                 # In that case we must still register the template under all the qualified
                 # names callers may use to reference it, then skip adding it to `structs`.
                 if struct_result is None:
-                    # The template was registered under its bare name by struct_def.
-                    # Also register it under the namespace-qualified forms so that
-                    # type_spec() can find it when the caller writes XYZ::myStru2<int>.
-                    if self._templates.all_of_kind('struct'):
-                        bare_name = next(reversed(self._templates.all_of_kind('struct')))
-                        # Register under  "NS__bare"  and  "NS::bare"  so both lookup
-                        # styles hit the same template definition.
+                    # struct_def() set _last_template_registered to the bare name it registered.
+                    # Register it under the namespace-qualified forms so that type_spec() can
+                    # find it when the caller writes XYZ::myStru2<int>.
+                    bare_name = self._last_template_registered
+                    if bare_name:
                         ns_mangled = f"{current_namespace}__{bare_name}"
                         ns_scoped  = f"{current_namespace}::{bare_name}"
                         self._templates.register_alias(ns_mangled, bare_name)
@@ -3885,9 +3796,8 @@ class FluxParser:
                 obj_result = self.object_def()
                 # object_def() returns None for template objects (deferred instantiation).
                 if obj_result is None:
-                    # Register under namespace-qualified names so type_spec() can find it.
-                    if self._templates.all_of_kind('object'):
-                        bare_name = next(reversed(self._templates.all_of_kind('object')))
+                    bare_name = self._last_template_registered
+                    if bare_name:
                         ns_mangled = f"{current_namespace}__{bare_name}"
                         ns_scoped  = f"{current_namespace}::{bare_name}"
                         self._templates.register_alias(ns_mangled, bare_name)
@@ -3907,8 +3817,8 @@ class FluxParser:
             elif self._is_trait_prefixed_object():
                 obj_result = self._parse_trait_prefixed_object()
                 if obj_result is None:
-                    if self._templates.all_of_kind('object'):
-                        bare_name = next(reversed(self._templates.all_of_kind('object')))
+                    bare_name = self._last_template_registered
+                    if bare_name:
                         ns_mangled = f"{current_namespace}__{bare_name}"
                         ns_scoped  = f"{current_namespace}::{bare_name}"
                         self._templates.register_alias(ns_mangled, bare_name)
@@ -4117,6 +4027,9 @@ class FluxParser:
             elif custom_typename in self._templates and self._templates.lookup(custom_typename).kind == 'object':
                 _tmpl_key = custom_typename
                 _is_object_tmpl = True
+            elif custom_typename in self._template_object_forward_decls:
+                _tmpl_key = custom_typename
+                _is_object_tmpl = True
             else:
                 # "XYZ_TEST::myStru2" -> try "XYZ_TEST__myStru2"
                 _mangled_attempt = custom_typename.replace("::", "__")
@@ -4261,7 +4174,7 @@ class FluxParser:
             if is_array:
                 if t.array_dimensions:
                     t.is_array = True
-                    t.array_dimensions = t.array_dimensions + (array_dimensions or [])
+                    t.array_dimensions = (array_dimensions or []) + t.array_dimensions
                     t.array_size = t.array_dimensions[0] if t.array_dimensions else t.array_size
                 else:
                     t.is_array = True
@@ -4647,6 +4560,13 @@ class FluxParser:
             while self.expect(TokenType.MULTIPLY):
                 self.advance()
 
+            # Skip bare array brackets: FieldSpec[].func(), int[].func(), etc.
+            if self.expect(TokenType.LEFT_BRACKET):
+                self.advance()
+                if not self.expect(TokenType.RIGHT_BRACKET):
+                    return False
+                self.advance()
+
             # Must be followed by '.'
             if not self.expect(TokenType.DOT):
                 return False
@@ -4736,11 +4656,11 @@ class FluxParser:
         return None
 
     @staticmethod
-    def _type_func_receiver_type_spec(type_name: str, pointer_depth: int = 0) -> 'TypeSystem':
+    def _type_func_receiver_type_spec(type_name: str, pointer_depth: int = 0, is_array: bool = False) -> 'TypeSystem':
         """
         Build a TypeSystem for the implicit ``_`` parameter of a type
-        function, given the canonical type-name string and pointer depth.
-        pointer_depth > 0 means the receiver is a pointer (e.g. byte* receiver).
+        function, given the canonical type-name string, pointer depth, and
+        whether the receiver is an unsized array (e.g. FieldSpec[]).
         """
         _BUILTIN_MAP = {
             'byte':   DataType.BYTE,
@@ -4758,11 +4678,16 @@ class FluxParser:
             depth = max(1, pointer_depth)
             return TypeSystem(base_type=DataType.BYTE, pointer_depth=depth, is_pointer=True)
         if type_name in _BUILTIN_MAP:
+            base = _BUILTIN_MAP[type_name]
+            if is_array:
+                return TypeSystem(base_type=base, is_array=True, array_size=None)
             if pointer_depth > 0:
-                return TypeSystem(base_type=_BUILTIN_MAP[type_name],
-                                  pointer_depth=pointer_depth, is_pointer=True)
-            return TypeSystem(base_type=_BUILTIN_MAP[type_name])
+                return TypeSystem(base_type=base, pointer_depth=pointer_depth, is_pointer=True)
+            return TypeSystem(base_type=base)
         # Named struct/object type
+        if is_array:
+            return TypeSystem(base_type=DataType.DATA, custom_typename=type_name,
+                              is_array=True, array_size=None)
         if pointer_depth > 0:
             return TypeSystem(base_type=DataType.DATA, custom_typename=type_name,
                               pointer_depth=pointer_depth, is_pointer=True)
@@ -4777,7 +4702,7 @@ class FluxParser:
             RECEIVER.func_name([params]) -> return_type ;          (prototype)
 
         The receiver establishes the type that the function extends.  Within
-        the body ``_`` is an implicit first parameter holding the receiver value.
+        the body ``this`` is an implicit first parameter holding the receiver value.
         """
         tok = self.current_token
 
@@ -4805,6 +4730,13 @@ class FluxParser:
             recv_pointer_depth += 1
             self.advance()
 
+        # Consume bare array brackets: FieldSpec[].func(), int[].func(), etc.
+        recv_is_array = False
+        if self.expect(TokenType.LEFT_BRACKET):
+            self.advance()
+            self.consume(TokenType.RIGHT_BRACKET)
+            recv_is_array = True
+
         self.consume(TokenType.DOT)
 
         if self.expect(TokenType.F_STRING, TokenType.I_STRING):
@@ -4823,18 +4755,11 @@ class FluxParser:
 
         # --- Optional template parameter list: byte.my_func<T, U>(...) ---
         # Supports optional per-param constraints: byte.my_func<T: int | float>(...) ---
-        def _ts_repr_simple_tf(ts):
-            name = ts.custom_typename if ts.custom_typename else (ts.base_type.value if hasattr(ts.base_type, 'value') else str(ts.base_type))
-            if ts.is_pointer:
-                name += '*' * ts.pointer_depth
-            if ts.is_array:
-                name += '[]'
-            return name
         template_params = []
-        _typefunc_constraints = {}  # param_name -> list of (TypeSystem, source_text)
-        _typefunc_relations = []    # list of (lhs_names, op: str, rhs_names)
-        _typefunc_defaults = {}     # param_name -> TypeSystem (the default type)
-        _typefunc_no_default = set()  # param_names marked <!+
+        _typefunc_constraints = {}
+        _typefunc_relations = []
+        _typefunc_defaults = {}
+        _typefunc_no_default = set()
         if self.expect(TokenType.LESS_THAN, TokenType.RECURSE_ARROW):
             # RECURSE_ARROW '<~' is lexed as a single token; split it by consuming it
             # and injecting a synthetic TIE token so the rest of the parser sees '<' + '~'.
@@ -4981,188 +4906,9 @@ class FluxParser:
                     if self.expect(TokenType.GREATER_THAN):
                         is_template = True
             if is_template:
-                self.advance()  # consume '<'
-                def _parse_id_list_tf():
-                    if self.expect(TokenType.CODIFY):
-                        names = [self._consume_codify()]
-                    else:
-                        names = [self.consume(TokenType.IDENTIFIER).value]
-                    while self.expect(TokenType.LOGICAL_AND):
-                        self.advance()
-                        if self.expect(TokenType.CODIFY):
-                            names.append(self._consume_codify())
-                        else:
-                            names.append(self.consume(TokenType.IDENTIFIER).value)
-                    return names
-                # Helper: parse a ':{' ... '}' constraint set and collect relational constraints
-                def _parse_constraint_set_tf():
-                    self.consume(TokenType.COLON)
-                    self.consume(TokenType.LEFT_BRACE)
-                    def _parse_one_cs_entry_tf():
-                        _entry_tok = self.current_token
-                        if self.expect(TokenType.CODIFY):
-                            _entry_name = self._consume_codify()
-                            _entry_is_codify = True
-                        else:
-                            _entry_name = self.consume(TokenType.IDENTIFIER).value
-                            _entry_is_codify = False
-                        if not _entry_is_codify and self.expect(TokenType.LEFT_PAREN):
-                            # Named constra with explicit args: MyCS(T, U)
-                            if _entry_name not in self._constras:
-                                self.current_token = _entry_tok
-                                self.error(f"Unknown named constraint set '{_entry_name}'")
-                            cs_params, cs_relations = self._constras[_entry_name]
-                            self.advance()  # consume '('
-                            call_args = []
-                            if not self.expect(TokenType.RIGHT_PAREN):
-                                call_args.append(self.consume(TokenType.IDENTIFIER).value)
-                                while self.expect(TokenType.COMMA):
-                                    self.advance()
-                                    call_args.append(self.consume(TokenType.IDENTIFIER).value)
-                            self.consume(TokenType.RIGHT_PAREN)
-                            if len(call_args) != len(cs_params):
-                                self.current_token = _entry_tok
-                                self.error(
-                                    f"Named constraint set '{_entry_name}' expects "
-                                    f"{len(cs_params)} argument(s), got {len(call_args)}"
-                                )
-                            for arg in call_args:
-                                if arg not in template_params:
-                                    self.error(
-                                        f"'{arg}' is not a template parameter; "
-                                        f"valid parameters are: {', '.join(template_params)}"
-                                    )
-                            mapping = dict(zip(cs_params, call_args))
-                            for lhs_f, compat_f, rhs_f in cs_relations:
-                                _typefunc_relations.append(
-                                    ([mapping.get(n, n) for n in lhs_f], compat_f,
-                                     [mapping.get(n, n) for n in rhs_f])
-                                )
-                        elif not _entry_is_codify and _entry_name in self._constras and not (
-                                self.expect(TokenType.LOGICAL_AND) or
-                                self._is_relconstraint_op()):
-                            # Bare constra name - map template params in order of appearance
-                            cs_params, cs_relations = self._constras[_entry_name]
-                            ordered_tparams = [p for p in template_params]
-                            if len(cs_params) != len(ordered_tparams):
-                                self.current_token = _entry_tok
-                                self.error(
-                                    f"Named constraint set '{_entry_name}' has {len(cs_params)} "
-                                    f"parameter(s) but the template has {len(ordered_tparams)} "
-                                    f"parameter(s); use explicit arguments: '{_entry_name}(...)'"
-                                )
-                            mapping = dict(zip(cs_params, ordered_tparams))
-                            for lhs_f, compat_f, rhs_f in cs_relations:
-                                _typefunc_relations.append(
-                                    ([mapping.get(n, n) for n in lhs_f], compat_f,
-                                     [mapping.get(n, n) for n in rhs_f])
-                                )
-                        else:
-                            # Raw relation
-                            lhs = [_entry_name]
-                            while self.expect(TokenType.LOGICAL_AND):
-                                self.advance()
-                                if self.expect(TokenType.CODIFY):
-                                    lhs.append(self._consume_codify())
-                                else:
-                                    lhs.append(self.consume(TokenType.IDENTIFIER).value)
-                            op = self._consume_relconstraint_op()
-                            rhs = _parse_id_list_tf()
-                            _typefunc_relations.append((lhs, op, rhs))
-                    _parse_one_cs_entry_tf()
-                    while self.expect(TokenType.COMMA):
-                        self.advance()
-                        _parse_one_cs_entry_tf()
-                    self.consume(TokenType.RIGHT_BRACE)
-                def _parse_param_entry_tf(param_name):
-                    if self.expect(TokenType.COLON):
-                        template_params.append(param_name)
-                        self.advance()
-                        _allowed = []
-                        _default_ts = None
-                        _saw_default = False
-                        _default_tok = None
-                        _is_default = self.expect(TokenType.PLUS)
-                        if _is_default:
-                            _default_tok = self.current_token
-                            self.advance()
-                            _saw_default = True
-                        _src = '""' if self.expect(TokenType.STRING_LITERAL) else None
-                        _ts = self.type_spec()
-                        _allowed.append((_ts, _src or _ts_repr_simple_tf(_ts)))
-                        if _is_default:
-                            _default_ts = _ts
-                        while self.expect(TokenType.LOGICAL_OR):
-                            self.advance()
-                            _is_default = self.expect(TokenType.PLUS)
-                            if _is_default:
-                                if _default_tok is None:
-                                    _default_tok = self.current_token
-                                self.advance()
-                                _saw_default = True
-                            _src = '""' if self.expect(TokenType.STRING_LITERAL) else None
-                            _ts = self.type_spec()
-                            _allowed.append((_ts, _src or _ts_repr_simple_tf(_ts)))
-                            if _is_default:
-                                _default_ts = _ts
-                        _typefunc_constraints[param_name] = _allowed
-                        if _saw_default:
-                            if param_name in _typefunc_no_default:
-                                _saved_err_tok = self.current_token
-                                if _default_tok is not None:
-                                    self.current_token = _default_tok
-                                self.error(
-                                    f"Template parameter '{param_name}' is marked '!+' (no default) "
-                                    f"but a default type was supplied with '+'"
-                                )
-                                self.current_token = _saved_err_tok
-                            _typefunc_defaults[param_name] = _default_ts
-                    else:
-                        template_params.append(param_name)
-                # Parse first entry: ':{...}' constraint set, or identifier param entry
-                if self.expect(TokenType.COLON):
-                    _parse_constraint_set_tf()
-                else:
-                    _no_default_first = False
-                    if self.expect(TokenType.NOT):
-                        self.advance()
-                        self.consume(TokenType.PLUS)
-                        _no_default_first = True
-                    if self.expect(TokenType.CODIFY):
-                        _first_id = self._consume_codify()
-                    else:
-                        _first_id = self.consume(TokenType.IDENTIFIER).value
-                    if _no_default_first:
-                        _typefunc_no_default.add(_first_id)
-                    if self.expect(TokenType.LOGICAL_AND, TokenType.TIE) or (self.expect(TokenType.NOT) and not self.expect(TokenType.COLON)):
-                        self.error(
-                            f"Relational template constraints must be wrapped in a constraint set :{{T ~ U}}. "
-                            f"Did you mean :{{{_first_id} ~ ...}}, or did you intend a type constraint {_first_id}: ?"
-                        )
-                    _parse_param_entry_tf(_first_id)
-                while self.expect(TokenType.COMMA):
-                    self.advance()
-                    if self.expect(TokenType.COLON):
-                        _parse_constraint_set_tf()
-                    else:
-                        _no_default_next = False
-                        if self.expect(TokenType.NOT):
-                            self.advance()
-                            self.consume(TokenType.PLUS)
-                            _no_default_next = True
-                        if self.expect(TokenType.CODIFY):
-                            _next_id = self._consume_codify()
-                        else:
-                            _next_id = self.consume(TokenType.IDENTIFIER).value
-                        if _no_default_next:
-                            _typefunc_no_default.add(_next_id)
-                        if self.expect(TokenType.LOGICAL_AND, TokenType.TIE) or (self.expect(TokenType.NOT) and not self.expect(TokenType.COLON)):
-                            self.error(
-                                f"Relational template constraints must be wrapped in a constraint set :{{T ~ U}}."
-                                f"\nDid you mean :{{{_next_id} ~ ...}}, or did you intend a type constraint {_next_id}:"
-                            )
-                        _parse_param_entry_tf(_next_id)
-                self.consume(TokenType.GREATER_THAN)
+                (template_params, _typefunc_constraints,
+                 _typefunc_relations, _typefunc_defaults,
+                 _typefunc_no_default) = self._parse_template_param_list(allow_codify=True)
 
         # Expose template param names so type_spec() inside params/return type defers them.
         _tf_tmpl_scope_ctx = self._template_scope(template_params if template_params else [])
@@ -5177,7 +4923,7 @@ class FluxParser:
         self.consume(TokenType.RETURN_ARROW)
         return_type = self.type_spec()
 
-        receiver_ts = self._type_func_receiver_type_spec(type_name, recv_pointer_depth)
+        receiver_ts = self._type_func_receiver_type_spec(type_name, recv_pointer_depth, recv_is_array)
         if recv_is_tied:
             receiver_ts.is_tied = True
 
@@ -5188,6 +4934,8 @@ class FluxParser:
             effective_type_name = 'string'
         elif recv_pointer_depth > 0:
             effective_type_name = type_name + '_ptr' * recv_pointer_depth
+        elif recv_is_array:
+            effective_type_name = type_name + '_arr'
         else:
             effective_type_name = type_name
         if recv_is_tied:
@@ -5202,11 +4950,9 @@ class FluxParser:
                 receiver_param = Parameter(name='_', type_spec=receiver_ts)
                 synthetic_fd = FunctionDef(mangled_base, [receiver_param] + list(parameters),
                                            return_type, Block([]), is_prototype=True)
-                self._templates.register(mangled_base, 'function', template_params, synthetic_fd,
-                                         constraints=_typefunc_constraints or {},
-                                         relational=_typefunc_relations or [],
-                                         defaults=_typefunc_defaults or {},
-                                         no_default=_typefunc_no_default or set())
+                self._register_template_function(mangled_base, template_params, synthetic_fd,
+                                                 _typefunc_constraints, _typefunc_relations,
+                                                 _typefunc_defaults, _typefunc_no_default)
                 return None
             return TypeFuncDef(
                 type_name=effective_type_name,
@@ -5228,11 +4974,9 @@ class FluxParser:
             receiver_param = Parameter(name='_', type_spec=receiver_ts)
             synthetic_fd = FunctionDef(mangled_base, [receiver_param] + list(parameters),
                                        return_type, body)
-            self._templates.register(mangled_base, 'function', template_params, synthetic_fd,
-                                     constraints=_typefunc_constraints or {},
-                                     relational=_typefunc_relations or [],
-                                     defaults=_typefunc_defaults or {},
-                                     no_default=_typefunc_no_default or set())
+            self._register_template_function(mangled_base, template_params, synthetic_fd,
+                                             _typefunc_constraints, _typefunc_relations,
+                                             _typefunc_defaults, _typefunc_no_default)
             return None
 
         return TypeFuncDef(
@@ -6114,6 +5858,18 @@ class FluxParser:
             value = self.expression()
         self.consume(TokenType.SEMICOLON)
         return ReturnStatement(value).set_location(tok.line, tok.column)
+
+    def return_arrow_ret(self) -> ReturnStatement:
+        """
+        '->' expression? ';'
+        """
+        tok = self.current_token
+        self.consume(TokenType.RETURN_ARROW)
+        value = None
+        if not self.expect(TokenType.SEMICOLON):
+            value = self.expression()
+        self.consume(TokenType.SEMICOLON)
+        return ReturnStatement(value).set_location(tok.line, tok.column)
     
     def break_statement(self) -> BreakStatement:
         """
@@ -6255,12 +6011,38 @@ class FluxParser:
         self.consume(TokenType.SEMICOLON)
         return NoreturnStatement().set_location(tok.line, tok.column)
 
-    def expression_statement(self) -> ExpressionStatement:
+    def expression_statement(self) -> Union[ExpressionStatement, List[Statement]]:
         """
         expression_statement -> expression ';'
+                              | expression member_assign_block   (when expr is lvalue and '{' follows)
+                              | expression array_assign_block    (when expr is array lvalue and '{' with '[' items follows)
         """
         tok = self.current_token
         expr = self.expression()
+
+        # Member-assign block: `base { .field = val; ... };`
+        # Array-assign block:  `base { [idx] = val; ... };`
+        # Triggered when an lvalue expression is immediately followed by '{'.
+        if self.expect(TokenType.LEFT_BRACE) and isinstance(expr, (Identifier, ArrayAccess, MemberAccess)):
+            # Peek past '{' to decide which block variant this is.
+            # peek(1) is the token immediately after the current '{'.
+            next_tok = self.peek(1)
+            if next_tok is not None and next_tok.type == TokenType.LEFT_BRACKET:
+                stmts = self._array_assign_block(expr, tok)
+            else:
+                stmts = self._member_assign_block(expr, tok)
+            self.consume(TokenType.SEMICOLON)
+            self._last_call_expr = None
+            if self._source_lines and 1 <= tok.line <= len(self._source_lines):
+                self._last_noncall_src = self._source_lines[tok.line - 1].rstrip('\r\n')
+            else:
+                self._last_noncall_src = ''
+            # Returned as a flat list (same convention used throughout this parser,
+            # e.g. multiple declarations) so the caller's `isinstance(stmt, list)`
+            # handling splices each desugared assignment in as its own statement,
+            # matching the shape codegen already handles for `base.field = val;`.
+            return stmts
+
         self.consume(TokenType.SEMICOLON)
         # Track ditto-in-args context across statements.
         if isinstance(expr, FunctionCall):
@@ -6276,6 +6058,120 @@ class FluxParser:
                 self._last_noncall_src = ''
         return ExpressionStatement(expr).set_location(tok.line, tok.column)
     
+    def _member_assign_block(self, base: Expression, tok) -> List[Statement]:
+        """
+        member_assign_block -> '{' member_assign_item* '}'
+
+        member_assign_item ->
+            '.' IDENTIFIER '=' expression ';'
+          | '.' IDENTIFIER '[' expression ']' '=' expression ';'
+          | '.' IDENTIFIER '{' member_assign_item* '}'  ';'
+
+        Desugars to a flat list of ExpressionStatement(Assignment) nodes -
+        the exact same shape as writing `base.field = val;` by hand - rather
+        than a single Block wrapped in one ExpressionStatement. Nested
+        `.field { ... }` blocks are flattened into this same list rather than
+        nested, since a Block is a compound statement in its own right, not
+        an expression a single ExpressionStatement can wrap and evaluate.
+
+        Declarations and non-member statements inside the block are illegal.
+        """
+        self.consume(TokenType.LEFT_BRACE)
+        statements: List[Statement] = []
+
+        while not self.expect(TokenType.RIGHT_BRACE):
+            # Every item must start with '.'
+            if not self.expect(TokenType.DOT):
+                self.error(
+                    "declarations and non-member statements are illegal inside "
+                    "a member-assign block; expected '.' or '}'",
+                    TokenType.DOT
+                )
+
+            item_tok = self.current_token
+            self.consume(TokenType.DOT)
+            field_name = self.consume(TokenType.IDENTIFIER).value
+            member = MemberAccess(base, field_name).set_location(item_tok.line, item_tok.column)
+
+            if self.expect(TokenType.LEFT_BRACE):
+                # Nested block: .field { ... }; - flatten into the same list.
+                # Peek past '{' to decide: '[' items -> array-assign, '.' items -> member-assign.
+                _inner_next = self.peek(1)
+                if _inner_next is not None and _inner_next.type == TokenType.LEFT_BRACKET:
+                    nested_stmts = self._array_assign_block(member, item_tok)
+                else:
+                    nested_stmts = self._member_assign_block(member, item_tok)
+                self.consume(TokenType.SEMICOLON)
+                statements.extend(nested_stmts)
+
+            elif self.expect(TokenType.LEFT_BRACKET):
+                # Array element: .field[idx] = expr;
+                #             or .field[idx] { nested block };
+                self.consume(TokenType.LEFT_BRACKET)
+                idx_expr = self.expression()
+                self.consume(TokenType.RIGHT_BRACKET)
+                lvalue = ArrayAccess(member, idx_expr).set_location(item_tok.line, item_tok.column)
+
+                if self.expect(TokenType.LEFT_BRACE):
+                    # Nested block on subscripted member: .field[idx] { .x = ...; }; 
+                    nested_stmts = self._member_assign_block(lvalue, item_tok)
+                    self.consume(TokenType.SEMICOLON)
+                    statements.extend(nested_stmts)
+                else:
+                    self.consume(TokenType.ASSIGN)
+                    rvalue = self.expression()
+                    self.consume(TokenType.SEMICOLON)
+                    assignment = Assignment(lvalue, rvalue).set_location(item_tok.line, item_tok.column)
+                    statements.append(ExpressionStatement(assignment).set_location(item_tok.line, item_tok.column))
+
+            else:
+                # Simple: .field = expr;
+                self.consume(TokenType.ASSIGN)
+                rvalue = self.expression()
+                self.consume(TokenType.SEMICOLON)
+                assignment = Assignment(member, rvalue).set_location(item_tok.line, item_tok.column)
+                statements.append(ExpressionStatement(assignment).set_location(item_tok.line, item_tok.column))
+
+        self.consume(TokenType.RIGHT_BRACE)
+        return statements
+
+    def _array_assign_block(self, base: Expression, tok) -> List[Statement]:
+        """
+        array_assign_block -> '{' array_assign_item* '}'
+
+        array_assign_item -> '[' expression ']' '=' expression ';'
+
+        Desugars to a flat list of ExpressionStatement(Assignment) nodes,
+        identical in shape to writing `base[idx] = val;` by hand.
+
+        Only index-assignment items are legal inside this block; member
+        (dot) items and declarations are not permitted.
+        """
+        self.consume(TokenType.LEFT_BRACE)
+        statements: List[Statement] = []
+
+        while not self.expect(TokenType.RIGHT_BRACE):
+            if not self.expect(TokenType.LEFT_BRACKET):
+                self.error(
+                    "only index-assignment items '[idx] = val;' are legal inside "
+                    "an array-assign block; expected '[' or '}'",
+                    TokenType.LEFT_BRACKET
+                )
+
+            item_tok = self.current_token
+            self.consume(TokenType.LEFT_BRACKET)
+            idx_expr = self.expression()
+            self.consume(TokenType.RIGHT_BRACKET)
+            lvalue = ArrayAccess(base, idx_expr).set_location(item_tok.line, item_tok.column)
+            self.consume(TokenType.ASSIGN)
+            rvalue = self.expression()
+            self.consume(TokenType.SEMICOLON)
+            assignment = Assignment(lvalue, rvalue).set_location(item_tok.line, item_tok.column)
+            statements.append(ExpressionStatement(assignment).set_location(item_tok.line, item_tok.column))
+
+        self.consume(TokenType.RIGHT_BRACE)
+        return statements
+
     def expression(self) -> Expression:
         """
         expression -> assignment_expression
@@ -6294,8 +6190,22 @@ class FluxParser:
         
         if self.expect(TokenType.ASSIGN):
             self.advance()
-            value = self.assignment_expression()
-            
+            if self.expect(TokenType.DITTO):
+                import copy
+                self.advance()  # consume DITTO
+                prev = self._last_stmt
+                if prev is None:
+                    self.error("Ditto #\" in assignment: no preceding statement to repeat")
+                if isinstance(prev, ExpressionStatement):
+                    inner = prev.expression
+                else:
+                    inner = prev
+                if not isinstance(inner, Assignment):
+                    self.error("Ditto #\" in assignment: preceding statement is not an assignment")
+                value = copy.deepcopy(inner.value)
+            else:
+                value = self.assignment_expression()
+
             # Check if this is struct field assignment
             if isinstance(expr, MemberAccess):
                 # This could be struct field assignment or object member assignment
@@ -6305,7 +6215,7 @@ class FluxParser:
             else:
                 return Assignment(expr, value).set_location(tok.line, tok.column)
         elif self.expect(TokenType.PLUS_ASSIGN, TokenType.MINUS_ASSIGN, TokenType.MULTIPLY_ASSIGN, 
-                         TokenType.DIVIDE_ASSIGN, TokenType.MODULO_ASSIGN, TokenType.POWER_ASSIGN,
+                         TokenType.DIVIDE_ASSIGN, TokenType.MODULO_ASSIGN, TokenType.EXPONENT_ASSIGN,
                          TokenType.XOR_ASSIGN, TokenType.BITXOR_ASSIGN, TokenType.BITXNOR_ASSIGN, TokenType.BITSHIFT_LEFT_ASSIGN, TokenType.BITSHIFT_RIGHT_ASSIGN,
                          TokenType.BITAND_ASSIGN, TokenType.BITOR_ASSIGN, TokenType.BITNAND_ASSIGN, TokenType.BITNOR_ASSIGN,
                          TokenType.OR_ASSIGN, TokenType.AND_ASSIGN):
@@ -6508,7 +6418,7 @@ class FluxParser:
 
     def bitwise_xor_expression(self) -> Expression:
         """
-        bitwise_xor_expression -> bitwise_and_expression (('`^^' | '`^^!|') bitwise_and_expression)*
+        bitwise_xor_expression -> bitwise_and_expression (('`^|' | '`^|!|') bitwise_and_expression)*
         """
         expr = self.bitwise_and_expression()
         
@@ -6650,7 +6560,7 @@ class FluxParser:
         """
         expr = self.cast_expression()
         
-        while self.expect(TokenType.MULTIPLY, TokenType.DIVIDE, TokenType.MODULO, TokenType.POWER):
+        while self.expect(TokenType.MULTIPLY, TokenType.DIVIDE, TokenType.MODULO, TokenType.EXPONENT):
             op_tok = self.current_token
             if self.current_token.type == TokenType.MULTIPLY:
                 operator = Operator.MUL
@@ -6716,7 +6626,7 @@ class FluxParser:
     
     def unary_expression(self) -> Expression:
         """
-        unary_expression -> ('is' 'not' | '-' | '+' | '*' | '@' | '++' | '--' | '`!' | '`^^!' | '`^^!&' | '`^^!|') unary_expression
+        unary_expression -> ('is' 'not' | '-' | '+' | '*' | '@' | '++' | '--' | '`!' | '`^|!' | '`^|!&' | '`^|!|') unary_expression
                          | postfix_expression
         """
         if self.expect(TokenType.IS):
@@ -6807,192 +6717,658 @@ class FluxParser:
         else:
             return self.postfix_expression()
     
+    # ------------------------------------------------------------------
+    # Shared template-inference helpers (Step 1 of template refactor)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ts_repr_simple(ts) -> str:
+        """Produce a readable source-like string for a TypeSystem (for constraint error messages)."""
+        name = ts.custom_typename if ts.custom_typename else (
+            ts.base_type.value if hasattr(ts.base_type, 'value') else str(ts.base_type))
+        if ts.is_pointer:
+            name += '*' * ts.pointer_depth
+        if ts.is_array:
+            name += '[]'
+        return name
+
+    def _register_template_function(self, name: str, template_params: list,
+                                     node, constraints: dict, relations: list,
+                                     defaults: dict, no_default: set) -> None:
+        """Register a template function (or type-function) in the template registry.
+
+        Centralises the ``self._templates.register(...)`` call so that
+        ``function_def``, ``type_function_definition``, and ``operator_def``
+        all go through one place, making future changes (e.g. adding a new
+        keyword argument to ``TemplateRegistry.register``) a one-line edit.
+        """
+        self._templates.register(
+            name, 'function', template_params, node,
+            constraints=constraints or {},
+            relational=relations or [],
+            defaults=defaults or {},
+            no_default=no_default or set(),
+        )
+        self._last_template_registered = name
+
+    def _parse_template_param_list(self, allow_codify: bool = False):
+        """Parse a template parameter list ``< T, U: int|float, ... >`` and return
+        ``(template_params, constraints, relations, defaults, no_default)``.
+
+        Must be called when ``self.current_token`` is already the ``<`` token
+        (caller has already confirmed via lookahead that this is a template list,
+        not a comparison operator).  Consumes the closing ``>``.
+
+        Parameters
+        ----------
+        allow_codify : bool
+            When True (type-function context), relation list identifiers and entry
+            names inside constraint-sets may be prefixed with the CODIFY (``~$``)
+            operator.  When False (regular function context), only bare IDENTIFIERs
+            are accepted there.
+        """
+        self.advance()  # consume '<'
+
+        template_params: list = []
+        constraints: dict = {}        # param_name -> [(TypeSystem, source_text)]
+        relations: list = []          # [(lhs_names, op, rhs_names)]
+        defaults: dict = {}           # param_name -> TypeSystem
+        no_default: set = set()       # param_names marked <!+
+
+        def _consume_id_or_codify():
+            """Consume and return IDENTIFIER or ~$ CODIFY token value."""
+            if allow_codify and self.expect(TokenType.CODIFY):
+                return self._consume_codify()
+            return self.consume(TokenType.IDENTIFIER).value
+
+        def _parse_id_list():
+            """Parse one side of a relation: (CODIFY? IDENTIFIER) ('&' (CODIFY? IDENTIFIER))*"""
+            names = [_consume_id_or_codify()]
+            while self.expect(TokenType.LOGICAL_AND):
+                self.advance()
+                names.append(_consume_id_or_codify())
+            return names
+
+        def _parse_constraint_set():
+            """Parse ':{ entry, ... }' and append relations into the outer ``relations`` list."""
+            self.consume(TokenType.COLON)
+            self.consume(TokenType.LEFT_BRACE)
+
+            def _parse_one_cs_entry():
+                _entry_tok = self.current_token
+                # In allow_codify mode the entry name itself can be a ~$ token
+                if allow_codify and self.expect(TokenType.CODIFY):
+                    _entry_name = self._consume_codify()
+                    _is_codify = True
+                else:
+                    _entry_name = self.consume(TokenType.IDENTIFIER).value
+                    _is_codify = False
+
+                if not _is_codify and self.expect(TokenType.LEFT_PAREN):
+                    # Named constra with explicit args: MyCS(T, U)
+                    if _entry_name not in self._constras:
+                        self.current_token = _entry_tok
+                        self.error(f"Unknown named constraint set '{_entry_name}'")
+                    cs_params, cs_relations = self._constras[_entry_name]
+                    self.advance()  # consume '('
+                    call_args = []
+                    if not self.expect(TokenType.RIGHT_PAREN):
+                        call_args.append(self.consume(TokenType.IDENTIFIER).value)
+                        while self.expect(TokenType.COMMA):
+                            self.advance()
+                            call_args.append(self.consume(TokenType.IDENTIFIER).value)
+                    self.consume(TokenType.RIGHT_PAREN)
+                    if len(call_args) != len(cs_params):
+                        self.current_token = _entry_tok
+                        self.error(
+                            f"Named constraint set '{_entry_name}' expects "
+                            f"{len(cs_params)} argument(s), got {len(call_args)}"
+                        )
+                    for arg in call_args:
+                        if arg not in template_params:
+                            self.error(
+                                f"'{arg}' is not a template parameter; "
+                                f"valid parameters are: {', '.join(template_params)}"
+                            )
+                    mapping = dict(zip(cs_params, call_args))
+                    for lhs_f, compat_f, rhs_f in cs_relations:
+                        relations.append(
+                            ([mapping.get(n, n) for n in lhs_f], compat_f,
+                             [mapping.get(n, n) for n in rhs_f])
+                        )
+                elif not _is_codify and _entry_name in self._constras and not (
+                        self.expect(TokenType.LOGICAL_AND) or
+                        self._is_relconstraint_op()):
+                    # Bare constra name - map template params in order of appearance
+                    cs_params, cs_relations = self._constras[_entry_name]
+                    ordered_tparams = list(template_params)
+                    if len(cs_params) != len(ordered_tparams):
+                        self.current_token = _entry_tok
+                        self.error(
+                            f"Named constraint set '{_entry_name}' has {len(cs_params)} "
+                            f"parameter(s) but the template has {len(ordered_tparams)} "
+                            f"parameter(s); use explicit arguments: '{_entry_name}(...)'"
+                        )
+                    mapping = dict(zip(cs_params, ordered_tparams))
+                    for lhs_f, compat_f, rhs_f in cs_relations:
+                        relations.append(
+                            ([mapping.get(n, n) for n in lhs_f], compat_f,
+                             [mapping.get(n, n) for n in rhs_f])
+                        )
+                else:
+                    # Raw relation: lhs already started with _entry_name
+                    lhs = [_entry_name]
+                    while self.expect(TokenType.LOGICAL_AND):
+                        self.advance()
+                        lhs.append(_consume_id_or_codify())
+                    op = self._consume_relconstraint_op()
+                    rhs = _parse_id_list()
+                    relations.append((lhs, op, rhs))
+
+            _parse_one_cs_entry()
+            while self.expect(TokenType.COMMA):
+                self.advance()
+                _parse_one_cs_entry()
+            self.consume(TokenType.RIGHT_BRACE)
+
+        def _parse_param_entry(param_name):
+            """Parse an optional ``: type1 | +type2 | ...`` constraint clause for *param_name*."""
+            if self.expect(TokenType.COLON):
+                template_params.append(param_name)
+                self.advance()
+                _allowed = []
+                _default_ts = None
+                _saw_default = False
+                _default_tok = None
+                # parse first alternative
+                _is_default = self.expect(TokenType.PLUS)
+                if _is_default:
+                    _default_tok = self.current_token
+                    self.advance()
+                    _saw_default = True
+                _src = '""' if self.expect(TokenType.STRING_LITERAL) else None
+                _ts = self.type_spec()
+                _allowed.append((_ts, _src or self._ts_repr_simple(_ts)))
+                if _is_default:
+                    _default_ts = _ts
+                while self.expect(TokenType.LOGICAL_OR):
+                    self.advance()
+                    _is_default = self.expect(TokenType.PLUS)
+                    if _is_default:
+                        if _default_tok is None:
+                            _default_tok = self.current_token
+                        self.advance()
+                        _saw_default = True
+                    _src = '""' if self.expect(TokenType.STRING_LITERAL) else None
+                    _ts = self.type_spec()
+                    _allowed.append((_ts, _src or self._ts_repr_simple(_ts)))
+                    if _is_default:
+                        _default_ts = _ts
+                constraints[param_name] = _allowed
+                if _saw_default:
+                    if param_name in no_default:
+                        _saved_err_tok = self.current_token
+                        if _default_tok is not None:
+                            self.current_token = _default_tok
+                        self.error(
+                            f"Template parameter '{param_name}' is marked '!+' (no default) "
+                            f"but a default type was supplied with '+'"
+                        )
+                        self.current_token = _saved_err_tok
+                    defaults[param_name] = _default_ts
+            else:
+                template_params.append(param_name)
+
+        # Parse first entry: ':{...}' constraint set, or identifier param entry
+        if self.expect(TokenType.COLON):
+            _parse_constraint_set()
+        else:
+            _no_default_first = False
+            if self.expect(TokenType.NOT):
+                self.advance()
+                self.consume(TokenType.PLUS)
+                _no_default_first = True
+            _first_id = _consume_id_or_codify()
+            if _no_default_first:
+                no_default.add(_first_id)
+            if self.expect(TokenType.LOGICAL_AND) or self._is_relconstraint_op():
+                self.error(
+                    f"Relational template constraints must be wrapped in a constraint set "
+                    f"as :{{T ~= U}}. Did you mean :{{{_first_id} ~= ...}}, or did you "
+                    f"intend a type constraint {_first_id}: ?"
+                )
+            _parse_param_entry(_first_id)
+
+        while self.expect(TokenType.COMMA):
+            self.advance()
+            if self.expect(TokenType.COLON):
+                _parse_constraint_set()
+            else:
+                _no_default_next = False
+                if self.expect(TokenType.NOT):
+                    self.advance()
+                    self.consume(TokenType.PLUS)
+                    _no_default_next = True
+                _next_id = _consume_id_or_codify()
+                if _no_default_next:
+                    no_default.add(_next_id)
+                if self.expect(TokenType.LOGICAL_AND) or self._is_relconstraint_op():
+                    self.error(
+                        f"Relational template constraints must be wrapped in a constraint "
+                        f"set: :{{T ~= U}}. Did you mean :{{{_next_id} ~= ...}}, or did "
+                        f"you intend a type constraint {_next_id}: ?"
+                    )
+                _parse_param_entry(_next_id)
+
+        self.consume(TokenType.GREATER_THAN)
+        return template_params, constraints, relations, defaults, no_default
+
+    _LITERAL_DT_MAP = None  # populated on first use
+
+    @classmethod
+    def _literal_dt_map(cls):
+        if cls._LITERAL_DT_MAP is None:
+            cls._LITERAL_DT_MAP = {
+                DataType.SINT:   TypeSystem(base_type=DataType.SINT,   is_signed=True),
+                DataType.UINT:   TypeSystem(base_type=DataType.UINT,   is_signed=False),
+                DataType.SLONG:  TypeSystem(base_type=DataType.SLONG,  is_signed=True),
+                DataType.ULONG:  TypeSystem(base_type=DataType.ULONG,  is_signed=False),
+                DataType.FLOAT:  TypeSystem(base_type=DataType.FLOAT),
+                DataType.DOUBLE: TypeSystem(base_type=DataType.DOUBLE),
+                DataType.CHAR:   TypeSystem(base_type=DataType.CHAR,   is_signed=True),
+                DataType.BOOL:   TypeSystem(base_type=DataType.BOOL),
+                DataType.BYTE:   TypeSystem(base_type=DataType.BYTE),
+            }
+        return cls._LITERAL_DT_MAP
+
+    def _infer_type_from_arg(self, arg) -> 'TypeSystem | None':
+        """Return the TypeSystem implied by a single call-site argument expression.
+
+        Handles:
+          * Identifier  -> symbol-table lookup
+          * Literal     -> DataType -> TypeSystem map
+          * StringLiteral -> byte* (pointer to i8)
+
+        AddressOf(@x) unwrapping is done by the caller before passing `arg`
+        so this method only sees the inner expression.
+
+        Returns None when the type cannot be determined.
+        """
+        if isinstance(arg, Identifier):
+            return self.symbol_table.get_type_spec(arg.name)
+        if isinstance(arg, Literal):
+            return self._literal_dt_map().get(arg.type)
+        if isinstance(arg, StringLiteral):
+            return TypeSystem(base_type=DataType.BYTE, is_signed=True,
+                              bit_width=8, is_pointer=True, pointer_depth=1)
+        return None
+
+    def _infer_template_params(self, entry: 'TemplateEntry', args: list,
+                               skip_first_param: bool = False) -> 'dict | None':
+        """Infer template-param -> TypeSystem bindings from call-site arguments.
+
+        Matches each declared function parameter's type-spec against the
+        corresponding call-site argument (via _infer_type_from_arg), handling:
+          * bare template params  (e.g. declared type is T)
+          * deferred struct params (e.g. declared type is Tensor<T>)
+
+        `skip_first_param` – set True for type-function calls where the first
+        declared parameter is the implicit `this` receiver (already consumed).
+
+        Returns a dict {param_name: TypeSystem} on success, or None when not
+        all params could be inferred (caller should decide what to do).
+        """
+        template_param_names = entry.params
+        template_func = entry.node
+        inferred: dict = {}
+
+        decl_params = template_func.parameters
+        if skip_first_param:
+            decl_params = decl_params[1:]
+
+        for i, decl_param in enumerate(decl_params):
+            if i >= len(args):
+                break
+            param_ts = decl_param.type_spec
+            if param_ts is None:
+                continue
+
+            param_tname = (
+                param_ts.custom_typename if param_ts.custom_typename
+                else (param_ts.base_type if isinstance(param_ts.base_type, str) else None)
+            )
+
+            # Deferred struct param: "Tensor<T>" – build struct_param_map then clear param_tname
+            struct_param_map = {}  # template_param_name -> inner arg index
+            if param_tname and '<' in param_tname and '>' in param_tname:
+                bracket = param_tname.index('<')
+                inner_args = [a.strip() for a in param_tname[bracket + 1:-1].split(',')]
+                for idx2, inner in enumerate(inner_args):
+                    if inner in template_param_names:
+                        struct_param_map[inner] = idx2
+                param_tname = None  # declared type is a struct, not a bare param name
+
+            if param_tname is not None and param_tname not in template_param_names:
+                continue  # concrete declared type – no inference needed
+
+            arg = args[i]
+            # Unwrap address-of (@x) to allow symbol-table lookup of the inner identifier
+            if (isinstance(arg, AddressOf)
+                    and isinstance(getattr(arg, 'expression', None), Identifier)):
+                arg = arg.expression
+
+            if struct_param_map:
+                # The argument must be a struct/object instance; recover the concrete
+                # type args from the mangled name (e.g. Tensor__float -> float).
+                arg_ts = self.symbol_table.get_type_spec(arg.name) if isinstance(arg, Identifier) else None
+                if arg_ts and arg_ts.custom_typename:
+                    arg_ctn = arg_ts.custom_typename
+                    _entries = {**self._templates.all_of_kind('struct'),
+                                **self._templates.all_of_kind('object')}
+                    for tmpl_name, _te in _entries.items():
+                        sep = tmpl_name + '__'
+                        if arg_ctn.startswith(sep) or arg_ctn == tmpl_name:
+                            suffix = arg_ctn[len(sep):]
+                            concrete_args = suffix.split('__') if suffix else []
+                            for tparam, pos in struct_param_map.items():
+                                if pos < len(concrete_args) and tparam not in inferred:
+                                    carg = concrete_args[pos]
+                                    resolved = self.symbol_table.get_type_spec(carg)
+                                    if resolved is None:
+                                        _dtbv = {dt.value: dt for dt in DataType}
+                                        if carg in _dtbv:
+                                            resolved = TypeSystem(base_type=_dtbv[carg],
+                                                is_signed=_dtbv[carg] in (DataType.SINT, DataType.CHAR))
+                                        else:
+                                            resolved = TypeSystem(base_type=DataType.DATA,
+                                                                  custom_typename=carg)
+                                    inferred[tparam] = resolved
+                            break
+            elif param_tname is not None:
+                inferred_ts = self._infer_type_from_arg(arg)
+                if inferred_ts is not None:
+                    inferred[param_tname] = inferred_ts
+
+        return inferred
+
+    @staticmethod
+    def _ts_matches(concrete, allowed) -> bool:
+        """Return True if concrete TypeSystem satisfies the allowed TypeSystem constraint."""
+        # object* is the erasure type for all object pointers -- it satisfies
+        # any constraint whose allowed type is a named object (DataType.DATA).
+        if (concrete.base_type == DataType.OBJECT and
+                allowed.base_type == DataType.DATA and
+                allowed.custom_typename is not None):
+            return True
+        if concrete.base_type != allowed.base_type:
+            return False
+        if concrete.is_pointer != allowed.is_pointer:
+            return False
+        if concrete.pointer_depth != allowed.pointer_depth:
+            return False
+        if concrete.is_array != allowed.is_array:
+            return False
+        if concrete.custom_typename != allowed.custom_typename:
+            return False
+        # bit_width: 0 means unspecified/default - treat 0 as wildcard
+        if allowed.bit_width and concrete.bit_width and concrete.bit_width != allowed.bit_width:
+            return False
+        return True
+
+    @staticmethod
+    def _types_compatible(a_ts, b_ts) -> bool:
+        """Return True if two TypeSystems are compatible for relational constraint (~=) checks."""
+        # Pointer vs non-pointer is always incompatible
+        if a_ts.is_pointer != b_ts.is_pointer:
+            return False
+        # Both pointer: pointer depth must match
+        if a_ts.is_pointer and a_ts.pointer_depth != b_ts.pointer_depth:
+            return False
+        # Width must match (0 means unresolved/default - treat as wildcard)
+        aw = a_ts.bit_width or 0
+        bw = b_ts.bit_width or 0
+        if aw and bw and aw != bw:
+            return False
+        return True
+
+    @staticmethod
+    def _walk_ast(node):
+        """Yield every AST node in the tree depth-first."""
+        if node is None:
+            return
+        yield node
+        for attr in vars(node).values():
+            if isinstance(attr, list):
+                for item in attr:
+                    if hasattr(item, '__dataclass_fields__'):
+                        yield from FluxParser._walk_ast(item)
+            elif hasattr(attr, '__dataclass_fields__'):
+                yield from FluxParser._walk_ast(attr)
+
+    @staticmethod
+    def _bw(ts) -> int:
+        """Return the bit width of a TypeSystem, or 0 if unknown."""
+        if ts is None:
+            return 0
+        if ts.bit_width:
+            return ts.bit_width
+        from ftypesys import get_builtin_bit_width as _gbw
+        try:
+            return _gbw(ts.base_type)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _ts_of_expr(expr, local_type_table):
+        """Best-effort TypeSystem for an expression node during body-level relation checks."""
+        from fast import (CastExpression as _CastExpr,
+                          TypeConvertExpression as _TypeConvExpr,
+                          Identifier as _Ident,
+                          Literal as _Literal)
+        ts = getattr(expr, '_resolved_type', None)
+        if ts is not None:
+            return ts
+        if isinstance(expr, (_CastExpr, _TypeConvExpr)):
+            return expr.target_type
+        if isinstance(expr, _Ident):
+            return local_type_table.get(expr.name)
+        if isinstance(expr, _Literal):
+            return TypeSystem(base_type=expr.type,
+                              is_signed=expr.type in (DataType.SINT, DataType.SLONG,
+                                                      DataType.CHAR, DataType.FLOAT,
+                                                      DataType.DOUBLE))
+        return None
+
+    def _substitute_type(self, ts, mapping):
+        """
+        Substitute template parameter names in a TypeSystem according to mapping.
+        Returns a (possibly new, shallow-copied) TypeSystem with params resolved.
+        Called by _substitute_node for every TypeSystem field encountered.
+        """
+        import copy
+        if not isinstance(ts, TypeSystem):
+            return ts
+        name = ts.custom_typename if ts.custom_typename else (
+            ts.base_type if isinstance(ts.base_type, str) else None)
+        if name and name in mapping:
+            concrete = mapping[name]
+            result = copy.copy(concrete)
+            if ts.is_pointer:
+                result.is_pointer = True
+                result.pointer_depth = (result.pointer_depth or 0) + ts.pointer_depth
+            if ts.is_array:
+                result.is_array = True
+                result.array_dimensions = ts.array_dimensions
+                result.array_size = ts.array_size
+            if ts.is_const:
+                result.is_const = True
+            if ts.is_volatile:
+                result.is_volatile = True
+            return result
+        # Deferred template struct/object: "Name<T,U>" where T/U may now be in mapping.
+        if name and '<' in name and '>' in name:
+            bracket = name.index('<')
+            struct_base = name[:bracket]
+            raw_args = name[bracket + 1:-1].split(',')
+            _sentry = self._templates.lookup(struct_base)
+            if _sentry is not None and _sentry.kind == 'struct' and any(a in mapping for a in raw_args):
+                concrete_type_names, concrete_type_specs = [], []
+                for arg in raw_args:
+                    arg = arg.strip()
+                    if arg in mapping:
+                        cts = mapping[arg]
+                        concrete_type_names.append(self._type_system_to_mangle_str(cts))
+                        concrete_type_specs.append(cts)
+                    else:
+                        concrete_type_names.append(arg)
+                        concrete_type_specs.append(TypeSystem(base_type=DataType.DATA, custom_typename=arg))
+                mangled = self._resolve_template_struct(struct_base, concrete_type_names, concrete_type_specs)
+                result = copy.copy(ts)
+                result.custom_typename = mangled
+                result.base_type = DataType.DATA
+                return result
+            if _sentry is not None and _sentry.kind == 'object' and any(a in mapping for a in raw_args):
+                concrete_type_names, concrete_type_specs = [], []
+                for arg in raw_args:
+                    arg = arg.strip()
+                    if arg in mapping:
+                        cts = mapping[arg]
+                        concrete_type_names.append(self._type_system_to_mangle_str(cts))
+                        concrete_type_specs.append(cts)
+                    else:
+                        concrete_type_names.append(arg)
+                        concrete_type_specs.append(TypeSystem(base_type=DataType.DATA, custom_typename=arg))
+                mangled = self._resolve_template_object(struct_base, concrete_type_names, concrete_type_specs)
+                result = copy.copy(ts)
+                result.custom_typename = mangled
+                result.base_type = DataType.DATA
+                return result
+        return copy.copy(ts)
+
+    def _substitute_node(self, obj, mapping):
+        """
+        Recursively deep-copy and substitute template params in an arbitrary AST value.
+        Handles TypeSystem, list, dict, str (deferred struct refs), Identifier, FunctionCall,
+        and any dataclass AST node. Called by _substitute_template.
+        """
+        import copy
+        if obj is None:
+            return None
+        if isinstance(obj, TypeSystem):
+            return self._substitute_type(obj, mapping)
+        if isinstance(obj, list):
+            return [self._substitute_node(item, mapping) for item in obj]
+        if isinstance(obj, dict):
+            return {k: self._substitute_node(v, mapping) for k, v in obj.items()}
+        # Resolve deferred template struct refs stored as strings in
+        # base_structs / post_structs: e.g. "A<T>" where T is in mapping.
+        if isinstance(obj, str):
+            if '<' in obj and '>' in obj and any(p in obj for p in mapping):
+                bracket = obj.index('<')
+                struct_base = obj[:bracket]
+                raw_args = obj[bracket + 1:-1].split(',')
+                _sentry = self._templates.lookup(struct_base)
+                if (_sentry is not None and _sentry.kind == 'struct' and
+                        any(a.strip() in mapping for a in raw_args)):
+                    concrete_type_names, concrete_type_specs = [], []
+                    for arg in raw_args:
+                        arg = arg.strip()
+                        if arg in mapping:
+                            cts = mapping[arg]
+                            concrete_type_names.append(self._type_system_to_mangle_str(cts))
+                            concrete_type_specs.append(cts)
+                        else:
+                            concrete_type_names.append(arg)
+                            concrete_type_specs.append(TypeSystem(base_type=DataType.DATA, custom_typename=arg))
+                    return self._resolve_template_struct(struct_base, concrete_type_names, concrete_type_specs)
+            return obj
+        if not hasattr(obj, '__dataclass_fields__'):
+            return obj
+        # Identifier used as expression whose name is a template param
+        # (e.g. sizeof(T) parses T as Identifier, not TypeSystem).
+        if isinstance(obj, Identifier) and obj.name in mapping:
+            return copy.copy(mapping[obj.name])
+        # Deferred template call: FunctionCall whose name is "func<T,U>"
+        # or "ObjName<T>.method" constructor/method call patterns.
+        if isinstance(obj, FunctionCall) and isinstance(obj.name, str) and '<' in obj.name and '>' in obj.name:
+            _gt_pos = obj.name.index('>')
+            if _gt_pos + 1 < len(obj.name) and obj.name[_gt_pos + 1] == '.':
+                _lt = obj.name.index('<')
+                _obj_base = obj.name[:_lt]
+                _raw_args = obj.name[_lt + 1:_gt_pos].split(',')
+                _method = obj.name[_gt_pos + 1:]
+                _oentry = self._templates.lookup(_obj_base)
+                if (_oentry is not None and _oentry.kind == 'object' and
+                        any(a.strip() in mapping for a in _raw_args)):
+                    _concrete_names, _concrete_specs = [], []
+                    for _a in _raw_args:
+                        _a = _a.strip()
+                        if _a in mapping:
+                            _cts = mapping[_a]
+                            _concrete_names.append(self._type_system_to_mangle_str(_cts))
+                            _concrete_specs.append(_cts)
+                        else:
+                            _concrete_names.append(_a)
+                            _concrete_specs.append(TypeSystem(base_type=DataType.DATA, custom_typename=_a))
+                    _mangled_obj = self._resolve_template_object(_obj_base, _concrete_names, _concrete_specs)
+                    _new_obj = copy.copy(obj)
+                    _new_obj.name = _mangled_obj + _method
+                    _new_obj.arguments = [self._substitute_node(a, mapping) for a in obj.arguments]
+                    return _new_obj
+            bracket = obj.name.index('<')
+            fn_base = obj.name[:bracket]
+            raw_args = obj.name[bracket + 1:-1].split(',')
+            _fentry = self._templates.lookup(fn_base)
+            if (_fentry is not None and _fentry.kind == 'function' and
+                    any(a.strip() in mapping for a in raw_args)):
+                concrete_type_names, concrete_type_specs = [], []
+                for arg in raw_args:
+                    arg = arg.strip()
+                    if arg in mapping:
+                        cts = mapping[arg]
+                        concrete_type_names.append(self._type_system_to_mangle_str(cts))
+                        concrete_type_specs.append(cts)
+                    else:
+                        concrete_type_names.append(arg)
+                        concrete_type_specs.append(TypeSystem(base_type=DataType.DATA, custom_typename=arg))
+                resolved_name = self._resolve_template_call(fn_base, concrete_type_names, concrete_type_specs)
+                new_obj = copy.copy(obj)
+                new_obj.name = resolved_name
+                new_obj.arguments = [self._substitute_node(a, mapping) for a in obj.arguments]
+                return new_obj
+            if (_fentry is not None and _fentry.kind == 'object' and
+                    any(a.strip() in mapping for a in raw_args)):
+                concrete_type_names, concrete_type_specs = [], []
+                for arg in raw_args:
+                    arg = arg.strip()
+                    if arg in mapping:
+                        cts = mapping[arg]
+                        concrete_type_names.append(self._type_system_to_mangle_str(cts))
+                        concrete_type_specs.append(cts)
+                    else:
+                        concrete_type_names.append(arg)
+                        concrete_type_specs.append(TypeSystem(base_type=DataType.DATA, custom_typename=arg))
+                resolved_name = self._resolve_template_object(fn_base, concrete_type_names, concrete_type_specs)
+                new_obj = copy.copy(obj)
+                new_obj.name = resolved_name
+                new_obj.arguments = [self._substitute_node(a, mapping) for a in obj.arguments]
+                return new_obj
+        # Dataclass AST node - shallow copy then recurse into fields
+        new_obj = copy.copy(obj)
+        for field_name in obj.__dataclass_fields__:
+            old_val = getattr(obj, field_name)
+            setattr(new_obj, field_name, self._substitute_node(old_val, mapping))
+        return new_obj
+
     def _substitute_template(self, node, mapping):
         """
         Deep-copy an AST node, substituting every TypeSystem whose custom_typename
         (or base_type string) appears in `mapping` with the corresponding concrete TypeSystem.
         Also substitutes Identifier nodes whose name is a template param, for cases
         where a param name appears as an expression (e.g. sizeof-style use).
+        Delegates to _substitute_node / _substitute_type for the recursive walk.
         """
-        import copy
-
-        def sub_type(ts):
-            if not isinstance(ts, TypeSystem):
-                return ts
-            # Check if the whole type is a template param
-            name = ts.custom_typename if ts.custom_typename else (
-                ts.base_type if isinstance(ts.base_type, str) else None)
-            if name and name in mapping:
-                concrete = mapping[name]
-                # Copy concrete and carry over pointer/array depth from the template usage
-                result = copy.copy(concrete)
-                if ts.is_pointer:
-                    result.is_pointer = True
-                    result.pointer_depth = (result.pointer_depth or 0) + ts.pointer_depth
-                if ts.is_array:
-                    result.is_array = True
-                    result.array_dimensions = ts.array_dimensions
-                    result.array_size = ts.array_size
-                if ts.is_const:
-                    result.is_const = True
-                if ts.is_volatile:
-                    result.is_volatile = True
-                return result
-            # Deferred template struct/object application: "Name<T,U>" where T/U may now
-            # be in the mapping.  Resolve it to the concrete mangled name.
-            if name and '<' in name and '>' in name:
-                bracket = name.index('<')
-                struct_base = name[:bracket]
-                raw_args = name[bracket + 1:-1].split(',')
-                _sentry = self._templates.lookup(struct_base)
-                if _sentry is not None and _sentry.kind == 'struct' and any(a in mapping for a in raw_args):
-                    concrete_type_names = []
-                    concrete_type_specs = []
-                    for arg in raw_args:
-                        arg = arg.strip()
-                        if arg in mapping:
-                            concrete_ts = mapping[arg]
-                            concrete_type_names.append(self._type_system_to_mangle_str(concrete_ts))
-                            concrete_type_specs.append(concrete_ts)
-                        else:
-                            # Arg is already a concrete name (e.g. another non-param type)
-                            concrete_type_names.append(arg)
-                            concrete_type_specs.append(TypeSystem(base_type=DataType.DATA, custom_typename=arg))
-                    mangled = self._resolve_template_struct(struct_base, concrete_type_names, concrete_type_specs)
-                    result = copy.copy(ts)
-                    result.custom_typename = mangled
-                    result.base_type = DataType.DATA
-                    return result
-                if _sentry is not None and _sentry.kind == 'object' and any(a in mapping for a in raw_args):
-                    concrete_type_names = []
-                    concrete_type_specs = []
-                    for arg in raw_args:
-                        arg = arg.strip()
-                        if arg in mapping:
-                            concrete_ts = mapping[arg]
-                            concrete_type_names.append(self._type_system_to_mangle_str(concrete_ts))
-                            concrete_type_specs.append(concrete_ts)
-                        else:
-                            concrete_type_names.append(arg)
-                            concrete_type_specs.append(TypeSystem(base_type=DataType.DATA, custom_typename=arg))
-                    mangled = self._resolve_template_object(struct_base, concrete_type_names, concrete_type_specs)
-                    result = copy.copy(ts)
-                    result.custom_typename = mangled
-                    result.base_type = DataType.DATA
-                    return result
-            return copy.copy(ts)
-
-        def walk(obj):
-            if obj is None:
-                return None
-            if isinstance(obj, TypeSystem):
-                return sub_type(obj)
-            if isinstance(obj, list):
-                return [walk(item) for item in obj]
-            if isinstance(obj, dict):
-                return {k: walk(v) for k, v in obj.items()}
-            # Resolve deferred template struct refs stored as strings in
-            # base_structs / post_structs: e.g. "A<T>" where T is in mapping.
-            if isinstance(obj, str):
-                if '<' in obj and '>' in obj and any(p in obj for p in mapping):
-                    bracket = obj.index('<')
-                    struct_base = obj[:bracket]
-                    raw_args = obj[bracket + 1:-1].split(',')
-                    _sentry = self._templates.lookup(struct_base)
-                    if _sentry is not None and _sentry.kind == 'struct' and any(a.strip() in mapping for a in raw_args):
-                        concrete_type_names = []
-                        concrete_type_specs = []
-                        for arg in raw_args:
-                            arg = arg.strip()
-                            if arg in mapping:
-                                concrete_ts = mapping[arg]
-                                concrete_type_names.append(self._type_system_to_mangle_str(concrete_ts))
-                                concrete_type_specs.append(concrete_ts)
-                            else:
-                                concrete_type_names.append(arg)
-                                concrete_type_specs.append(TypeSystem(base_type=DataType.DATA, custom_typename=arg))
-                        return self._resolve_template_struct(struct_base, concrete_type_names, concrete_type_specs)
-                return obj
-            if not hasattr(obj, '__dataclass_fields__'):
-                return obj
-            # Identifier used as expression whose name is a template param
-            # (e.g. sizeof(T) parses T as Identifier, not TypeSystem).
-            if isinstance(obj, Identifier) and obj.name in mapping:
-                return copy.copy(mapping[obj.name])
-            # Deferred template call: FunctionCall whose name is "func<T,U>"
-            # or "ObjName<T>.method" constructor/method call patterns.
-            if isinstance(obj, FunctionCall) and isinstance(obj.name, str) and '<' in obj.name and '>' in obj.name:
-                # Handle "ObjName<T>.method" - substitute the type arg in the object name.
-                _gt_pos = obj.name.index('>')
-                if _gt_pos + 1 < len(obj.name) and obj.name[_gt_pos + 1] == '.':
-                    _lt = obj.name.index('<')
-                    _obj_base = obj.name[:_lt]
-                    _raw_args = obj.name[_lt + 1:_gt_pos].split(',')
-                    _method = obj.name[_gt_pos + 1:]  # e.g. '.__init'
-                    _oentry = self._templates.lookup(_obj_base)
-                    if _oentry is not None and _oentry.kind == 'object' and any(a.strip() in mapping for a in _raw_args):
-                        _concrete_names = []
-                        _concrete_specs = []
-                        for _a in _raw_args:
-                            _a = _a.strip()
-                            if _a in mapping:
-                                _cts = mapping[_a]
-                                _concrete_names.append(self._type_system_to_mangle_str(_cts))
-                                _concrete_specs.append(_cts)
-                            else:
-                                _concrete_names.append(_a)
-                                _concrete_specs.append(TypeSystem(base_type=DataType.DATA, custom_typename=_a))
-                        _mangled_obj = self._resolve_template_object(_obj_base, _concrete_names, _concrete_specs)
-                        _new_obj = copy.copy(obj)
-                        _new_obj.name = _mangled_obj + _method
-                        _new_obj.arguments = [walk(a) for a in obj.arguments]
-                        return _new_obj
-                bracket = obj.name.index('<')
-                fn_base = obj.name[:bracket]
-                raw_args = obj.name[bracket + 1:-1].split(',')
-                _fentry = self._templates.lookup(fn_base)
-                if _fentry is not None and _fentry.kind == 'function' and any(a.strip() in mapping for a in raw_args):
-                    concrete_type_names = []
-                    concrete_type_specs = []
-                    for arg in raw_args:
-                        arg = arg.strip()
-                        if arg in mapping:
-                            cts = mapping[arg]
-                            concrete_type_names.append(self._type_system_to_mangle_str(cts))
-                            concrete_type_specs.append(cts)
-                        else:
-                            concrete_type_names.append(arg)
-                            concrete_type_specs.append(TypeSystem(base_type=DataType.DATA, custom_typename=arg))
-                    resolved_name = self._resolve_template_call(fn_base, concrete_type_names, concrete_type_specs)
-                    new_obj = copy.copy(obj)
-                    new_obj.name = resolved_name
-                    new_obj.arguments = [walk(a) for a in obj.arguments]
-                    return new_obj
-                if _fentry is not None and _fentry.kind == 'object' and any(a.strip() in mapping for a in raw_args):
-                    concrete_type_names = []
-                    concrete_type_specs = []
-                    for arg in raw_args:
-                        arg = arg.strip()
-                        if arg in mapping:
-                            cts = mapping[arg]
-                            concrete_type_names.append(self._type_system_to_mangle_str(cts))
-                            concrete_type_specs.append(cts)
-                        else:
-                            concrete_type_names.append(arg)
-                            concrete_type_specs.append(TypeSystem(base_type=DataType.DATA, custom_typename=arg))
-                    resolved_name = self._resolve_template_object(fn_base, concrete_type_names, concrete_type_specs)
-                    new_obj = copy.copy(obj)
-                    new_obj.name = resolved_name
-                    new_obj.arguments = [walk(a) for a in obj.arguments]
-                    return new_obj
-            # It's a dataclass AST node - shallow copy then recurse into fields
-            new_obj = copy.copy(obj)
-            for field_name in obj.__dataclass_fields__:
-                old_val = getattr(obj, field_name)
-                setattr(new_obj, field_name, walk(old_val))
-            return new_obj
-
-        return walk(node)
+        return self._substitute_node(node, mapping)
 
     def _type_system_to_mangle_str(self, ts):
         """Produce a short string identifying a TypeSystem for name mangling.
@@ -7016,6 +7392,62 @@ class FluxParser:
             return f"data_{sign}{ts.bit_width}"
         return base
 
+    def _build_template_mapping(self, template_params, type_names, type_specs):
+        """
+        Build the param-name → TypeSystem substitution mapping shared by all
+        instantiation paths.
+
+        Resolution order for each param:
+          1. A pre-resolved TypeSystem from type_specs (avoids lossy mangle round-trip).
+          2. A symbol-table alias (e.g. 'u64' → DATA/64-bit).
+          3. A primitive DataType keyword ('sint', 'float', …).
+          4. Fall back to a DATA custom_typename from the mangle string.
+        """
+        _datatype_by_value = {dt.value: dt for dt in DataType}
+        mapping = {}
+        specs = type_specs or []
+        for i, (param, tname) in enumerate(zip(template_params, type_names)):
+            if i < len(specs) and specs[i] is not None:
+                mapping[param] = specs[i]
+            else:
+                resolved = self.symbol_table.get_type_spec(tname)
+                if resolved is not None:
+                    mapping[param] = resolved
+                elif tname in _datatype_by_value:
+                    dt = _datatype_by_value[tname]
+                    mapping[param] = TypeSystem(
+                        base_type=dt,
+                        is_signed=dt in (DataType.SINT, DataType.CHAR))
+                else:
+                    mapping[param] = TypeSystem(base_type=DataType.DATA, custom_typename=tname)
+        return mapping
+
+    def _instantiate_template_node(self, kind, name, template_params, template_node,
+                                   type_names, type_specs, usage_tok=None):
+        """
+        Shared instantiation body for 'struct' and 'object' template kinds.
+        Handles: mangle, is_emitted guard, mapping build, substitute, stamp name,
+        kind-specific post-steps, and append to _pending_template_instances.
+        Returns the mangled name.
+        """
+        mangled = name + '__' + '_'.join(type_names)
+        if not self._templates.is_emitted(name, mangled):
+            self._templates.mark_emitted(name, mangled)
+            mapping = self._build_template_mapping(template_params, type_names, type_specs)
+            concrete = self._substitute_template(template_node, mapping)
+            concrete.name = mangled
+            concrete.template_params = []
+            if getattr(template_node, '_is_comptime_only', False):
+                concrete._is_comptime_only = True
+            if usage_tok is not None:
+                for member in getattr(concrete, 'members', []):
+                    member.set_location(usage_tok.line, usage_tok.column)
+            if kind == 'object':
+                self._parsed_objects[mangled] = concrete
+                self._object_init_params[mangled] = self._object_init_params.get(template_node.name, 0)
+            self._pending_template_instances.append((kind, concrete))
+        return mangled
+
     def _resolve_template_struct(self, struct_name, type_names, type_specs=None, usage_tok=None):
         """
         Instantiate a template struct with concrete type arguments.
@@ -7035,35 +7467,14 @@ class FluxParser:
         entry = self._templates.lookup(struct_name)
         if entry is None or entry.kind != 'struct':
             self.error(f"Unknown template struct '{struct_name}'")
-        template_params = entry.params
-        template_sd = entry.node
-        if len(type_names) != len(template_params):
+        if len(type_names) != len(entry.params):
             self.error(
-                f"Template struct '{struct_name}' expects {len(template_params)} "
+                f"Template struct '{struct_name}' expects {len(entry.params)} "
                 f"type argument(s), got {len(type_names)}"
             )
-        mangled = struct_name + "__" + "_".join(type_names)
-        if not self._templates.is_emitted(struct_name, mangled):
-            self._templates.mark_emitted(struct_name, mangled)
-            mapping = {}
-            for param, tname, tspec in zip(
-                    template_params, type_names,
-                    type_specs or [None] * len(type_names)):
-                if tspec is not None:
-                    mapping[param] = tspec
-                else:
-                    mapping[param] = TypeSystem(
-                        base_type=DataType.DATA, custom_typename=tname)
-            concrete = self._substitute_template(template_sd, mapping)
-            concrete.name = mangled
-            concrete.template_params = []
-            if getattr(template_sd, '_is_comptime_only', False):
-                concrete._is_comptime_only = True
-            if usage_tok is not None:
-                for member in getattr(concrete, 'members', []):
-                    member.set_location(usage_tok.line, usage_tok.column)
-            self._template_struct_instances.append(concrete)
-        return mangled
+        return self._instantiate_template_node(
+            'struct', struct_name, entry.params, entry.node,
+            type_names, type_specs, usage_tok)
 
     def _resolve_template_object(self, object_name, type_names, type_specs=None, usage_tok=None):
         """
@@ -7078,35 +7489,14 @@ class FluxParser:
         entry = self._templates.lookup(object_name)
         if entry is None or entry.kind != 'object':
             self.error(f"Unknown template object '{object_name}'")
-        template_params = entry.params
-        template_od = entry.node
-        if len(type_names) != len(template_params):
+        if len(type_names) != len(entry.params):
             self.error(
-                f"Template object '{object_name}' expects {len(template_params)} "
+                f"Template object '{object_name}' expects {len(entry.params)} "
                 f"type argument(s), got {len(type_names)}"
             )
-        mangled = object_name + "__" + "_".join(type_names)
-        if not self._templates.is_emitted(object_name, mangled):
-            self._templates.mark_emitted(object_name, mangled)
-            mapping = {}
-            for param, tname, tspec in zip(
-                    template_params, type_names,
-                    type_specs or [None] * len(type_names)):
-                if tspec is not None:
-                    mapping[param] = tspec
-                else:
-                    mapping[param] = TypeSystem(
-                        base_type=DataType.DATA, custom_typename=tname)
-            concrete = self._substitute_template(template_od, mapping)
-            concrete.name = mangled
-            concrete.template_params = []
-            if usage_tok is not None:
-                for member in getattr(concrete, 'members', []):
-                    member.set_location(usage_tok.line, usage_tok.column)
-            self._parsed_objects[mangled] = concrete
-            self._object_init_params[mangled] = self._object_init_params.get(template_od.name, 0)
-            self._template_object_instances.append(concrete)
-        return mangled
+        return self._instantiate_template_node(
+            'object', object_name, entry.params, entry.node,
+            type_names, type_specs, usage_tok)
 
     def _resolve_template_call(self, func_name, arg_type_names, arg_type_specs=None, arg_positions=None):
         """
@@ -7151,32 +7541,8 @@ class FluxParser:
                     concrete_ts = arg_type_specs[i]
                 if concrete_ts is None:
                     continue
-                # Check if concrete_ts matches any allowed spec
-                def _ts_matches(concrete, allowed):
-                    """Return True if concrete TypeSystem matches the allowed TypeSystem."""
-                    # object* is the erasure type for all object pointers -- it satisfies
-                    # any constraint whose allowed type is a named object (DataType.DATA).
-                    if (concrete.base_type == DataType.OBJECT and
-                            allowed.base_type == DataType.DATA and
-                            allowed.custom_typename is not None):
-                        return True
-                    # Compare structural identity on the fields that define a type
-                    if concrete.base_type != allowed.base_type:
-                        return False
-                    if concrete.is_pointer != allowed.is_pointer:
-                        return False
-                    if concrete.pointer_depth != allowed.pointer_depth:
-                        return False
-                    if concrete.is_array != allowed.is_array:
-                        return False
-                    if concrete.custom_typename != allowed.custom_typename:
-                        return False
-                    # bit_width: 0 means unspecified/default - treat 0 as wildcard
-                    if allowed.bit_width and concrete.bit_width and concrete.bit_width != allowed.bit_width:
-                        return False
-                    return True
                 # allowed_specs is a list of (TypeSystem, source_text) tuples
-                if not any(_ts_matches(concrete_ts, a_ts) for a_ts, _ in allowed_specs):
+                if not any(self._ts_matches(concrete_ts, a_ts) for a_ts, _ in allowed_specs):
                     allowed_strs = ' | '.join(a_src for _, a_src in allowed_specs)
                     # Produce a readable name for the function in the error message.
                     # __typefunc__string__f  -> i-string
@@ -7218,20 +7584,6 @@ class FluxParser:
             for i, pname in enumerate(template_params):
                 if arg_type_specs is not None and i < len(arg_type_specs):
                     _param_to_ts[pname] = arg_type_specs[i]
-            def _types_compatible(a_ts, b_ts):
-                # Pointer vs non-pointer is always incompatible
-                if a_ts.is_pointer != b_ts.is_pointer:
-                    return False
-                # Both pointer: pointer depth must match
-                if a_ts.is_pointer and a_ts.pointer_depth != b_ts.pointer_depth:
-                    return False
-                # Width must match (0 means unresolved/default - treat as wildcard)
-                aw = a_ts.bit_width or 0
-                bw = b_ts.bit_width or 0
-                if aw and bw and aw != bw:
-                    return False
-                return True
-
             # Body-walk helpers for !`< !`<= !`> !`>=
             # These ops require scanning the instantiated function body for
             # cast/truncation/widening operations involving the constrained types.
@@ -7251,7 +7603,7 @@ class FluxParser:
                             continue
 
                         if op == "~=":
-                            if not _types_compatible(lts, rts):
+                            if not self._types_compatible(lts, rts):
                                 lmangle = self._type_system_to_mangle_str(lts)
                                 rmangle = self._type_system_to_mangle_str(rts)
                                 self.error(
@@ -7260,7 +7612,7 @@ class FluxParser:
                                     f"(pointer mismatch or width mismatch)"
                                 )
                         elif op == "!~=":
-                            if _types_compatible(lts, rts):
+                            if self._types_compatible(lts, rts):
                                 lmangle = self._type_system_to_mangle_str(lts)
                                 rmangle = self._type_system_to_mangle_str(rts)
                                 self.error(
@@ -7274,17 +7626,6 @@ class FluxParser:
                                 # whose operand is an identifier declared with a constrained
                                 # param type.  Done here (before substitution) so the type
                                 # names are still the abstract param names (T, U, ...).
-                                def _walk_tmpl(node):
-                                    if node is None:
-                                        return
-                                    yield node
-                                    for _attr in vars(node).values():
-                                        if isinstance(_attr, list):
-                                            for _item in _attr:
-                                                if hasattr(_item, '__dataclass_fields__'):
-                                                    yield from _walk_tmpl(_item)
-                                        elif hasattr(_attr, '__dataclass_fields__'):
-                                            yield from _walk_tmpl(_attr)
                                 _addr_param_names = set()
                                 _addr_param_names.add(lname)
                                 _addr_param_names.add(rname)
@@ -7295,13 +7636,13 @@ class FluxParser:
                                             _tp.type_spec.custom_typename in _addr_param_names):
                                         _tparam_vars[_tp.name] = _tp.type_spec.custom_typename
                                 from fast import VariableDeclaration as _TVarDecl
-                                for _tn in _walk_tmpl(template_func):
+                                for _tn in self._walk_ast(template_func):
                                     if isinstance(_tn, _TVarDecl) and _tn.type_spec:
                                         if _tn.type_spec.custom_typename in _addr_param_names:
                                             _tparam_vars[_tn.name] = _tn.type_spec.custom_typename
                                 # Scan for AddressOf whose operand is one of those variables
                                 from fast import AddressOf as _TAddressOf, Identifier as _TIdent
-                                for _tn in _walk_tmpl(template_func):
+                                for _tn in self._walk_ast(template_func):
                                     if not isinstance(_tn, _TAddressOf):
                                         continue
                                     _expr = _tn.expression
@@ -7334,35 +7675,8 @@ class FluxParser:
         if not self._templates.is_emitted(func_name, mangled):
             self._templates.mark_emitted(func_name, mangled)
 
-            # Map DataType enum value strings back to DataType members
-            _datatype_by_value = {dt.value: dt for dt in DataType}
-
             # Build the substitution mapping: param name -> concrete TypeSystem
-            mapping = {}
-            for i, (param_name, type_name) in enumerate(zip(template_params, arg_type_names)):
-                # If a pre-resolved TypeSystem was supplied, use it directly.
-                # This is the correct path for type aliases like u64 whose
-                # resolution (bit_width, signedness, etc.) would otherwise be
-                # lost when round-tripping through the mangle string.
-                if arg_type_specs is not None and i < len(arg_type_specs):
-                    mapping[param_name] = arg_type_specs[i]
-                    continue
-                # Fallback: try symbol table alias first
-                resolved = self.symbol_table.get_type_spec(type_name)
-                if resolved is not None:
-                    mapping[param_name] = resolved
-                elif type_name in _datatype_by_value:
-                    # Primitive keyword type (sint, uint, float, char, bool, void, data)
-                    mapping[param_name] = TypeSystem(
-                        base_type=_datatype_by_value[type_name],
-                        is_signed=_datatype_by_value[type_name] in (DataType.SINT, DataType.CHAR)
-                    )
-                else:
-                    # Custom type name (object, struct) - use custom_typename
-                    mapping[param_name] = TypeSystem(
-                        base_type=DataType.DATA,
-                        custom_typename=type_name
-                    )
+            mapping = self._build_template_mapping(template_params, arg_type_names, arg_type_specs)
 
             # Deep-copy + substitute
             concrete_func = self._substitute_template(template_func, mapping)
@@ -7397,63 +7711,25 @@ class FluxParser:
                                   ReturnStatement as _ReturnStatement,
                                   Literal as _Literal)
 
-                def _walk(node):
-                    """Yield every node in the AST (depth-first)."""
-                    if node is None:
-                        return
-                    yield node
-                    for attr in vars(node).values():
-                        if isinstance(attr, list):
-                            for item in attr:
-                                if hasattr(item, '__dataclass_fields__'):
-                                    yield from _walk(item)
-                        elif hasattr(attr, '__dataclass_fields__'):
-                            yield from _walk(attr)
-
-                def _bw(ts):
-                    """Return bit width of a TypeSystem, 0 if unknown."""
-                    if ts is None:
-                        return 0
-                    if ts.bit_width:
-                        return ts.bit_width
-                    from ftypesys import get_builtin_bit_width as _gbw
-                    try:
-                        return _gbw(ts.base_type)
-                    except Exception:
-                        return 0
-
                 # Build a name -> TypeSystem table from the concrete function's
                 # parameters and local variable declarations.  This is needed
                 # because _resolved_type annotations are set by codegen, not by
                 # the parser, so Identifier nodes in the substituted AST carry no
                 # type at this point.
-                from fast import VariableDeclaration as _VarDecl, Identifier as _Ident
+                from fast import VariableDeclaration as _VarDecl
                 _local_type_table = {}
                 for _p in concrete_func.parameters:
                     if _p.name is not None:
                         _local_type_table[_p.name] = _p.type_spec
-                for _n in _walk(concrete_func):
+                for _n in self._walk_ast(concrete_func):
                     if isinstance(_n, _VarDecl):
                         _local_type_table[_n.name] = _n.type_spec
 
+                # Local aliases so the checker closures below can call the
+                # promoted private methods without spelling out self every time.
+                _bw = self._bw
                 def _ts_of_expr(expr):
-                    """Best-effort TypeSystem for an expression node."""
-                    ts = getattr(expr, '_resolved_type', None)
-                    if ts is not None:
-                        return ts
-                    # CastExpression / TypeConvertExpression carry their own target type
-                    if isinstance(expr, (_CastExpr, _TypeConvExpr)):
-                        return expr.target_type
-                    # Identifier: look up in the local type table built above
-                    if isinstance(expr, _Ident):
-                        return _local_type_table.get(expr.name)
-                    # Literal: build a minimal TypeSystem so e.g. 5 in '5 + x' resolves to int
-                    if isinstance(expr, _Literal):
-                        return TypeSystem(base_type=expr.type,
-                                          is_signed=expr.type in (DataType.SINT, DataType.SLONG,
-                                                                   DataType.CHAR, DataType.FLOAT,
-                                                                   DataType.DOUBLE))
-                    return None
+                    return self._ts_of_expr(expr, _local_type_table)
 
                 def _arithmetic_result_width(node):
                     """
@@ -7596,7 +7872,7 @@ class FluxParser:
                     _is_trunc = _op in ("!`<",  "!`<=")
                     _constrained = {_lname: _lts, _rname: _rts}
 
-                    for _node in _walk(concrete_func):
+                    for _node in self._walk_ast(concrete_func):
                         _checker = _node_checkers.get(type(_node))
                         if _checker is None:
                             continue
@@ -7659,9 +7935,9 @@ class FluxParser:
                 if obj_def is not None:
                     obj_def.methods.append(concrete_func)
                 else:
-                    self._template_instantiations.append(concrete_func)
+                    self._pending_template_instances.append(('function', concrete_func))
             else:
-                self._template_instantiations.append(concrete_func)
+                self._pending_template_instances.append(('function', concrete_func))
 
         return func_name  # Call site uses the original name; overload resolution finds it
 
@@ -7686,7 +7962,7 @@ class FluxParser:
         `arg_type_specs` is a list of two TypeSystem objects - one per operand.
 
         A concrete FunctionDef is produced (via _substitute_template) and appended to
-        _template_instantiations so codegen can find it by normal overload resolution
+        _pending_template_instances so codegen can find it by normal overload resolution
         inside visit_BinaryOp.  The BinaryOp AST node is left unchanged.
         """
         entry = self._templates.lookup(op_symbol)
@@ -7799,7 +8075,7 @@ class FluxParser:
         self._templates.mark_emitted(op_symbol, mangle_key)
 
         # Build the substitution mapping: template param name -> concrete TypeSystem
-        mapping = {pname: ts for pname, ts in zip(template_params, arg_type_specs)}
+        mapping = self._build_template_mapping(template_params, type_names, arg_type_specs)
 
         concrete_func = self._substitute_template(template_func, mapping)
         # Keep the original mangled function name (e.g. operator__plus); the
@@ -7810,8 +8086,7 @@ class FluxParser:
         # template instantiation and emits it after all namespace functions are
         # registered. Without this attribute the pass 3 filter silently skips it.
         concrete_func._source_namespace = ''
-        #import sys as _sys; _sys.stderr.write(f'[DEBUG op_inst] appending {concrete_func.name} to _template_instantiations (id={id(concrete_func)})\n'); _sys.stderr.flush()
-        self._template_instantiations.append(concrete_func)
+        self._pending_template_instances.append(('function', concrete_func))
 
     def _infer_type_from_expr(self, expr) -> 'TypeSystem | None':
         """
@@ -7822,18 +8097,7 @@ class FluxParser:
         if isinstance(expr, Identifier):
             return self.symbol_table.get_type_spec(expr.name)
         if isinstance(expr, Literal):
-            _dt_map = {
-                DataType.SINT:   TypeSystem(base_type=DataType.SINT,   is_signed=True),
-                DataType.UINT:   TypeSystem(base_type=DataType.UINT,   is_signed=False),
-                DataType.SLONG:  TypeSystem(base_type=DataType.SLONG,  is_signed=True),
-                DataType.ULONG:  TypeSystem(base_type=DataType.ULONG,  is_signed=False),
-                DataType.FLOAT:  TypeSystem(base_type=DataType.FLOAT),
-                DataType.DOUBLE: TypeSystem(base_type=DataType.DOUBLE),
-                DataType.CHAR:   TypeSystem(base_type=DataType.CHAR,   is_signed=True),
-                DataType.BOOL:   TypeSystem(base_type=DataType.BOOL),
-                DataType.BYTE:   TypeSystem(base_type=DataType.BYTE),
-            }
-            return _dt_map.get(expr.type)
+            return self._literal_dt_map().get(expr.type)
         return None
 
     def postfix_expression(self) -> Expression:
@@ -7913,139 +8177,27 @@ class FluxParser:
 
             _entry_6487 = self._templates.lookup(expr.name)
             template_param_names = _entry_6487.params
-            template_func = _entry_6487.node
 
-            # Build a mapping from template-param-name -> inferred TypeSystem by
-            # walking each declared parameter and matching its template param name
-            # against the corresponding call-site argument.
-            inferred: dict = {}  # template param name -> TypeSystem
-            _arg_pos: dict = {}  # template param name -> (line, col) of call-site arg
+            # Infer template-param -> TypeSystem bindings from call-site arguments.
+            inferred: dict = self._infer_template_params(_entry_6487, args)
 
-            for i, decl_param in enumerate(template_func.parameters):
+            # Build per-param source positions for error reporting (best-effort).
+            _arg_pos: dict = {}
+            for i, decl_param in enumerate(_entry_6487.node.parameters):
                 if i >= len(args):
                     break
                 param_ts = decl_param.type_spec
                 if param_ts is None:
                     continue
-                # The declared parameter type names a template param when its
-                
-                # The declared parameter type names a template param directly when
-                # its custom_typename appears in template_param_names (e.g. param type is T).
-                # It may also be a deferred template-struct token like "Tensor<T>" or
-                # "standard__tensors__Tensor<T>" - in that case extract the inner type
-                # args and match them against template_param_names instead.
                 param_tname = (
                     param_ts.custom_typename if param_ts.custom_typename
                     else (param_ts.base_type if isinstance(param_ts.base_type, str) else None)
                 )
-
-                # Resolve deferred template-struct param: "StructName<T>" -> param_tname = "T"
-                # Builds a mapping: template_param_name -> position-in-arg-type so we can
-                # extract the concrete type from the call-site argument's declared type.
-                struct_param_map = {}  # template_param_name -> inner arg index
-                if param_tname and "<" in param_tname and ">" in param_tname:
-                    bracket = param_tname.index("<")
-                    inner_args = [a.strip() for a in param_tname[bracket+1:-1].split(",")]
-                    for idx2, inner in enumerate(inner_args):
-                        if inner in template_param_names:
-                            struct_param_map[inner] = idx2
-                    # Reset param_tname - the declared param is a struct, not a bare T.
-                    # We will infer via struct_param_map below.
-                    param_tname = None
-
-                if param_tname is not None and param_tname not in template_param_names:
-                    continue  # This param's type is concrete - no inference needed here.
-
-                # Try to derive the concrete TypeSystem from the call-site argument.
-                arg = args[i]
-                inferred_ts = None
-
-                # Unwrap address-of (@x) to get the underlying identifier for type lookup.
-                _arg_for_lookup = arg
-                if (isinstance(arg, AddressOf)
-                        and isinstance(getattr(arg, 'expression', None), Identifier)):
-                    _arg_for_lookup = arg.expression
-                if isinstance(_arg_for_lookup, Identifier):
-                    arg = _arg_for_lookup
-                if isinstance(arg, Identifier):
-                    # Look up the variable\'s declared type in the symbol table.
-                    arg_ts = self.symbol_table.get_type_spec(arg.name)
-                    if arg_ts is not None:
-                        if struct_param_map and arg_ts.custom_typename:
-                            # The argument is a template struct/object instance: e.g. Tensor__float*.
-                            # Recover which concrete type was substituted for each inner
-                            # template param by looking up the mangled name's template record.
-                            arg_ctn = arg_ts.custom_typename
-                            # Search template structs and objects in the unified registry.
-                            _struct_obj_entries = {**self._templates.all_of_kind('struct'),
-                                                   **self._templates.all_of_kind('object')}
-                            _tmpl_registries = [_struct_obj_entries]
-                            for _registry in _tmpl_registries:
-                                _found = False
-                                for tmpl_name, _te in _registry.items():
-                                    tmpl_params = _te.params
-                                    sep = tmpl_name + "__"
-                                    if arg_ctn.startswith(sep) or arg_ctn == tmpl_name:
-                                        suffix = arg_ctn[len(sep):]
-                                        concrete_args = suffix.split("__") if suffix else []
-                                        for tparam, pos in struct_param_map.items():
-                                            if pos < len(concrete_args):
-                                                carg = concrete_args[pos]
-                                                resolved = self.symbol_table.get_type_spec(carg)
-                                                if resolved is None:
-                                                    _dtbv = {dt.value: dt for dt in DataType}
-                                                    if carg in _dtbv:
-                                                        resolved = TypeSystem(base_type=_dtbv[carg],
-                                                            is_signed=_dtbv[carg] in (DataType.SINT, DataType.CHAR))
-                                                    else:
-                                                        resolved = TypeSystem(base_type=DataType.DATA,
-                                                                              custom_typename=carg)
-                                                inferred[tparam] = resolved
-                                        _found = True
-                                        break
-                                if _found:
-                                    break
-                        elif param_tname is not None:
-                            inferred_ts = arg_ts
-                elif isinstance(arg, Literal):
-                    # Map the Literal's DataType to a minimal TypeSystem.
-                    _dt_map = {
-                        DataType.SINT:   TypeSystem(base_type=DataType.SINT,   is_signed=True),
-                        DataType.UINT:   TypeSystem(base_type=DataType.UINT,   is_signed=False),
-                        DataType.SLONG:  TypeSystem(base_type=DataType.SLONG,  is_signed=True),
-                        DataType.ULONG:  TypeSystem(base_type=DataType.ULONG,  is_signed=False),
-                        DataType.FLOAT:  TypeSystem(base_type=DataType.FLOAT),
-                        DataType.DOUBLE: TypeSystem(base_type=DataType.DOUBLE),
-                        DataType.CHAR:   TypeSystem(base_type=DataType.CHAR,   is_signed=True),
-                        DataType.BOOL:   TypeSystem(base_type=DataType.BOOL),
-                        DataType.BYTE:   TypeSystem(base_type=DataType.BYTE),
-                    }
-                    inferred_ts = _dt_map.get(arg.type)
-                elif isinstance(arg, StringLiteral):
-                    # A string literal is a byte* (pointer to i8).
-                    inferred_ts = TypeSystem(base_type=DataType.BYTE, is_signed=True,
-                                            bit_width=8, is_pointer=True, pointer_depth=1)
-
-                if inferred_ts is not None and param_tname is not None:
-                    if param_tname in inferred:
-                        # A previous argument already fixed this param - check consistency.
-                        prev_ts = inferred[param_tname]
-                        prev_name = self._type_system_to_mangle_str(prev_ts)
-                        new_name  = self._type_system_to_mangle_str(inferred_ts)
-                        if prev_name != new_name:
-                            _saved_tok2 = self.current_token
-                            self.current_token = tok
-                            self.error(
-                                f"Template parameter '{param_tname}' of '{expr.name}' cannot be "
-                                f"inferred: argument types conflict ('{prev_name}' vs '{new_name}')"
-                            )
-                            self.current_token = _saved_tok2
-                    else:
-                        inferred[param_tname] = inferred_ts
-                        _arg_pos[param_tname] = (
-                            getattr(args[i], 'source_line', None),
-                            getattr(args[i], 'source_col',  None),
-                        )
+                if param_tname and param_tname in template_param_names and param_tname not in _arg_pos:
+                    _arg_pos[param_tname] = (
+                        getattr(args[i], 'source_line', None),
+                        getattr(args[i], 'source_col',  None),
+                    )
 
             # Only proceed with implicit instantiation if every template param was resolved
             # to a *concrete* type. If any inferred TypeSystem maps a param back to itself
@@ -8174,41 +8326,8 @@ class FluxParser:
                     if _tfk and _tfk in self._templates:
                         _tfk_entry = self._templates.lookup(_tfk)
                         _tmpl_params = _tfk_entry.params
-                        _tmpl_fd = _tfk_entry.node
-                        _inferred = {}
-                        _decl_params = _tmpl_fd.parameters[1:]  # skip implicit '_'
-                        for _i, _dp in enumerate(_decl_params):
-                            if _i >= len(args):
-                                break
-                            _pts = _dp.type_spec
-                            _ptn = (_pts.custom_typename if _pts and _pts.custom_typename
-                                    else (str(_pts.base_type) if _pts else None))
-                            if _ptn not in _tmpl_params:
-                                continue
-                            _arg = args[_i]
-                            if isinstance(_arg, Identifier):
-                                _its = self.symbol_table.get_type_spec(_arg.name)
-                                if _its is not None:
-                                    _inferred[_ptn] = _its
-                            elif isinstance(_arg, Literal):
-                                _dtm = {
-                                    DataType.SINT:   TypeSystem(base_type=DataType.SINT,  is_signed=True),
-                                    DataType.UINT:   TypeSystem(base_type=DataType.UINT),
-                                    DataType.SLONG:  TypeSystem(base_type=DataType.SLONG, is_signed=True),
-                                    DataType.ULONG:  TypeSystem(base_type=DataType.ULONG),
-                                    DataType.FLOAT:  TypeSystem(base_type=DataType.FLOAT),
-                                    DataType.DOUBLE: TypeSystem(base_type=DataType.DOUBLE),
-                                    DataType.BYTE:   TypeSystem(base_type=DataType.BYTE),
-                                    DataType.BOOL:   TypeSystem(base_type=DataType.BOOL),
-                                    DataType.CHAR:   TypeSystem(base_type=DataType.CHAR,  is_signed=True),
-                                }
-                                _its = _dtm.get(_arg.type)
-                                if _its is not None:
-                                    _inferred[_ptn] = _its
-                            elif isinstance(_arg, StringLiteral):
-                                # A string literal is byte* (pointer to i8).
-                                _inferred[_ptn] = TypeSystem(base_type=DataType.BYTE, is_signed=True,
-                                                             bit_width=8, is_pointer=True, pointer_depth=1)
+                        # skip_first_param=True: first declared param is implicit 'this' receiver
+                        _inferred = self._infer_template_params(_tfk_entry, args, skip_first_param=True)
                         if len(_inferred) == len(_tmpl_params):
                             _tnames = [self._type_system_to_mangle_str(_inferred[p]) for p in _tmpl_params]
                             _tspecs = [_inferred[p] for p in _tmpl_params]

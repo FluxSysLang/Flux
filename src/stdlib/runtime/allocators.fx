@@ -252,7 +252,7 @@ namespace standard
                 {
                     switch (cls > 8) { case (1) { return NP_FREENODE; } default {}; };
                     FreeNode* n = g_bins[cls];
-                    switch (n != NP_FREENODE) { case (1) { g_bins[cls] = n.next; } default {}; };
+                    switch (n!?) { case (1) { g_bins[cls] = n.next; } default {}; };
                     return n;
                 };
 
@@ -273,7 +273,7 @@ namespace standard
                     // for strong avalanche in 3 ops instead of 5.
                     size_t h = (size_t)ptr >> (size_t)4;
                     h = h * 0x9E3779B97F4A7C15;
-                    h = h `^^ (h >> (size_t)32);
+                    h = h `^| (h >> (size_t)32);
                     return h & (cap - (size_t)1);
                 };
 
@@ -282,14 +282,18 @@ namespace standard
                                      u64 key, size_t size, u64 kind, u64 slab) -> void
                 {
                     size_t idx = table_hash(key, cap);
-                    while (tbl[idx].key != 0)
+                    while (tbl[idx].key!?)
                     {
                         idx = (idx + 1) `& (cap - 1);
                     };
-                    tbl[idx].key  = key;
-                    tbl[idx].size = size;
-                    tbl[idx].kind = kind;
-                    tbl[idx].slab = slab;
+
+                    tbl[idx]
+                    {
+                        .key  = key;
+                        .size = size;
+                        .kind = kind;
+                        .slab = slab;
+                    };
                 };
 
                 // Grow the table slab when load factor exceeds 0.5
@@ -321,7 +325,7 @@ namespace standard
                     // Rehash all existing entries into the new table
                     while (j < g_table_cap)
                     {
-                        switch (g_table[j].key != 0)
+                        switch (g_table[j].key!?)
                         {
                             case (1)
                             {
@@ -343,8 +347,11 @@ namespace standard
                     size_t rm_idx = table_hash(old_tbl_addr, new_cap),
                            rm_hole, rm_next,
                            rm_natural;
-                    bool rm_found, rm_shift, rm_in_range;
-                    while (new_tbl[rm_idx].key != 0)
+                    bool rm_found,
+                         rm_shift,
+                         rm_in_range;
+
+                    while (new_tbl[rm_idx].key!?)
                     {
                         switch (new_tbl[rm_idx].key == old_tbl_addr)
                         {
@@ -355,7 +362,7 @@ namespace standard
                                 // Backward-shift deletion to close the gap
                                 rm_hole = rm_idx;
                                 rm_next = (rm_idx + 1) `& (new_cap - 1);
-                                while (new_tbl[rm_next].key != 0)
+                                while (new_tbl[rm_next].key!?)
                                 {
                                     rm_natural = table_hash(new_tbl[rm_next].key, new_cap);
                                     switch (rm_hole < rm_next)
@@ -405,10 +412,13 @@ namespace standard
                                     {
                                         case (1)
                                         {
-                                            new_tbl[rm_hole].key  = new_tbl[rm_next].key;
-                                            new_tbl[rm_hole].size = new_tbl[rm_next].size;
-                                            new_tbl[rm_hole].kind = new_tbl[rm_next].kind;
-                                            new_tbl[rm_hole].slab = new_tbl[rm_next].slab;
+                                            new_tbl[rm_hole]
+                                            {
+                                                .key  = new_tbl[rm_next].key;
+                                                .size = new_tbl[rm_next].size;
+                                                .kind = new_tbl[rm_next].kind;
+                                                .slab = new_tbl[rm_next].slab;
+                                            };
                                             new_tbl[rm_next].key  = 0;
                                             rm_hole = rm_next;
                                         }
@@ -445,8 +455,8 @@ namespace standard
                 // Initialise the table on first use
                 def table_init() -> bool
                 {
-                    size_t initial_cap   = 1024;
-                    size_t initial_bytes = initial_cap * SLAB_ENTRY_SIZE;
+                    size_t initial_cap   = 1024,
+                           initial_bytes = initial_cap * SLAB_ENTRY_SIZE;
 
                     u64 raw = heap_os_alloc(initial_bytes);
                     switch (raw == 0)
@@ -504,7 +514,7 @@ namespace standard
                     switch (g_table == NP_BLOCKENTRY) { case (1) { return NP_BLOCKENTRY; } default {}; };
 
                     size_t idx = table_hash(key, g_table_cap);
-                    while (g_table[idx].key != 0)
+                    while (g_table[idx].key!?)
                     {
                         switch (g_table[idx].key == key)
                         {
@@ -603,11 +613,14 @@ namespace standard
                                     {
                                         case (1)
                                         {
-                                            g_table[hole].key  = g_table[next].key;
-                                            g_table[hole].size = g_table[next].size;
-                                            g_table[hole].kind = g_table[next].kind;
-                                            g_table[hole].slab = g_table[next].slab;
-                                            g_table[next].key  = 0;
+                                            g_table[hole]
+                                            {
+                                                .key  = g_table[next].key;
+                                                .size = g_table[next].size;
+                                                .kind = g_table[next].kind;
+                                                .slab = g_table[next].slab;
+                                                .key  = 0;
+                                            };
                                             hole = next;
                                         }
                                         default {};
@@ -636,11 +649,15 @@ namespace standard
                     switch (raw == 0) { case (1) { return NP_SLAB; } default {}; };
 
                     Slab* slab    = (Slab*)raw;
-                    slab.base     = raw;
-                    slab.capacity = sz;
-                    slab.frontier = header_size;
-                    slab.used     = 0;
-                    slab.next     = g_slab_head;
+                    slab
+                    {
+                        .base = raw;
+                        .capacity = sz;
+                        .frontier = header_size;
+                        .used = 0;
+                        .next = g_slab_head;
+                    };
+
                     g_slab_head   = slab;
 
                     // Advance exponential growth
@@ -660,7 +677,7 @@ namespace standard
                     Slab* slab = g_slab_head;
                     bool b = slab == NP_SLAB;
                     if (b) { return 0; };
-                    bool ret = ((slab != NP_SLAB) `& (slab.frontier + bytes <= slab.capacity));
+                    bool ret = ((slab!?) `& (slab.frontier + bytes <= slab.capacity));
                     u64 ptr       = (u64)((byte*)slab.base + slab.frontier);
                     slab.frontier = slab.frontier + bytes;
                     return ptr * ret;
@@ -688,7 +705,7 @@ namespace standard
                         if (size > 16)   // exactly class 1 (17..32 bytes)
                         {
                             u64 fast = fmalloc_fast(1);
-                            if (fast != void) { return fast; };
+                            if (fast!?) { return fast; };
                             // Bin empty: fall through to bump path with cls already known.
                             size_t cls = 1;
                             u64 ptr = bump_alloc(32);
@@ -713,7 +730,7 @@ namespace standard
                         if (size > 32)   // exactly class 2 (33..64 bytes)
                         {
                             u64 fast = fmalloc_fast(2);
-                            if (fast != void) { return fast; };
+                            if (fast!?) { return fast; };
                             size_t cls = 2;
                             u64 ptr = bump_alloc(64);
                             if (ptr is void)
@@ -737,7 +754,7 @@ namespace standard
                         if (size > 64)   // exactly class 3 (65..128 bytes)
                         {
                             u64 fast = fmalloc_fast(3);
-                            if (fast != 0) { return fast; };
+                            if (fast!?) { return fast; };
                             size_t cls = 3;
                             u64 ptr = bump_alloc(128);
                             if (ptr is void)
@@ -785,7 +802,7 @@ namespace standard
 
                     // Small: try free list bin first — return directly, no table_find needed.
                     FreeNode* node = bin_pop(cls);
-                    switch (node != NP_FREENODE)
+                    switch (node!?)
                     {
                         case (1) { return (u64)node; }
                         default  {};
@@ -908,21 +925,21 @@ namespace standard
                             switch (new_size < copy_size) { case (1) { copy_size = new_size; } default {}; };
 
                             reuse = bin_pop(new_cls);
-                            has_reuse = reuse != NP_FREENODE;
+                            has_reuse = reuse!?;
                             switch (has_reuse)
                             {
                                 case (1)
                                 {
                                     new_ptr = (u64)reuse;
                                     BlockEntry* reuse_entry = table_find(new_ptr);
-                                    switch (reuse_entry != NP_BLOCKENTRY)
+                                    switch (reuse_entry!?)
                                     {
                                         case (1)
                                         {
                                             new_owner = (Slab*)reuse_entry.slab;
                                             reuse_entry.size = new_cls;
                                             reuse_entry.kind = 0;  // BLOCK_SMALL: mark live
-                                            switch (new_owner != NP_SLAB)
+                                            switch (new_owner!?)
                                             {
                                                 case (1) { new_owner.used++; }
                                                 default  {};
@@ -934,7 +951,7 @@ namespace standard
                                     dst = (byte*)new_ptr;
                                     while (i < copy_size) { dst[i] = src[i]; i++; };
                                     old_owner = (Slab*)entry.slab;
-                                    switch (old_owner != NP_SLAB)
+                                    switch (old_owner!?)
                                     {
                                         case (1) { switch (old_owner.used > 0) { case (1) { old_owner.used--; } default {}; }; }
                                         default  {};
@@ -987,7 +1004,7 @@ namespace standard
                     FreeNode* node, node_next, keep_head, keep_tail,
                               reinsert, reinsert_next;
 
-                    while (slab != NP_SLAB)
+                    while (slab!?)
                     {
                         next = slab.next;
 
@@ -1003,7 +1020,7 @@ namespace standard
                                     keep_head = NP_FREENODE;
                                     keep_tail = NP_FREENODE;
 
-                                    while (node != NP_FREENODE)
+                                    while (node!?)
                                     {
                                         addr = (u64)node;
                                         node_next = node.next;
@@ -1037,7 +1054,7 @@ namespace standard
 
                                     // Re-push survivors back into the bin in order.
                                     reinsert = keep_head;
-                                    while (reinsert != NP_FREENODE)
+                                    while (reinsert!?)
                                     {
                                         reinsert_next = reinsert.next;
                                         bin_push(bin_idx, reinsert);
@@ -1079,7 +1096,7 @@ namespace standard
 
                     Slab* slab = g_slab_head;
 
-                    while (slab != NP_SLAB)
+                    while (slab!?)
                     {
                         // Usable capacity excludes the slab header.
                         usable = slab.capacity - SLAB_HEADER_SIZE;
@@ -1110,7 +1127,7 @@ namespace standard
                     // total committed space.  Large blocks are live so they do
                     // not contribute free bytes but are added to used.
                     slab = g_slab_head;
-                    while (slab != NP_SLAB)
+                    while (slab!?)
                     {
                         committed += slab.frontier - SLAB_HEADER_SIZE;
                         slab = slab.next;
@@ -1151,9 +1168,13 @@ namespace standard
                     
                     def __init(size_t size) -> this
                     {
-                        this.capacity = size;
-                        this.offset = 0;
-                        this.buffer = (byte*)stdheap::fmalloc(size);
+                        this
+                        {
+                            .capacity = size;
+                            .offset = 0;
+                            .buffer = (byte*)stdheap::fmalloc(size);
+                        };
+
                         return this;
                     };
                     
@@ -1245,10 +1266,13 @@ namespace standard
                             default  {};
                         };
 
-                        this.block_size  = actual_bsize;
-                        this.block_count = bcount;
-                        this.buffer      = (byte*)stdheap::fmalloc(actual_bsize * bcount);
-                        this.free_head   = NP_FREENODE;
+                        this
+                        {
+                            .block_size = actual_bsize;
+                            .block_count = bcount;
+                            .buffer = (byte*)stdheap::fmalloc(actual_bsize * bcount);
+                            .free_head = NP_FREENODE;
+                        };
 
                         // Build the free list by threading every block together.
                         switch (this.buffer != (byte*)0)
@@ -1333,7 +1357,7 @@ namespace standard
                     {
                         size_t    count;
                         FreeNode* node  = this.free_head;
-                        while (node != NP_FREENODE)
+                        while (node!?)
                         {
                             count++;
                             node = node.next;
@@ -1414,9 +1438,12 @@ namespace standard
                     raw = stdheap::fmalloc(sz);
                     switch (raw == 0) { case (1) { return false; } default {}; };
                     chunk          = (ArenaChunk*)raw;
-                    chunk.next     = a.head;
-                    chunk.capacity = sz;
-                    chunk.offset   = ARENA_HDR;
+                    chunk
+                    {
+                        .next = a.head;
+                        .capacity = sz;
+                        .offset = ARENA_HDR;
+                    };
                     a.head         = chunk;
                     sz = a.next_chunk_size * 2;
                     switch (sz > a.chunk_size_cap) { case (1) { sz = a.chunk_size_cap; } default {}; };
@@ -1581,7 +1608,6 @@ namespace standard
                     ArenaChunk* c;
                     size_t      total;
                     c     = a.head;
-                    total = 0;
                     while ((u64)c != 0)
                     {
                         total = total + c.offset - ARENA_HDR;
@@ -1596,7 +1622,6 @@ namespace standard
                     ArenaChunk* c;
                     size_t      total;
                     c     = a.head;
-                    total = 0;
                     while ((u64)c != 0)
                     {
                         total = total + c.capacity - ARENA_HDR;
@@ -1636,10 +1661,13 @@ namespace standard
 
                     def __init(size_t size) -> this
                     {
-                        this.capacity     = size;
-                        this.write_pos    = 0;
-                        this.buffer       = (byte*)stdheap::fmalloc(size);
-                        this.rallocresult = (RingAllocResult*)stdheap::fmalloc(16);
+                        this
+                        {
+                            .capacity = size;
+                            .write_pos = 0;
+                            .buffer = (byte*)stdheap::fmalloc(size);
+                            .rallocresult = (RingAllocResult*)stdheap::fmalloc(16);
+                        };
                         return this;
                     };
 

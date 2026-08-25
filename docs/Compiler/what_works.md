@@ -90,7 +90,7 @@
 - DIV = "/" ✅
 - MOD = "%" ✅
 - POWER = "^" ✅
-- XOR = "^^" ✅
+- XOR = "^|" ✅
 - OR = "||" ✅
 - AND = "&&" ✅
 - NOR = "!|" ✅
@@ -118,7 +118,7 @@
 - DIVIDE_ASSIGN = "/=" ✅
 - MODULO_ASSIGN = "%=" ✅
 - POWER_ASSIGN = "^=" ✅
-- XOR_ASSIGN = "^^=" ✅
+- XOR_ASSIGN = "^|=" ✅
 - BITSHIFT_LEFT_ASSIGN = "<<=" ✅
 - BITSHIFT_RIGHT_ASSIGN = ">>=" ✅
     

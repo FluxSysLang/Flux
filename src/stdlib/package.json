@@ -409,7 +409,7 @@
       }
     },
     "flux-memory": {
-      "version": "1.0.2",
+      "version": "1.0.3",
       "entry": "memory.fx",
       "path": "runtime",
       "description": "Memory management primitives",

@@ -24,6 +24,13 @@ const void* STDLIB_GVP = (void*)@void;
 const data{64} U64MAXVAL = 0xFFFFFFFFFFFFFFFFu;
 const bool _fltused = true;
 
+//def !!__chkstk() -> void {};
+
+#ifdef __ARCH_X86_64__
+global ulong nt_threshold;
+global bool  ermsb;
+#endif;
+
 #def NULL STDLIB_GVP;
 
 #ifndef FLUX_STANDARD
@@ -50,6 +57,10 @@ const bool _fltused = true;
 global i64 WIN_STDOUT_HANDLE;
 #endif;
 
+#ifndef FLUX_STANDARD_SYSTEM
+#import <..\sys.fx>;
+#endif;
+
 #ifndef FLUX_STANDARD_MEMORY
 #import <memory.fx>;
 #endif;
@@ -64,10 +75,6 @@ using standard::memory::allocators::stdheap;
 // DO NOT MODIFY THIS LINE
 #import <..\utility\string_utilities.fx>;
 // DO NOT MODIFY THIS LINE
-
-#ifndef FLUX_STANDARD_SYSTEM
-#import <..\sys.fx>;
-#endif;
 
 #ifndef FLUX_STANDARD_TIMING
 #import <timing.fx>;
@@ -231,6 +238,10 @@ def !!FRTStartup() -> int
     bool quoted;
     wchar* cmdLine;
 
+#ifdef __ARCH_X86_64__
+    nt_threshold = standard::system::cpu::l2_bytes();
+    ermsb        = standard::system::cpu::ermsb();
+#endif;
 
     // Initialize stdout handle for win_print
     WIN_STDOUT_HANDLE = GetStdHandle(-11);
@@ -325,7 +336,6 @@ def !!FRTStartup() -> int
 
         // Copy low byte of each wchar into byte buffer
         arg = (byte*)fmalloc((u64)len + (u64)1);
-        defer ffree(@arg);
         j = 0;
         while (j < len)
         {
@@ -372,7 +382,6 @@ def !!FRTStartup() -> int
         ffree((u64)argv[k]);
         k = k + 1;
     };
-    ffree(ulong(argv));
 
     if (return_code != 0)
     {

@@ -760,6 +760,24 @@ Drawable object myObj
 };
 ```
 
+You may have multiple traits to apply such as:
+```
+Drawable Deletable Resizable object Square
+{
+    /// ... ///
+};
+```
+
+This can get hard to read fast, so you can compose traits together:
+```
+trait GeomT1 = Drawable & Deletable & Resizable;
+
+GeomT1 object Square
+{
+    /// ... ///
+};
+```
+
 <a id="interfaces"></a>
 ## **Interfaces**
 Interfaces define how two or more objects interact. Every interface parameter must declare a trait constraint — bare role names without a trait are a compile error.
@@ -1828,7 +1846,7 @@ union ErrorUnion
     char cRval;
     float fRval;
     double dRval;
-} ErrorUnionEnum;
+} # ErrorUnionEnum; // # is the 'tag' operator
 
 
 def foo() -> ErrorUnion
@@ -1836,7 +1854,7 @@ def foo() -> ErrorUnion
     ErrorUnion err;
 
     err.bRval = false; // Set bool to active element
-    err._ = ErrorUnionEnum.BOOL_ACTIVE;
+    err.# = ErrorUnionEnum.BOOL_ACTIVE;
 
     return err;
 };
@@ -1846,7 +1864,7 @@ def main() -> int
 {
     ErrorUnion e = foo();
 
-    switch (e._)
+    switch (e.#)
     {
         case (ErrorUnionEnum.INT_ACTIVE)
         {
@@ -3764,7 +3782,7 @@ AND = "&"
 OR = "|"
 NAND = "!&"
 NOR = "!|"
-XOR = "^^"
+XOR = "^|"
 # Comparison
 EQUAL = "=="
 NOT_EQUAL = "!="
@@ -3787,22 +3805,22 @@ BITAND = "`&"
 BITOR = "`|"
 BITNAND = "`!&"
 BITNOR = "`!|"
-BITXOR = "`^^"
-BITXNOT = "`^^!"
-BITXNAND = "`^^!&"
-BITXNOR = "`^^!|"
+BITXOR = "`^|"
+BITXNOT = "`^|!"
+BITXNAND = "`^|!&"
+BITXNOR = "`^|!|"
 # Assignment
 AND_ASSIGN = "&="
 OR_ASSIGN = "|="
-XOR_ASSIGN = "^^="
+XOR_ASSIGN = "^|="
 BITAND_ASSIGN = "`&="
 BITOR_ASSIGN = "`|="
 BITNAND_ASSIGN = "`!&="
 BITNOR_ASSIGN = "`!|="
-BITXOR_ASSIGN = "`^^="
-BITXNOT_ASSIGN = "`^^!="
-BITXNAND_ASSIGN = "`^^!&="
-BITXNOR_ASSIGN = "`^^!|="
+BITXOR_ASSIGN = "`^|="
+BITXNOT_ASSIGN = "`^|!="
+BITXNAND_ASSIGN = "`^|!&="
+BITXNOR_ASSIGN = "`^|!|="
 
 # Ternary operators / Null-oriented operators
 TERN_ASSIGN = "?="  // Assign if LHS is null
@@ -3844,14 +3862,14 @@ Flux's operators bind in the following order, from **loosest** (evaluated last) 
 
 | Level | Operators | Associativity |
 |---|---|---|
-| 1 | `=` `+=` `-=` `*=` `/=` `%=` `^=` `&=` `\|=` `^^=` `` `&= `` `` `\|= `` `` `!&= `` `` `!\|= `` `` `^^!= `` `<<=` `>>=` `@=` `?=` | right |
+| 1 | `=` `+=` `-=` `*=` `/=` `%=` `^=` `&=` `\|=` `^|=` `` `&= `` `` `\|= `` `` `!&= `` `` `!\|= `` `` `^|!= `` `<<=` `>>=` `@=` `?=` | right |
 | 2 | `?:` (ternary) | right |
 | 3 | `??` (null-coalesce) | right |
 | 4 | `or` / `\|\|` | left |
 | 5 | `and` / `&&` | left |
-| 6 | `xor` / `^^` (logical xor) | left |
+| 6 | `xor` / `^|` (logical xor) | left |
 | 7 | `` `\| `` `` `!\| `` (bitwise or / nor) | left |
-| 8 | `` `^^ `` `` `^^!\| `` (bitwise xor / xnor) | left |
+| 8 | `` `^| `` `` `^|!\| `` (bitwise xor / xnor) | left |
 | 9 | `` `& `` `` `!& `` (bitwise and / nand) | left |
 | 10 | `==` `!=` `is` `in` | left |
 | 11 | `<-` (chain arrow) | right |
@@ -3862,7 +3880,7 @@ Flux's operators bind in the following order, from **loosest** (evaluated last) 
 | 16 | user-defined infix operators (`operator`) | left |
 | 17 | `*` `/` `%` `^` (multiplicative, **including power**) | left |
 | 18 | `(Type)expr` (cast) | right (prefix) |
-| 19 | unary `-` `+` `*` (deref) `@` (address-of) `++` `--` `` `! `` `not` `is not` `` `^^! `` `` `^^!& `` `` `^^!\| `` | right (prefix) |
+| 19 | unary `-` `+` `*` (deref) `@` (address-of) `++` `--` `` `! `` `not` `is not` `` `^|! `` `` `^|!& `` `` `^|!\| `` | right (prefix) |
 | 20 | postfix `[i]` `[a:b]` `` [a``b] `` `(...)` `.field` `->field` postfix `++`/`--` | left |
 
 A few rules worth calling out individually, since they differ from the C-family languages Flux
@@ -3871,12 +3889,12 @@ otherwise resembles:
 - **`^` is the power operator, and it binds at the same precedence as `*`, `/`, and `%`,
   evaluated left to right.** `2 * 3 ^ 2` is `(2 * 3) ^ 2`, not `2 * (3 ^ 2)`. If you want
   exponentiation to bind tighter than multiplication, parenthesize explicitly.
-- **Bitwise `` `& ``, `` `\| ``, and `` `^^ `` bind tighter than the comparison operators**
+- **Bitwise `` `& ``, `` `\| ``, and `` `^| `` bind tighter than the comparison operators**
   (`==`, `!=`, `<`, `<=`, `>`, `>=`). `a == b `&` c` means `a == (b `&` c)`. This is the opposite
   of C, where bitwise operators are notoriously looser than comparisons - in Flux you do not
   need extra parentheses to get the intuitive reading.
-- `xor`/`^^` is a **logical** connective, sitting with `and`/`or` above the bitwise tier. It is
-  a different operator from the bitwise `` `^^ ``, which lives down with the other bitwise
+- `xor`/`^|` is a **logical** connective, sitting with `and`/`or` above the bitwise tier. It is
+  a different operator from the bitwise `` `^| ``, which lives down with the other bitwise
   operators.
 - The range operator `..` wraps an arithmetic expression on each side, so `1 + 2 .. 3 + 4` is
   valid and means `(1+2)..(3+4)`. A range cannot directly be the left or right operand of a

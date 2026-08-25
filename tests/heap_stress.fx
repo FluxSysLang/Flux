@@ -1,7 +1,7 @@
 // Author: Karac V. Thweatt
 // heap_stress.fx - Stress test for standard::memory::allocators::stdheap
 
-#import "standard.fx", "allocators.fx", "random.fx", "timing.fx";
+#import <standard.fx>, <random.fx>, <timing.fx>;
 
 using standard::io::console,
       standard::strings,
@@ -661,7 +661,7 @@ def test_mixed_pattern() -> void
     size_t      live_count;
     u32         rval;
     u64         rval64, ptr;
-    bool        ok;
+    bool        ok, do_alloc;
     byte*       bp;
     size_t      j, victim;
 
@@ -680,7 +680,6 @@ def test_mixed_pattern() -> void
         // Decide: alloc or free.  If live is full, always free.
         // If live is empty, always alloc.
         // Otherwise 60% alloc / 40% free.
-        bool do_alloc;
         if (live_count == 256)      { do_alloc = false; }
         elif (live_count == 0)      { do_alloc = true; }
         else                                { do_alloc = (rval64 & 0xFF) < 0x99; };
@@ -965,7 +964,7 @@ def test_frealloc_pressure() -> void
     byte*    bp;
     size_t   j;
     u32      rval;
-    u64      rval64;
+    u64      rval64, new_ptr;
 
     print("-- frealloc pressure (1000 random grow/shrink cycles) --\n");
     pcg32_init(@rng);
@@ -991,7 +990,7 @@ def test_frealloc_pressure() -> void
         copy_sz = prev_sz;
         if (sz < copy_sz) { copy_sz = sz; };
 
-        u64 new_ptr = frealloc(ptr, sz);
+        new_ptr = frealloc(ptr, sz);
         if (new_ptr == 0) { ok = false; break; };
 
         // Verify preserved bytes
@@ -1025,7 +1024,7 @@ def test_slab_exhaustion_recovery() -> void
 {
     // Allocate small blocks to exhaust the first slab (4 MB default),
     // spill into a second slab, then free everything and coalesce.
-    size_t   batch, i, total, freed;
+    size_t   batch, i, total, freed, freed_batch, target;
     u64[256] ptrs;
     bool     ok;
     u64      p;
@@ -1038,7 +1037,7 @@ def test_slab_exhaustion_recovery() -> void
 
     // Fill ~6 MB worth of 16-byte blocks (class 0):
     // 6MB / 16 bytes = 393216 blocks, batched in groups of 256 to stay on stack.
-    size_t target = 393216;
+    target = 393216;
     while (total < target & ok)
     {
         i = 0;
@@ -1050,7 +1049,7 @@ def test_slab_exhaustion_recovery() -> void
             total++;
         };
         // Free this batch immediately to keep stack-local ptrs valid.
-        size_t freed_batch = i;
+        freed_batch = i;
         i = 0;
         while (i < freed_batch) { ffree(ptrs[i]); i++; };
     };

@@ -60,7 +60,7 @@ namespace standard
                 t3 = get_rdtsc();
             
             // Mix the entropy sources
-            return t1 ^^ (t2 << 21) ^^ (t3 >> 17);
+            return t1 ^| (t2 << 21) ^| (t3 >> 17);
         };
         
         // ============ XorShift64 RNG ============
@@ -93,9 +93,9 @@ namespace standard
         def xorshift64_next(XorShift64* rng) -> u64
         {
             u64 x = rng.state;
-            x = x ^^ (x << 13);
-            x = x ^^ (x >> 7);
-            x = x ^^ (x << 17);
+            x = x ^| (x << 13);
+            x = x ^| (x >> 7);
+            x = x ^| (x << 17);
             rng.state = x;
             return x;
         };
@@ -137,10 +137,10 @@ namespace standard
                 s0 = rng.state[1];
             
             rng.state[0] = s0;
-            s1 = s1 ^^ (s1 << 23);
-            s1 = s1 ^^ (s1 >> 17);
-            s1 = s1 ^^ s0;
-            s1 = s1 ^^ (s0 >> 26);
+            s1 = s1 ^| (s1 << 23);
+            s1 = s1 ^| (s1 >> 17);
+            s1 = s1 ^| s0;
+            s1 = s1 ^| (s0 >> 26);
             rng.state[1] = s1;
             
             return s0 + s1;
@@ -176,7 +176,7 @@ namespace standard
             rng.state = oldstate * 6364136223846793005 + rng.inc;
             
             // Calculate output function (XSH RR)
-            u32 xorshifted = (((oldstate >> 18) ^^ oldstate) >> 27),
+            u32 xorshifted = (((oldstate >> 18) ^| oldstate) >> 27),
                 rot = (oldstate >> 59);
             
             return (xorshifted >> rot) | (xorshifted << (0u - rot));

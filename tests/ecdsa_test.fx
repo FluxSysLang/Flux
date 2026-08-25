@@ -221,7 +221,7 @@ def test_verify_rejects_bad_sig() -> void
     ecdsa_p256_pubkey(@pubx[0], @puby[0], @TEST_PRIVKEY[0]);
     ecdsa_p256_sign(@sig_r[0], @sig_s[0], @TEST_PRIVKEY[0], @hash[0], @TEST_NONCE[0]);
 
-    sig_r[15] = sig_r[15] ^^ 0xFF;
+    sig_r[15] = sig_r[15] ^| 0xFF;
 
     bool ok = ecdsa_p256_verify(@sig_r[0], @sig_s[0], @pubx[0], @puby[0], @hash[0]);
     if (ok) { test_fail("verify_rejects_bad_sig: accepted corrupted r\0"); return; };

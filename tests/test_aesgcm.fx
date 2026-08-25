@@ -20,7 +20,7 @@ def bytes_equal(byte* a, byte* b, int len) -> int
     int i, diff;
     for (i = 0; i < len; i++)
     {
-        diff = diff | ((int)(a[i] ^^ b[i]));
+        diff = diff | ((int)(a[i] ^| b[i]));
     };
     return (diff == 0) ? 1 : 0;
 };
@@ -84,7 +84,7 @@ def run_test(int test_num,
 
     // Tamper: flip one bit in the tag, verify returns 0
     for (i = 0; i < 16; i++) { bad_tag[i] = tag[i]; };
-    bad_tag[0] = bad_tag[0] ^^ (byte)0x01;
+    bad_tag[0] = bad_tag[0] ^| (byte)0x01;
     result = gcm_decrypt(@ctx, iv,
                          aad, aad_len,
                          @cipher[0], plain_len,

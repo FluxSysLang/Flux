@@ -2,25 +2,31 @@
 
 using standard::io::console;
 
-struct myStru
-{
-	int x,y,z;
-};
-
 struct bits
 {
-    unsigned data{1} a,b,c,d,e,f,g,h;
+    data{1} a,b,c,d,e,f,g,h;
 };
 
 def main() -> int
 {
-	myStru newStru = {0,1,2};
+    bits myb;
 
-    if (newStru.y is 1 and sizeof(newStru) == 96 and sizeof(bits) == 8)
+    myb
     {
-        print("Structs working!\n\0");
-        print("Size of newStru: \0");
-        print(sizeof(newStru));
+        .a = 0;
+        .b = 1;
+        .c = 0;
+        .c = 0;
+        .d = 0;
+        .e = 0;
+        .f = 0;
+        .g = 0;
+        .h = 1;
     };
+
+    byte[2] y = [myb, 0];
+
+    println(@y);
+
 	return 0;
 };

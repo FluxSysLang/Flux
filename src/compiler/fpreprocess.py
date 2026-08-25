@@ -47,7 +47,7 @@ class FXPreprocessor:
         self.processed_files: Set[str] = set()
         self.output_lines = []
         self.constants: Dict[str, str] = {}
-        self.macros: Dict[str, tuple] = {}  # name -> (params: List[str], body: str)
+        self.psubs: Dict[str, tuple] = {}  # name -> (params: List[str], body: str)
         self.lib_dirs: List[str] = []
         # Maps each output line index (0-based) -> (filename, local_line_number 1-based)
         self.line_map: List[tuple] = []
@@ -107,9 +107,30 @@ class FXPreprocessor:
         result = []
         i = 0
         n = len(content)
+        in_string = False      # True while inside a string literal
+        string_char = ''       # The quote character that opened the string
 
         while i < n:
             c = content[i]
+
+            # ── String literal tracking ───────────────────────────────────────
+            if in_string:
+                result.append(c)
+                if c == '\\' and i + 1 < n:
+                    # Escaped character -- consume both so \" doesn't close the string
+                    i += 1
+                    result.append(content[i])
+                elif c == string_char:
+                    in_string = False
+                i += 1
+                continue
+
+            if c in ('"', "'"):
+                in_string = True
+                string_char = c
+                result.append(c)
+                i += 1
+                continue
 
             # ── Block comment: /// ... /// ────────────────────────────────────
             if i + 2 < n and c == '/' and content[i+1] == '/' and content[i+2] == '/':
@@ -365,7 +386,7 @@ class FXPreprocessor:
             raw_params = rest[paren_open + 1:paren_close]
             params = [p.strip() for p in raw_params.split(',') if p.strip()]
             body = rest[paren_close + 1:].strip()
-            self.macros[name] = (params, body)
+            self.psubs[name] = (params, body)
             print(f"[PREPROCESSOR] Defined PSUB: {name}({', '.join(params)}) = {body}")
             self.line_map.append((getattr(self, '_current_file', self.source_file), self._current_local_lineno))
             self.output_lines.append('')
@@ -558,7 +579,7 @@ class FXPreprocessor:
         def _make_ifdef_cond(cname, invert):
             def _cond():
                 if check_macros:
-                    defined = cname in self.macros
+                    defined = cname in self.psubs
                 else:
                     val = self.constants.get(cname)
                     defined = val is not None and val != '0'
@@ -714,7 +735,7 @@ class FXPreprocessor:
         if _depth > MAX_DEPTH:
             raise RecursionError(f"[PREPROCESSOR] Macro expansion exceeded depth limit ({MAX_DEPTH}). Possible infinite recursion.")
 
-        if not self.macros:
+        if not self.psubs:
             return line
 
         result = []
@@ -730,9 +751,9 @@ class FXPreprocessor:
                     j += 1
                 name = line[i:j]
 
-                if name in self.macros and j < n and line[j] == '(':
+                if name in self.psubs and j < n and line[j] == '(':
                     # Found a macro call -- extract the argument list
-                    params, body = self.macros[name]
+                    params, body = self.psubs[name]
                     # Find matching closing paren, respecting nesting and strings
                     k = j + 1  # start after '('
                     depth = 1

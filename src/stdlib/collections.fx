@@ -4,11 +4,11 @@
 // Provides dynamic, generic collection types for the reduced specification.
 
 #ifndef FLUX_STANDARD_TYPES
-#import "types.fx";
+#import <types.fx>;
 #endif;
 
 #ifndef FLUX_STANDARD_MEMORY
-#import "memory.fx";
+#import <memory.fx>;
 #endif;
 
 #ifndef FLUX_STANDARD_COLLECTIONS
@@ -992,13 +992,7 @@ namespace standard
                 return this.cap;
             };
         };
-    };
-};
 
-namespace standard
-{
-    namespace collections
-    {
         // ============================================================================
         // LinkedList
         // Doubly-linked list backed by a fixed-capacity node pool.
@@ -1292,13 +1286,7 @@ namespace standard
                 return;
             };
         };
-    };
-};
 
-namespace standard
-{
-    namespace collections
-    {
         // ============================================================================
         // Stack
         // LIFO stack backed by LinkedList pool.
@@ -1368,13 +1356,7 @@ namespace standard
                 return this.ll.ll_len() == 0;
             };
         };
-    };
-};
 
-namespace standard
-{
-    namespace collections
-    {
         // ============================================================================
         // Queue
         // FIFO queue backed by LinkedList pool.
@@ -1444,13 +1426,7 @@ namespace standard
                 return this.ll.ll_len() == 0;
             };
         };
-    };
-};
 
-namespace standard
-{
-    namespace collections
-    {
         // ============================================================================
         // Deque  (double-ended queue)
         // Ring-buffer backed deque with fixed capacity set at construction time.
@@ -1606,13 +1582,7 @@ namespace standard
                 return;
             };
         };
-    };
-};
 
-namespace standard
-{
-    namespace collections
-    {
         // ============================================================================
         // RingBuffer
         // Fixed-capacity circular buffer for raw bytes.
@@ -1763,13 +1733,7 @@ namespace standard
                 return;
             };
         };
-    };
-};
 
-namespace standard
-{
-    namespace collections
-    {
         // ============================================================================
         // HashSet  (string keys)
         // Open-addressed robin-hood hash set.
@@ -2073,13 +2037,7 @@ namespace standard
                 return this.cap;
             };
         };
-    };
-};
 
-namespace standard
-{
-    namespace collections
-    {
         // ============================================================================
         // HashSetInt  (u64 keys)
         // Robin-hood hash set for integer keys.
@@ -2321,13 +2279,7 @@ namespace standard
                 return this.cap;
             };
         };
-    };
-};
 
-namespace standard
-{
-    namespace collections
-    {
         // ============================================================================
         // MinHeap  (priority queue, smallest value at top)
         // Binary min-heap backed by a flat Array of void* pointers.
@@ -2508,6 +2460,104 @@ namespace standard
             {
                 this.elems.clear();
                 return;
+            };
+        };
+
+        // ============================================================================
+        // Ptr<T>  (owning smart pointer)
+        // Wraps a single heap-allocated T. Owns the allocation; frees on __exit.
+        // Move semantics via the tie operator -- copy is not permitted.
+        //
+        // Usage example:
+        //   Ptr<int> p;
+        //   p.__init();                  // allocates zeroed T on the heap
+        //   *p.get() = 42;
+        //   int val = *p.get();          // 42
+        //   p.reset();                   // frees and nulls the pointer
+        //   bool live = p.valid();       // false after reset
+        // ============================================================================
+
+        trait BaseSTDSmartPtrTraits
+        {
+            def get<T>()   -> T*,
+                valid() -> bool,
+                reset() -> void,
+                take<T>()  -> T*;
+        };
+
+        BaseSTDSmartPtrTraits
+        object SmartPtr<T>
+        {
+            T* raw;
+
+            // Allocate a zeroed T on the heap.
+            def __init() -> this
+            {
+                this.raw = (T*)fmalloc(sizeof(T) / 8);
+                return this;
+            };
+
+            // Adopt an existing heap pointer (must have been allocated with fmalloc).
+            def __init(T* existing) -> this
+            {
+                this.raw = existing;
+                return this;
+            };
+
+            // Free the owned allocation, if any.
+            def __exit() -> void
+            {
+                if (this.raw != STDLIB_GVP)
+                {
+                    ffree(ulong(this.raw));
+                    this.raw = (T*)STDLIB_GVP;
+                };
+                return;
+            };
+
+            def __expr() -> SmartPtr<T>*
+            {
+                return this;
+            };
+
+            // ----------------------------------------------------------------
+            // get() - return the raw pointer. Null if not valid.
+            // ----------------------------------------------------------------
+            def get() -> T*
+            {
+                return this.raw;
+            };
+
+            // ----------------------------------------------------------------
+            // valid() - true if the pointer is non-null.
+            // ----------------------------------------------------------------
+            def valid() -> bool
+            {
+                return this.raw != (T*)STDLIB_GVP;
+            };
+
+            // ----------------------------------------------------------------
+            // reset() - free the owned allocation and null the pointer.
+            // ----------------------------------------------------------------
+            def reset() -> void
+            {
+                if (this.raw != (T*)STDLIB_GVP)
+                {
+                    ffree(ulong(this.raw));
+                    this.raw = (T*)STDLIB_GVP;
+                };
+                return;
+            };
+
+            // ----------------------------------------------------------------
+            // take() - relinquish ownership and return the raw pointer.
+            // The caller is responsible for freeing it. Ptr is left null.
+            // ----------------------------------------------------------------
+            def take() -> T*
+            {
+                T* out  = this.raw;
+                this.raw = (T*)STDLIB_GVP;
+                return out;
             };
         };
     };

@@ -22,7 +22,7 @@ namespace crc32
             {
                 if (entry `& 1u)
                 {
-                    entry = (entry >> 1) `^^ 0xEDB88320u;
+                    entry = (entry >> 1) `^| 0xEDB88320u;
                 }
                 else
                 {
@@ -38,11 +38,11 @@ namespace crc32
 
         for (uint j; j < length; j++)
         {
-            idx = (crc `^^ ((uint)buf[j] `& 0xFFu)) `& 0xFFu;
-            crc = (crc >> 8) `^^ table[idx];
+            idx = (crc `^| ((uint)buf[j] `& 0xFFu)) `& 0xFFu;
+            crc = (crc >> 8) `^| table[idx];
         };
 
-        return crc `^^ 0xFFFFFFFFu;
+        return crc `^| 0xFFFFFFFFu;
     };
 
     def of_string(byte* str) -> uint

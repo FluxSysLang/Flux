@@ -4555,7 +4555,7 @@ def main() -> int
 - The shadow page holds up to 170 frames; deeply recursive protected functions will hit this limit
 - Windows x86-64 only; requires a frame pointer (`%rbp`) to be present
 - `FSS_CANARY` is a process-lifetime global — direct writes to it from any code path are also detected
-- Future: per-call canary randomization via `fss_rdtsc() ^^ FSS_CANARY` for stronger per-invocation protection
+- Future: per-call canary randomization via `fss_rdtsc() ^| FSS_CANARY` for stronger per-invocation protection
 
 ---
 

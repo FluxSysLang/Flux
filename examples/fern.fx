@@ -55,9 +55,9 @@ def xorshift64(ulong* state) -> ulong
 {
     ulong x;
     x = *state;
-    x = x ^^ (x << 13);
-    x = x ^^ (x >> 7);
-    x = x ^^ (x << 17);
+    x = x ^| (x << 13);
+    x = x ^| (x >> 7);
+    x = x ^| (x << 17);
     *state = x;
     return x;
 };
@@ -380,7 +380,7 @@ def main() -> int
             for (int ci = 0; ci < WIN_W * WIN_H; ci++) { g_hits[ci] = 0; };
         };
 
-        base_seed = base_seed ^^ (ulong)t_now;
+        base_seed = base_seed ^| (ulong)t_now;
 
         for (int t = 0; t < num_threads; t++)
         {
@@ -388,7 +388,7 @@ def main() -> int
             g_slices[t].cx       = cx;
             g_slices[t].cy       = cy;
             g_slices[t].zoom     = zoom;
-            g_slices[t].rng_seed = base_seed ^^ ((ulong)t * 0x9E3779B97F4A7C15);
+            g_slices[t].rng_seed = base_seed ^| ((ulong)t * 0x9E3779B97F4A7C15);
             thread_create(@worker, (void*)@g_slices[t], @threads[t]);
         };
 

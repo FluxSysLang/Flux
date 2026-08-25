@@ -96,7 +96,7 @@ class Operator(Enum):
     OR = "|" #
     NAND = "!&" #
     NOR = "!|" #
-    XOR = "^^" #
+    XOR = "^|" #
     # Comparison
     EQUAL = "==" #
     NOT_EQUAL = "!=" #
@@ -111,7 +111,7 @@ class Operator(Enum):
     MULTIPLY_ASSIGN = "*=" #
     DIVIDE_ASSIGN = "/=" #
     MODULO_ASSIGN = "%=" #
-    POWER_ASSIGN = "^=" #
+    EXPONENT_ASSIGN = "^=" #
     # Bitwise operators
     # Logical
     BITNOT = "`!" #
@@ -119,22 +119,22 @@ class Operator(Enum):
     BITOR = "`|" #
     BITNAND = "`!&" #
     BITNOR = "`!|" #
-    BITXOR = "`^^" #
-    BITXNOT = "`^^!" #
-    BITXNAND = "`^^!&" #
-    BITXNOR = "`^^!|" #
+    BITXOR = "`^|" #
+    BITXNOT = "`^|!" #
+    BITXNAND = "`^|!&" #
+    BITXNOR = "`^|!|" #
     # Assignment
     AND_ASSIGN = "&=" #
     OR_ASSIGN = "|=" #
-    XOR_ASSIGN = "^^=" #
+    XOR_ASSIGN = "^|=" #
     BITAND_ASSIGN = "`&=" #
     BITOR_ASSIGN = "`|=" #
     BITNAND_ASSIGN = "`!&=" #
     BITNOR_ASSIGN = "`!|=" #
-    BITXOR_ASSIGN = "`^^=" #
-    BITXNOT_ASSIGN = "`^^!=" #
-    BITXNAND_ASSIGN = "`^^!&=" #
-    BITXNOR_ASSIGN = "`^^!|=" #
+    BITXOR_ASSIGN = "`^|=" #
+    BITXNOT_ASSIGN = "`^|!=" #
+    BITXNAND_ASSIGN = "`^|!&=" #
+    BITXNOR_ASSIGN = "`^|!|=" #
 
     # Shift
     BITSHIFT_LEFT = "<<"
@@ -838,6 +838,18 @@ class TypeResolver:
                                 if param_spec.is_signed != arg_spec.is_signed:
                                     types_match = False
                                     break
+                            # char and byte are both i8 but semantically distinct.
+                            # Reject a candidate if exactly one side is CHAR —
+                            # keeping the check narrow avoids breaking other same-
+                            # width pairings (e.g. uint vs int) that rely on the
+                            # existing is_signed path above.
+                            param_base = getattr(param_spec, 'base_type', None)
+                            arg_base   = getattr(arg_spec,   'base_type', None)
+                            param_is_char = (param_base == DataType.CHAR)
+                            arg_is_char   = (arg_base   == DataType.CHAR)
+                            if param_is_char != arg_is_char:
+                                types_match = False
+                                break
                             # Endianness must also match for DATA-typed parameters so that
                             # le32 and be32 overloads don't collapse onto the same candidate.
                             param_endian = getattr(param_spec, 'endianness', None)
@@ -1201,17 +1213,12 @@ class TypeSystem:
             return ir.Constant(llvm_type, 0.0)
         elif isinstance(llvm_type, ir.PointerType):
             return ir.Constant(llvm_type, None)
-        elif isinstance(llvm_type, ir.ArrayType):
-            element_init = TypeSystem.get_default_initializer(llvm_type.element)
-            return ir.Constant(llvm_type, [element_init] * llvm_type.count)
-        elif isinstance(llvm_type, ir.LiteralStructType):
-            field_inits = [TypeSystem.get_default_initializer(field) for field in llvm_type.elements]
-            return ir.Constant(llvm_type, field_inits)
-        elif isinstance(llvm_type, ir.IdentifiedStructType):
-            field_inits = [TypeSystem.get_default_initializer(field) for field in llvm_type.elements]
-            return ir.Constant(llvm_type, field_inits)
+        elif isinstance(llvm_type, (ir.ArrayType, ir.LiteralStructType, ir.IdentifiedStructType)):
+            # Use zeroinitializer for all aggregates — emits a single token in IR
+            # instead of recursively materializing every element as an explicit constant,
+            # which produces enormous IR for large structs (e.g. [64 x ArgDef]).
+            return ir.Constant(llvm_type, None)
         else:
-            # Fallback: try to create a zeroed value
             return ir.Constant(llvm_type, None)
 
     @staticmethod
@@ -2697,6 +2704,10 @@ class ArrayTypeHandler:
             # StringLiteral element in a pointer array (e.g. [N x i8*])
             elif isinstance(elem, StringLiteral) and isinstance(llvm_type.element, ir.PointerType):
                 string_val = elem.value
+                import fconfig as _fconfig
+                _null_terminate = _fconfig.config.get('null_terminate_strings', '0').strip() == '1'
+                if _null_terminate and (not string_val or string_val[-1] != '\0'):
+                    string_val += '\0'
                 string_bytes = string_val.encode('ascii')
                 str_arr_ty = ir.ArrayType(ir.IntType(8), len(string_bytes))
                 str_const = ir.Constant(str_arr_ty, bytearray(string_bytes))
@@ -2842,6 +2853,32 @@ class ArrayTypeHandler:
                         field_consts.append(ir.Constant(elem_struct_type.elements[i], 0))
                 const_elements.append(ir.Constant(elem_struct_type, field_consts))
 
+            # Identifier element: copy the current constant initializer of the
+            # named global variable.  Handles `A[] g_arr = [a, b, c]` where
+            # a/b/c are global struct variables whose initializers are already
+            # set (possibly patched by earlier global-scope member assignments).
+            elif isinstance(elem, Identifier):
+                const_val = VariableTypeHandler.identifier_to_constant(elem, module)
+                if const_val is None:
+                    line = getattr(array_literal, 'source_line', 0)
+                    col  = getattr(array_literal, 'source_col',  0)
+                    elem_line = getattr(elem, 'source_line', line)
+                    elem_col  = getattr(elem, 'source_col',  col)
+                    raise ValueError(f"{elem_line}:{elem_col}: Cannot resolve global initializer for identifier '{elem.name}'")
+                # Coerce to element type if needed (e.g. integer width mismatch)
+                if const_val.type != llvm_type.element:
+                    if (isinstance(const_val.type, ir.IntType)
+                            and isinstance(llvm_type.element, ir.IntType)):
+                        const_val = ir.Constant(llvm_type.element, const_val.constant)
+                    else:
+                        line = getattr(array_literal, 'source_line', 0)
+                        col  = getattr(array_literal, 'source_col',  0)
+                        elem_line = getattr(elem, 'source_line', line)
+                        elem_col  = getattr(elem, 'source_col',  col)
+                        raise ValueError(f"{elem_line}:{elem_col}: Type mismatch for identifier '{elem.name}': "
+                                         f"expected {llvm_type.element}, got {const_val.type}")
+                const_elements.append(const_val)
+
             else:
                 line = getattr(array_literal, 'source_line', 0)
                 col  = getattr(array_literal, 'source_col',  0)
@@ -2922,6 +2959,14 @@ class ArrayTypeHandler:
                 if elem_val.type != llvm_type.element:
                     if isinstance(elem_val.type, ir.IntType) and isinstance(llvm_type.element, ir.IntType):
                         elem_val = ArrayTypeHandler._cast_int_to_width(builder, elem_val, llvm_type.element)
+                    elif (isinstance(elem_val.type, (ir.LiteralStructType, ir.IdentifiedStructType)) and
+                          isinstance(llvm_type.element, ir.IntType) and
+                          StructTypeHandler._struct_bits(elem_val.type) == llvm_type.element.width):
+                        # Struct whose total bit width equals the target integer -- reinterpret via memory
+                        tmp = builder.alloca(elem_val.type, name="struct_tmp")
+                        builder.store(elem_val, tmp)
+                        int_ptr = builder.bitcast(tmp, llvm_type.element.as_pointer(), name="struct_as_int_ptr")
+                        elem_val = builder.load(int_ptr, name="struct_to_int")
                     else:
                         raise ValueError(f"ArrayTypeHandler.initialize_local_array: Array element type mismatch: expected {llvm_type.element}, got {elem_val.type}")
                 
@@ -3757,6 +3802,12 @@ class CoercionContext:
                 raise TypeError(
                     f"CoercionContext.coerce_return_value: Invalid return type: can only convert between integer arrays, "
                     f"got {src} -> {expected}")
+
+        # Pointer-to-array decay: [N x T]* -> [N x T]
+        # String literals and global array constants are codegen'd as pointers;
+        # load through when the declared return type is the array value type.
+        if isinstance(src, ir.PointerType) and src.pointee == expected:
+            return builder.load(value, name="array_decay")
 
         # No valid conversion exists
         raise TypeError(
@@ -4690,8 +4741,12 @@ class AssignmentTypeHandler:
                         val.type.pointee.count <= member_type.count):
                     src_count = val.type.pointee.count
                     dst_count = member_type.count
-                    elem_bits = member_type.element.width if isinstance(member_type.element, ir.IntType) else 8
-                    elem_bytes = max(elem_bits // 8, 1)
+                    if isinstance(member_type.element, ir.IntType):
+                        elem_bytes = max(member_type.element.width // 8, 1)
+                    elif isinstance(member_type.element, ir.PointerType):
+                        elem_bytes = 8  # pointers are 64-bit on all supported targets
+                    else:
+                        elem_bytes = 8  # conservative default for floats, structs, etc.
                     # Zero the entire destination array first
                     ArrayTypeHandler.emit_memset(builder, module, member_ptr, 0, dst_count * elem_bytes)
                     # Copy the source bytes
@@ -4977,10 +5032,15 @@ class AssignmentTypeHandler:
                 zero_idx = ir.Constant(ir.IntType(32), 0)
                 val = builder.gep(val, [zero_idx, zero_idx], inbounds=True, name="str_to_ptr")
             
-            # Handle type mismatch: if val is a pointer but element_type is not (or vice versa),
-            # bitcast elem_ptr so the store is valid.
+            # Handle type mismatch: if val is a pointer but element_type is not (or vice versa).
             if isinstance(val.type, ir.PointerType) and not isinstance(element_type, ir.PointerType):
-                elem_ptr = builder.bitcast(elem_ptr, ir.PointerType(val.type), name="void_arr_elem_ptr")
+                # If val is a pointer-to-struct and element_type IS that struct (by value),
+                # visit_ArrayAccess returned a GEP instead of a loaded value (correct for
+                # lvalue field-access, wrong here). Load to get the struct value.
+                if isinstance(val.type.pointee, (ir.LiteralStructType, ir.IdentifiedStructType)) and val.type.pointee == element_type:
+                    val = builder.load(val, name="struct_elem_load")
+                else:
+                    elem_ptr = builder.bitcast(elem_ptr, ir.PointerType(val.type), name="void_arr_elem_ptr")
             elif isinstance(val.type, ir.PointerType) and isinstance(element_type, ir.PointerType):
                 if val.type != element_type:
                     val = builder.bitcast(val, element_type, name="ptr_cast")
@@ -5074,7 +5134,7 @@ class AssignmentTypeHandler:
             TokenType.MULTIPLY_ASSIGN: Operator.MUL,
             TokenType.DIVIDE_ASSIGN: Operator.DIV,
             TokenType.MODULO_ASSIGN: Operator.MOD,
-            TokenType.POWER_ASSIGN: Operator.POWER,
+            TokenType.EXPONENT_ASSIGN: Operator.POWER,
             TokenType.AND_ASSIGN: Operator.AND,
             TokenType.OR_ASSIGN: Operator.OR,
             TokenType.XOR_ASSIGN: Operator.XOR,
@@ -6085,7 +6145,13 @@ class MemberAccessTypeHandler:
         for name, stype in module._struct_types.items():
             if stype == struct_type:
                 return name
-        
+
+        # IdentifiedStructType equality is by identity in llvmlite; if the type
+        # object differs (e.g. came through a bitcast pointer), fall back to
+        # matching by the type's own name attribute.
+        if hasattr(struct_type, 'name') and struct_type.name in module._struct_types:
+            return struct_type.name
+
         return None
 
     @staticmethod

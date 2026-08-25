@@ -33,7 +33,7 @@ int z = x % y;
 ```
 
 **`^`** - Exponentiation
-Note: `^` is **not** XOR. Use `^^` or the `xor` keyword for XOR.
+Note: `^` is **not** XOR. Use `^|` or the `xor` keyword for XOR.
 ```
 float z = 2.0 ^ 10.0;   // 1024.0
 ```
@@ -171,9 +171,9 @@ if (x !& y) { ... };   // true unless both are true
 if (x !| y) { ... };   // true only if both are false
 ```
 
-**`^^`** - Logical XOR
+**`^|`** - Logical XOR
 ```
-if (x ^^ y) { ... };   // true if exactly one is true
+if (x ^| y) { ... };   // true if exactly one is true
 ```
 
 **`and`** - Logical AND (keyword alias for `&`)
@@ -192,7 +192,7 @@ if (not flag) { ... };
 ```
 
 **`xor`** - Bitwise XOR (keyword form)
-Note: `xor` operates on integer values as bitwise XOR. `^^` is its symbolic equivalent in logical context.
+Note: `xor` operates on integer values as bitwise XOR. `^|` is its symbolic equivalent in logical context.
 ```
 int result = a xor b;
 byte k = ipad_key[i] xor byte(0x36);
@@ -212,9 +212,9 @@ x &= mask;
 x |= flag;
 ```
 
-**`^^=`** - XOR and assign
+**`^|=`** - XOR and assign
 ```
-x ^^= y;
+x ^|= y;
 ```
 
 ---
@@ -248,24 +248,24 @@ int result = a `!& b;
 int result = a `!| b;
 ```
 
-**`` `^^ ``** - Bitwise XOR
+**`` `^| ``** - Bitwise XOR
 ```
-int result = a `^^ b;
-```
-
-**`` `^^! ``** - Bitwise XNOT (XOR then NOT)
-```
-int result = a `^^! b;
+int result = a `^| b;
 ```
 
-**`` `^^!& ``** - Bitwise XNAND
+**`` `^|! ``** - Bitwise XNOT (XOR then NOT)
 ```
-int result = a `^^!& b;
+int result = a `^|! b;
 ```
 
-**`` `^^!| ``** - Bitwise XNOR
+**`` `^|!& ``** - Bitwise XNAND
 ```
-int result = a `^^!| b;
+int result = a `^|!& b;
+```
+
+**`` `^|!| ``** - Bitwise XNOR
+```
+int result = a `^|!| b;
 ```
 
 ---
@@ -292,24 +292,24 @@ x `!&= y;
 x `!|= y;
 ```
 
-**`` `^^= ``** - Bitwise XOR and assign
+**`` `^|= ``** - Bitwise XOR and assign
 ```
-x `^^= y;
-```
-
-**`` `^^!= ``** - Bitwise XNOT and assign
-```
-x `^^!= y;
+x `^|= y;
 ```
 
-**`` `^^!&= ``** - Bitwise XNAND and assign
+**`` `^|!= ``** - Bitwise XNOT and assign
 ```
-x `^^!&= y;
+x `^|!= y;
 ```
 
-**`` `^^!|= ``** - Bitwise XNOR and assign
+**`` `^|!&= ``** - Bitwise XNAND and assign
 ```
-x `^^!|= y;
+x `^|!&= y;
+```
+
+**`` `^|!|= ``** - Bitwise XNOR and assign
+```
+x `^|!|= y;
 ```
 
 ---
@@ -764,16 +764,16 @@ Higher rows bind more tightly. Within a row, associativity is left-to-right unle
 | | `*` `/` `%` | Multiplicative |
 | | `+` `-` | Additive |
 | | `<<` `>>` | Shift |
-| | `` `& `` `` `| `` `` `^^ `` `` `!& `` `` `!| `` `` `^^! `` `` `^^!& `` `` `^^!| `` | Bitwise |
+| | `` `& `` `` `| `` `` `^| `` `` `!& `` `` `!| `` `` `^|! `` `` `^|!& `` `` `^|!| `` | Bitwise |
 | | `<` `<=` `>` `>=` | Relational |
 | | `==` `!=` `is` | Equality |
 | | `&` `!&` | Logical AND / NAND |
-| | `^^` | Logical XOR |
+| | `^|` | Logical XOR |
 | | `|` `!|` | Logical OR / NOR |
 | | `??` | Null coalesce |
 | | `? :` | Ternary conditional |
 | | `<-` | Chain arrow |
-| Lowest | `=` `+=` `-=` `*=` `/=` `%=` `^=` `?=` `&=` `|=` `^^=` `` `&= `` `` `|= `` `` `^^= `` `` `!&= `` `` `!|= `` `` `^^!= `` `` `^^!&= `` `` `^^!|= `` `<<=` `>>=` | Assignment (right-associative) |
+| Lowest | `=` `+=` `-=` `*=` `/=` `%=` `^=` `?=` `&=` `|=` `^|=` `` `&= `` `` `|= `` `` `^|= `` `` `!&= `` `` `!|= `` `` `^|!= `` `` `^|!&= `` `` `^|!|= `` `<<=` `>>=` | Assignment (right-associative) |
 
 ---
 
@@ -789,12 +789,12 @@ Higher rows bind more tightly. Within a row, associativity is left-to-right unle
 | `?=` | Assignment | Assign if zero/null |
 | `==` `!=` `<` `<=` `>` `>=` | Comparison | Relational |
 | `is` | Comparison | Equality (keyword alias for `==`) |
-| `&` `\\|` `!` `!&` `!\\|` `^^` | Logical | Boolean logic |
+| `&` `\\|` `!` `!&` `!\\|` `^|` | Logical | Boolean logic |
 | `and` `or` `not` | Logical | Keyword aliases |
 | `xor` | Logical/Bitwise | XOR (keyword form) |
-| `&=` `\\|=` `^^=` | Logical assignment | Compound logical assignment |
-| `` `! `` `` `& `` `` `\\| `` `` `!& `` `` `!\\| `` `` `^^ `` `` `^^! `` `` `^^!& `` `` `^^!\\| `` | Bitwise | Bit-level logic |
-| `` `&= `` `` `\\|= `` `` `^^= `` `` `!&= `` `` `!\\|= `` `` `^^!= `` `` `^^!&= `` `` `^^!\\|= `` | Bitwise assignment | Compound bitwise assignment |
+| `&=` `\\|=` `^|=` | Logical assignment | Compound logical assignment |
+| `` `! `` `` `& `` `` `\\| `` `` `!& `` `` `!\\| `` `` `^| `` `` `^|! `` `` `^|!& `` `` `^|!\\| `` | Bitwise | Bit-level logic |
+| `` `&= `` `` `\\|= `` `` `^|= `` `` `!&= `` `` `!\\|= `` `` `^|!= `` `` `^|!&= `` `` `^|!\\|= `` | Bitwise assignment | Compound bitwise assignment |
 | `<<` `>>` `<<=` `>>=` | Shift | Bit shift |
 | `@` | Pointer | Address-of |
 | `*` (unary) | Pointer | Dereference |

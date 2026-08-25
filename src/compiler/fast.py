@@ -167,15 +167,15 @@ class StringLiteral(Expression):
 _BUILTIN_OP_SYMBOL_MANGLE = {
     '%': 'pct',  '+': 'plus', '-': 'minus', '*': 'mul',
     '/': 'div',  '<': 'lt',   '>': 'gt',    '=': 'eq',
-    '&': 'amp',  '|': 'pipe', '^^': 'xor',  '!': 'not',
+    '&': 'amp',  '|': 'pipe', '^|': 'xor',  '!': 'not',
     '?': 'qst',  '@': 'at',   '~': 'tilde', '^': 'exp',
 }
 
 def _mangle_builtin_op(symbol: str) -> str:
     """Reproduce the parser's _mangle_op_symbol logic for built-in operator names."""
     # This mirrors parser._symbol_to_parts (greedy longest-first) then _mangle_op_symbol.
-    multi = sorted(['^^!&', '^^!|', '^^!', '^^', '!&', '!|', '<=', '>=', '==', '!=',
-                    '++', '--', '<<', '>>', '`!&', '`!|', '`^^'],
+    multi = sorted(['^|!&', '^|!|', '^|!', '^|', '!&', '!|', '<=', '>=', '==', '!=',
+                    '++', '--', '<<', '>>', '`!&', '`!|', '`^|'],
                    key=len, reverse=True)
     parts = []
     i = 0
@@ -263,7 +263,7 @@ class CastExpression(Expression):
 class TypeConvertExpression(Expression):
     """
     Represents a built-in type conversion expression: float(x), int(y), etc.
-    This is a value-convert (not a bitcast) — e.g. float(intval) emits sitofp.
+    This is a value-convert (not a bitcast) - e.g. float(intval) emits sitofp.
     Delegates codegen to CastExpression since the conversion semantics are identical.
     """
     target_type: TypeSystem
@@ -342,7 +342,6 @@ class MethodCall(Expression):
         return f"{self.object}.{self.method_name}({s})"
 
 
-
 def _emit_va_arg(builder, va_list_i8ptr, arg_type, name: str = ''):
     """Emit a va_arg instruction. Delegates to fcodegen."""
     from fcodegen import _emit_va_arg as _eva
@@ -351,7 +350,7 @@ def _emit_va_arg(builder, va_list_i8ptr, arg_type, name: str = ''):
 
 @dataclass
 class VariadicAccess(Expression):
-    """Represents ...[N] — access the Nth variadic argument."""
+    """Represents ...[N] - access the Nth variadic argument."""
     index: Expression
 
     def __repr__(self) -> str:
@@ -692,12 +691,12 @@ class NotNull(Expression):
     non-zero/non-null, and False (i8 0) when it is zero/null.
 
     Semantics:
-        ptr!?          ->  ptr != 0   (boolean i1, zero-extended to i8)
-        x!?            ->  x  != 0
-        obj.field!?    ->  obj.field != 0
+        ptr!?          def   ptr != 0   (boolean i1, zero-extended to i8)
+        x!?            def   x  != 0
+        obj.field!?    def   obj.field != 0
 
     The operator sits in the postfix position because the subject is already
-    in mind when the assertion is made — mirroring natural language:
+    in mind when the assertion is made - mirroring natural language:
         "The pointer isn't null!?"  ->  ptr!?
 
     Codegen produces an LLVM icmp ne ... 0 (or fcmp one for floats), then
@@ -882,7 +881,6 @@ class InlineAsm(Expression):
         return self.body
 
 
-
 def _collect_label_names(stmts) -> list:
     """Recursively walk a statement list and collect all LabelStatement names."""
     names = []
@@ -902,7 +900,7 @@ def _collect_label_names(stmts) -> list:
             names.extend(_collect_label_names(stmt.else_block.statements))
     return names
 
-# Deprecate statement — compile-time check that no references to a namespace exist
+# Deprecate statement - compile-time check that no references to a namespace exist
 @dataclass
 class DeprecateStatement(Statement):
     namespace_path: str  # e.g., "standard::io::some::deprecated::namespace"
@@ -956,7 +954,6 @@ class FunctionPointerDeclaration(Statement):
         """Convert to LLVM function type. Delegates to fcodegen."""
         from fcodegen import _fp_decl_get_llvm_type as _fgt
         return _fgt(func_ptr, module)
-
 def _get_fp_cconv(pointer_expr, module) -> Optional[str]:
     """Look up the LLVM calling convention for an indirect call through a named function pointer."""
     from fcodegen import _get_fp_cconv as _gfc
@@ -1148,12 +1145,10 @@ class StructRecast(Expression):
 # ============================================================================
 # Helper Functions
 # ============================================================================
-
 def register_struct_type(module, type_name: str, bit_width: int, alignment: int):
     """Register a custom type in the module's type registry. Delegates to fcodegen."""
     from fcodegen import register_struct_type as _rst
     return _rst(module, type_name, bit_width, alignment)
-
 def get_struct_vtable(module, struct_name: str) -> Optional['StructVTable']:
     """Get vtable for a struct type. Delegates to fcodegen."""
     from fcodegen import get_struct_vtable as _gsv
@@ -1239,7 +1234,7 @@ class ExternBlock(Statement):
         };
     
     Or single declaration:
-        extern def function_name(params) -> return_type;
+        extern ->function_name(params) -> return_type;
     """
     declarations: List['FunctionDef']  # List of function prototypes
 
@@ -1364,10 +1359,10 @@ class macroDef(ASTNode):
         };
 
     The body is a single expression. The trailing ';' inside the braces is a
-    terminator only — it is consumed during parsing and is NOT injected into
+    terminator only - it is consumed during parsing and is NOT injected into
     the expanded expression.
 
-    macroDef nodes are registered in the parser's macro table at parse time
+    macro->nodes are registered in the parser's macro table at parse time
     and never reach codegen directly. Invocation sites are replaced with
     macroCall, which expands by substituting caller arguments for params.
     """
@@ -1403,7 +1398,7 @@ class macroCall(Expression):
 
 @dataclass
 class macroDefStatement(Statement):
-    """Wraps an macroDef so it can appear as a top-level statement."""
+    """Wraps an macro->so it can appear as a top-level statement."""
     macro_def: macroDef
 
 
@@ -1423,7 +1418,7 @@ class ContractDef(Statement):
         def foo(int x) -> int : NonZero { ... };
 
     The parser expands the contract body statements into the top of the
-    function body at parse time. ContractDef nodes are stored in the
+    function body at parse time. Contract->nodes are stored in the
     parser's _contracts table and never reach codegen directly.
     """
     name: str
@@ -1450,7 +1445,7 @@ class ConstraDef(Statement):
         <T, U, :{MyCS(T, U)}>
         <T, U, :{MyCS}>         // parameters mapped in declaration order
 
-    ConstraDef nodes are stored in the parser's _constras table and never
+    Constra->nodes are stored in the parser's _constras table and never
     reach codegen directly.
     """
     name: str
@@ -1473,18 +1468,18 @@ class TypeFuncDef(ASTNode):
     Syntax:
         TYPE_OR_LITERAL.func_name(params) -> return_type { body };
 
-    Within the body, ``_`` is an implicit first parameter that holds the
+    Within the body, ``this`` is an implicit first parameter that holds the
     receiver value (the left-hand side of the dot).
 
     ``type_name`` is the canonical string that identifies the receiver type,
     e.g. ``"byte"``, ``"int"``, ``"string"``, ``"MyStruct"``.
     ``func_name`` is the unqualified function name.
-    ``parameters`` does NOT include the implicit ``_`` parameter; that is
+    ``parameters`` does NOT include the implicit ``this`` parameter; that is
     added automatically during lowering.
     ``return_type`` is the TypeSystem for the declared return type.
     ``body`` is the Block (may be empty for a prototype).
     ``receiver_type_spec`` is the TypeSystem of the receiver (used to build
-    the implicit ``_`` parameter).
+    the implicit ``this`` parameter).
     ``is_prototype`` is True when the body is omitted (ends with ``;`` after
     the return type).
     """
@@ -1515,7 +1510,7 @@ class TypeFuncCall(Expression):
     receiver ``expr`` resolves to a built-in / literal / named-struct type
     that has a matching type function registered.
 
-    ``receiver`` is the expression whose value becomes ``_`` in the body.
+    ``receiver`` is the expression whose value becomes ``this`` in the body.
     ``type_name`` is the canonical receiver type name (same key used in
     TypeFuncDef).
     ``func_name`` is the unqualified function name.

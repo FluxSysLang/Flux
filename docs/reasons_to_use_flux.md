@@ -9,11 +9,11 @@ The FFI system is first-class: extern blocks, !! no-mangle, string-literal funct
 3. "I want compile-time code generation without a preprocessor macro language from 1972."  
 comptime blocks run full Flux at compile time via the FVM - I/O, FFI, networking, anything - and emitflux injects generated Flux source back into the compilation unit. Self-referential macros constant-fold automatically. It's a real programming environment at compile time, not token pasting.  
 4. "Operator precedence always bites me with bitwise ops and comparisons."  
-Flux fixes the classic C mistake: bitwise operators (\`&, \`|, \`^^) bind tighter than comparisons, so a == b & c means what you intuitively expect. No extra parentheses needed.  
+Flux fixes the classic C mistake: bitwise operators (\`&, \`|, \`^|) bind tighter than comparisons, so `a == b & c` means what you intuitively expect. No extra parentheses needed.  
 5. "I want to add methods to types I don't own, including primitives."  
 Type functions let you attach callable methods to any type - structs, primitives, aliases - using _ as the implicit receiver. "Hello".add_world() or 0.clamp(min, max) work without wrapping the type in a new object.
 6. "C++ templates are unreadable and SFINAE is a nightmare."  
-Flux templates are pure type substitution with no SFINAE. Type constraints are declared explicitly with <T: int | long> or named constraint blocks, and type geometry operators (~=, !<, !>) express compatibility rules without template metaprogramming gymnastics.  
+Flux templates are pure type substitution with no SFINAE. Type constraints are declared explicitly with <T: int | long> or named constraint blocks, and type geometry operators (`~=`, `!<`, `!>`) express compatibility rules without template metaprogramming gymnastics.  
 7. "I want guaranteed tail-call optimization without trusting the optimizer."  
 The <~ recurse arrow on a function definition emits LLVM musttail, guaranteeing zero stack growth on every recursive call. The escape keyword exits the strict-recursion context when you genuinely need to return.  
 8. "Parsing binary protocols and file formats in C is tedious byte-juggling."  

@@ -11,12 +11,13 @@ Runs on the AST produced by FluxParser *before* code generation.
 
 Strategy
 --------
-Only namespace-level *functions* are candidates for elimination.
-Top-level structs, objects, enums, and traits are always preserved.
+All namespace-level declarations are candidates for elimination: functions,
+structs, objects (and their methods), enums, unions, and traits. Any
+declaration whose name is never referenced by live code is removed.
 
 Liveness closure:
   1. Seed from non-namespace top-level code + entry points.
-  2. Expand: for each live name, walk that function's body and add its refs.
+  2. Expand: for each live name, walk that function/method body and add its refs.
   3. Repeat until stable.
   4. Eliminate anything never reached.
 
@@ -52,11 +53,7 @@ _PRIMITIVE_TYPES: frozenset = frozenset({
 # Entry-point / always-keep function names
 # ---------------------------------------------------------------------------
 
-_ALWAYS_KEEP: frozenset = frozenset({
-    'main',
-    'FRTStartup', 'frt_startup',
-    'fstr_append',
-})
+
 
 # ---------------------------------------------------------------------------
 # Mangling helpers
@@ -148,11 +145,37 @@ class _RefCollector:
                 self._add(name)
             return
 
+        # ── TypeSystem ───────────────────────────────────────────────────
+        # TypeSystem nodes carry struct/object type names in custom_typename.
+        # These are strings so the generic dataclass walker skips them; we
+        # must collect them explicitly so named types (RECT, POINT, etc.) are
+        # not eliminated as dead even when only used as parameter/return types.
+        if cls == 'TypeSystem':
+            custom = getattr(node, 'custom_typename', None)
+            if isinstance(custom, str) and custom:
+                self._add(custom)
+            # Still walk array_size / array_dimensions which may be Expressions
+            self._walk(getattr(node, 'array_size', None))
+            self._walk(getattr(node, 'array_dimensions', None))
+            self._walk(getattr(node, 'array_element_type', None))
+            return
+
         # ── FunctionCall ──────────────────────────────────────────────────
         if cls == 'FunctionCall':
             name = getattr(node, 'name', None)
             if isinstance(name, str):
                 self._add(name)
+                # Also emit  basename__N  so that only the matching-arity overloads
+                # are kept alive when multiple overloads share the same base name.
+                # The name may be fully qualified with __ (e.g. standard__io__console__print)
+                # or :: (e.g. standard::io::console::print); extract just the bare name.
+                args = getattr(node, 'arguments', None)
+                if args is None:
+                    args = getattr(node, 'args', None)
+                if isinstance(args, list):
+                    bare = name.replace('::', '__').rsplit('__', 1)[-1]
+                    if bare and bare not in _PRIMITIVE_TYPES:
+                        self.refs.add(bare + '__' + str(len(args)))
             self._walk(getattr(node, 'arguments', None))
             self._walk(getattr(node, 'args', None))
             self._walk(getattr(node, 'type_args', None))
@@ -171,6 +194,12 @@ class _RefCollector:
             if isinstance(method_name, str) and method_name:
                 # Register the bare method name
                 self._add(method_name)
+                # Also emit  method_name__N  for arity-based narrowing.
+                args = getattr(node, 'arguments', None)
+                if args is None:
+                    args = getattr(node, 'args', None)
+                if isinstance(args, list):
+                    self.refs.add(method_name + '__' + str(len(args)))
                 # If the receiver is an Identifier (e.g. a namespace alias),
                 # also register the qualified  obj__method  variant so that
                 # partial-suffix matching in the liveness index can find it.
@@ -232,23 +261,15 @@ def _is_str_name(node: Any) -> bool:
     return isinstance(getattr(node, 'name', None), str)
 
 
-def _func_is_entry_point(func: Any) -> bool:
+def _func_is_entry_point(func: Any, entry: str) -> bool:
     name = getattr(func, 'name', '')
     if not isinstance(name, str):
         return False
-    if getattr(func, 'no_mangle', False):
-        return True
-    if getattr(func, 'is_extern', False):
-        return True
-    if getattr(func, 'is_prototype', False):
-        return True
-    base = name.split('::')[-1] if '::' in name else name
-    base = base.rsplit('__', 1)[-1] if '__' in base else base
-    return base in _ALWAYS_KEEP
+    return name == entry
 
 
 # ---------------------------------------------------------------------------
-# Index all namespace functions under ALL suffix variants of mangled name
+# Index all namespace declarations under ALL suffix variants of mangled name
 # ---------------------------------------------------------------------------
 
 def _index_namespace_functions(program) -> Dict[str, List[Any]]:
@@ -256,13 +277,6 @@ def _index_namespace_functions(program) -> Dict[str, List[Any]]:
     Index every namespace FunctionDef under all suffix variants of its
     fully-qualified mangled name so that partial-qualification call sites
     still hit the index.
-
-    e.g. a function  compare_ignore_case  inside  standard::strings::helpers
-    is indexed under:
-        'standard__strings__helpers__compare_ignore_case'
-        'strings__helpers__compare_ignore_case'
-        'helpers__compare_ignore_case'
-        'compare_ignore_case'
     """
     from fast import NamespaceDef, NamespaceDefStatement, FunctionDef
 
@@ -279,6 +293,68 @@ def _index_namespace_functions(program) -> Dict[str, List[Any]]:
             for variant in _all_suffixes(full_mangled):
                 if variant:
                     index.setdefault(variant, []).append(func)
+            # Also index under  name__N  (arg-count-qualified bare name) so that
+            # call sites emitting  println__1  only keep the 1-parameter overloads.
+            nparams = len(getattr(func, 'parameters', []) or [])
+            count_key = func.name + '__' + str(nparams)
+            index.setdefault(count_key, []).append(func)
+
+        for nested in getattr(ns, 'nested_namespaces', []):
+            _index_ns(nested, cur_prefix)
+
+    for stmt in program.statements:
+        ns = None
+        if isinstance(stmt, NamespaceDef):
+            ns = stmt
+        elif isinstance(stmt, NamespaceDefStatement):
+            ns = getattr(stmt, 'namespace_def', None)
+        if ns is not None:
+            _index_ns(ns, '')
+
+    return index
+
+
+def _index_namespace_types(program) -> Dict[str, Any]:
+    """
+    Index every namespace-level type declaration (StructDef, ObjectDef,
+    TraitDef, EnumDef, UnionDef) under all suffix variants of its
+    fully-qualified mangled name.
+
+    Used during pruning to check type-name liveness.
+    """
+    from fast import NamespaceDef, NamespaceDefStatement
+
+    index: Dict[str, Any] = {}
+
+    def _add_type(cur_prefix: str, name: str, node: Any) -> None:
+        full_mangled = (cur_prefix + '__' + name) if cur_prefix else name
+        for variant in _all_suffixes(full_mangled):
+            if variant:
+                index[variant] = node
+
+    def _index_ns(ns: Any, full_prefix: str) -> None:
+        ns_name = getattr(ns, 'name', '') or ''
+        cur_prefix = (full_prefix + '__' + ns_name) if full_prefix else ns_name
+
+        for decl in getattr(ns, 'structs', []):
+            name = getattr(decl, 'name', None)
+            if isinstance(name, str) and name:
+                _add_type(cur_prefix, name, decl)
+
+        for decl in getattr(ns, 'objects', []):
+            name = getattr(decl, 'name', None)
+            if isinstance(name, str) and name:
+                _add_type(cur_prefix, name, decl)
+
+        for decl in getattr(ns, 'enums', []):
+            name = getattr(decl, 'name', None)
+            if isinstance(name, str) and name:
+                _add_type(cur_prefix, name, decl)
+
+        for decl in getattr(ns, 'unions', []):
+            name = getattr(decl, 'name', None)
+            if isinstance(name, str) and name:
+                _add_type(cur_prefix, name, decl)
 
         for nested in getattr(ns, 'nested_namespaces', []):
             _index_ns(nested, cur_prefix)
@@ -320,24 +396,45 @@ def _compute_live_functions(program, ns_func_index: Dict[str, List[Any]],
     # functions that must remain live even if the entrypoint does not call them
     # directly. Using statements are excluded -- they carry namespace path
     # strings that are not function names.
+    # Top-level FunctionDef nodes (e.g. no-mangle wrappers like realloc, malloc)
+    # are NOT seeded here -- their bodies are only walked if they are themselves
+    # live (i.e. called from live code or are a named entrypoint). Walking them
+    # unconditionally seeds their callees (e.g. memcpy from realloc) even when
+    # nothing in live code ever calls realloc.
+    from fast import FunctionDef as _FunctionDef
     for stmt in program.statements:
         if isinstance(stmt, (NamespaceDef, NamespaceDefStatement)):
             continue
         if isinstance(stmt, UsingStatement):
             continue
+        if isinstance(stmt, _FunctionDef):
+            # Only seed entrypoint functions; skip all others.
+            if _func_is_entry_point(stmt, entry):
+                seed |= _collect_refs(stmt)
+            continue
         seed |= _collect_refs(stmt)
 
-    # Step 2: Seed extern / no_mangle / prototype functions unconditionally.
-    # These are always preserved by _func_is_entry_point; seeding their names
-    # ensures that anything they call is also considered live.
-    for name, funcs in ns_func_index.items():
-        for func in funcs:
-            if _func_is_entry_point(func):
-                seed.add(name)
+    # Step 2: Seed named entrypoint top-level functions and build an index of
+    # all top-level FunctionDefs so they can be walked in the fixed-point when
+    # their name is live. Top-level functions (no-mangle wrappers, CRT shims,
+    # etc.) are not in ns_func_index; without this index their bodies would never
+    # be walked even if something live calls them.
+    toplevel_func_index: Dict[str, List[Any]] = {}
+    for stmt in program.statements:
+        if not isinstance(stmt, _FunctionDef) or not _is_str_name(stmt):
+            continue
+        for variant in _all_suffixes(stmt.name):
+            if variant:
+                toplevel_func_index.setdefault(variant, []).append(stmt)
+        nparams = len(getattr(stmt, 'parameters', []) or [])
+        count_key = stmt.name + '__' + str(nparams)
+        toplevel_func_index.setdefault(count_key, []).append(stmt)
+        if _func_is_entry_point(stmt, entry):
+            seed.add(stmt.name)
 
     # Step 3: Object methods are NOT pre-seeded into the liveness set.
     #
-    # Object methods are only reachable via explicit call sites in live code —
+    # Object methods are only reachable via explicit call sites in live code -
     # the fixed-point expansion in Step 4 discovers them naturally when walking
     # the bodies of live namespace functions.
     #
@@ -358,6 +455,13 @@ def _compute_live_functions(program, ns_func_index: Dict[str, List[Any]],
     from fast import NamespaceDef, NamespaceDefStatement, ObjectDef
 
     obj_method_index: Dict[str, List[Any]] = {}
+    # obj_method_index_qualified only maps variants that still contain the object
+    # name as a qualifier. Used during fixed-point expansion so that bare names
+    # like 'println' or 'len' never cause unrelated object methods to be walked.
+    obj_method_index_qualified: Dict[str, List[Any]] = {}
+    # Maps method node id -> bare object type name, for use in the bare-name
+    # second pass to gate body walking on object type liveness.
+    obj_method_owner: Dict[int, str] = {}
 
     def _index_obj_methods(ns: Any, full_prefix: str) -> None:
         ns_name = getattr(ns, 'name', '') or ''
@@ -372,9 +476,14 @@ def _compute_live_functions(program, ns_func_index: Dict[str, List[Any]],
                     continue
                 full_method = (cur_prefix + '__' + obj_name + '__' + method_name
                                if cur_prefix else obj_name + '__' + method_name)
+                obj_anchor = obj_name + '__' + method_name
+                obj_method_owner[id(method)] = obj_name
                 for variant in _all_suffixes(full_method):
                     if variant:
                         obj_method_index.setdefault(variant, []).append(method)
+                        # Qualified index: only variants that contain the object name
+                        if obj_anchor in variant or variant == full_method:
+                            obj_method_index_qualified.setdefault(variant, []).append(method)
         for nested in getattr(ns, 'nested_namespaces', []):
             _index_obj_methods(nested, cur_prefix)
 
@@ -387,11 +496,13 @@ def _compute_live_functions(program, ns_func_index: Dict[str, List[Any]],
         if ns is not None:
             _index_obj_methods(ns, '')
 
-    # Step 3b(ii): Seed all methods of trait-implementing objects into the frontier.
-    # These objects are preserved in full (not DCE'd), so their method bodies must
-    # be walked to keep any namespace functions they call alive. Without this, a
-    # trait method calling helpers::compare_ignore_case would cause that function
-    # to be eliminated even though the method that calls it is kept.
+    # Step 3b(ii): Seed methods of trait-implementing objects into the frontier,
+    # but ONLY if the object type name is actually referenced in the current seed.
+    # Trait objects are preserved unconditionally by _prune_namespace, but their
+    # method bodies should only be walked (and their callees kept alive) if the
+    # object type is actually constructed or referenced in live code. Seeding all
+    # trait objects unconditionally causes massive false liveness chains when e.g.
+    # a file or allocator object implements a trait but is never used.
     def _seed_trait_obj_methods(ns: Any, full_prefix: str) -> None:
         ns_name = getattr(ns, 'name', '') or ''
         cur_prefix = (full_prefix + '__' + ns_name) if full_prefix else ns_name
@@ -401,14 +512,21 @@ def _compute_live_functions(program, ns_func_index: Dict[str, List[Any]],
             if not getattr(obj, 'traits', None):
                 continue
             obj_name = getattr(obj, 'name', '') or ''
+            # Only walk this trait object's methods if the object type name appears
+            # in any already-seeded name (i.e. something constructs or passes it).
+            obj_referenced = any(obj_name in s for s in seed if obj_name)
+            if not obj_referenced:
+                continue
             for method in getattr(obj, 'methods', []):
                 method_name = getattr(method, 'name', None)
                 if not isinstance(method_name, str):
                     continue
                 full_method = (cur_prefix + '__' + obj_name + '__' + method_name
                                if cur_prefix else obj_name + '__' + method_name)
+                obj_anchor = obj_name + '__' + method_name
+                # Only seed qualified variants to avoid bare-name collisions
                 for variant in _all_suffixes(full_method):
-                    if variant:
+                    if variant and (obj_anchor in variant or variant == full_method):
                         seed.add(variant)
         for nested in getattr(ns, 'nested_namespaces', []):
             _seed_trait_obj_methods(nested, cur_prefix)
@@ -422,18 +540,46 @@ def _compute_live_functions(program, ns_func_index: Dict[str, List[Any]],
         if ns is not None:
             _seed_trait_obj_methods(ns, '')
 
+    # Step 3b(iii): Seed type names from extern block parameter and return types.
+    # Extern blocks are never pruned (they're FFI declarations), so any type they
+    # reference must be kept alive. Walk all extern block function prototypes and
+    # collect their TypeSystem refs into the seed.
+    def _seed_extern_type_refs(ns: Any) -> None:
+        from fast import ExternBlock
+        for block in getattr(ns, 'extern_blocks', []):
+            if not isinstance(block, ExternBlock):
+                continue
+            for decl in getattr(block, 'declarations', []):
+                for ref in _collect_refs(decl):
+                    seed.add(ref)
+        for nested in getattr(ns, 'nested_namespaces', []):
+            _seed_extern_type_refs(nested)
+
+    for stmt in program.statements:
+        ns = None
+        if isinstance(stmt, NamespaceDef):
+            ns = stmt
+        elif isinstance(stmt, NamespaceDefStatement):
+            ns = getattr(stmt, 'namespace_def', None)
+        if ns is not None:
+            _seed_extern_type_refs(ns)
+
     # Step 4: Fixed-point expansion.
     #
     # For each newly-live name we walk two indexes:
-    #   ns_func_index    -- namespace-level FunctionDefs
-    #   obj_method_index -- object methods
+    #   ns_func_index             -- namespace-level FunctionDefs
+    #   obj_method_index_qualified -- object methods, keyed only by qualified
+    #                                 variants (those containing the object name)
     #
-    # Object methods are NOT used to mark OTHER methods live via bare name
-    # matching (that would cause 'println'/'len' etc. to collide with same-named
-    # namespace functions). But we DO need to walk their bodies so that any
-    # namespace functions they call are added to the frontier. Without this,
-    # a live __init that calls a namespace helper (e.g. setup_opengl) would
-    # fail to keep that helper alive.
+    # We deliberately use obj_method_index_qualified and NOT the full
+    # obj_method_index here. The full index contains bare-name keys like
+    # 'println', 'len', 'val', 'append', which collide with same-named
+    # namespace functions and live name variants, causing unrelated object
+    # methods to be walked and their transitive callees to be falsely kept alive.
+    # By using only qualified keys (e.g. 'string__println', 'string__len'),
+    # we only walk a method body when the method was explicitly reached via a
+    # qualified call site. This is consistent with how liveness is checked in
+    # _prune_namespace (the obj_anchor check there).
     live: Set[str] = set()
     frontier: Set[str] = seed
 
@@ -443,19 +589,154 @@ def _compute_live_functions(program, ns_func_index: Dict[str, List[Any]],
             if name in live:
                 continue
             live.add(name)
-            # Walk namespace function bodies
+            # Walk namespace function bodies.
+            # When multiple overloads share a bare name (e.g. 'println'),
+            # we try to restrict walking to only the arity-matching overloads:
+            # if any count-qualified key (funcname__N) for this function is live,
+            # skip overloads whose arity key is NOT live. This avoids walking
+            # every println overload just because one of them was called.
+            # If no count-qualified key is live for any function in the list
+            # (e.g. the name was reached via a non-call path), fall back to
+            # walking all of them conservatively.
+            funcs = ns_func_index.get(name)
+            if funcs:
+                # Check if any arity-qualified key for these functions is live.
+                has_count_key_live = any(
+                    (f.name + '__' + str(len(getattr(f, 'parameters', []) or []))) in live
+                    for f in funcs
+                )
+                for func in funcs:
+                    nparams = len(getattr(func, 'parameters', []) or [])
+                    count_key = func.name + '__' + str(nparams)
+                    # If count-qualified filtering is available and this overload's
+                    # arity key is not live, skip it.
+                    if has_count_key_live and count_key not in live:
+                        continue
+                    for ref in _collect_refs(func):
+                        if ref not in live:
+                            new_frontier.add(ref)
+            # Walk top-level function bodies (no-mangle wrappers, CRT shims, etc.)
+            # These are not in ns_func_index but must be walked when live.
+            tl_funcs = toplevel_func_index.get(name)
+            if tl_funcs:
+                for func in tl_funcs:
+                    for ref in _collect_refs(func):
+                        if ref not in live:
+                            new_frontier.add(ref)
+            # Walk object method bodies only when reached via a qualified name
+            # variant (one containing the object name), to avoid bare-name
+            # collisions that cascade false liveness across unrelated objects.
+            methods = obj_method_index_qualified.get(name)
+            if methods:
+                for method in methods:
+                    for ref in _collect_refs(method):
+                        if ref not in live:
+                            new_frontier.add(ref)
+        frontier = new_frontier
+
+    # Second pass: walk method bodies reachable via bare method name when the
+    # object type is confirmed live. This handles obj.method() call sites where
+    # the receiver is a variable -- the ref collector emits only the bare method
+    # name since type is unknown at DCE time. Without this, functions called from
+    # within live method bodies (e.g. gl_load_extensions from load_extensions)
+    # are never seen and get eliminated.
+    #
+    # Guard: only walk a method body if BOTH:
+    #   (a) the bare method name is in live, AND
+    #   (b) the object type name (from obj_method_owner) is in live
+    # This prevents dead objects from having their method bodies walked.
+    bare_frontier: Set[str] = set()
+    for bare_name, methods in obj_method_index.items():
+        if '__' in bare_name:
+            continue  # qualified key, already handled
+        if bare_name not in live:
+            continue
+        for method in methods:
+            obj_name = obj_method_owner.get(id(method))
+            if obj_name and obj_name not in live:
+                continue  # object type not live, skip
+            for ref in _collect_refs(method):
+                if ref not in live:
+                    bare_frontier.add(ref)
+
+    frontier = bare_frontier
+    while frontier:
+        new_frontier = set()
+        for name in frontier:
+            if name in live:
+                continue
+            live.add(name)
             funcs = ns_func_index.get(name)
             if funcs:
                 for func in funcs:
                     for ref in _collect_refs(func):
                         if ref not in live:
                             new_frontier.add(ref)
-            # Walk object method bodies to catch namespace function calls made
-            # from within live methods (e.g. __init calling setup_opengl)
-            methods = obj_method_index.get(name)
+            tl_funcs = toplevel_func_index.get(name)
+            if tl_funcs:
+                for func in tl_funcs:
+                    for ref in _collect_refs(func):
+                        if ref not in live:
+                            new_frontier.add(ref)
+            methods = obj_method_index_qualified.get(name)
             if methods:
                 for method in methods:
                     for ref in _collect_refs(method):
+                        if ref not in live:
+                            new_frontier.add(ref)
+        frontier = new_frontier
+
+    # Third pass: walk field type specs of live struct and object definitions.
+    # A struct like MSG contains a field of type POINT. When MSG is live, POINT
+    # must also be live. But struct field types are TypeSystem nodes inside
+    # StructDef/ObjectDef -- not function call sites -- so the main fixed-point
+    # never sees them. Walk all live structs/objects, collect their field type
+    # refs, and expand the live set.
+    def _collect_type_field_refs(ns: Any, full_prefix: str) -> Set[str]:
+        ns_name = getattr(ns, 'name', '') or ''
+        cur_prefix = (full_prefix + '__' + ns_name) if full_prefix else ns_name
+        refs: Set[str] = set()
+        for decl in list(getattr(ns, 'structs', [])) + list(getattr(ns, 'objects', [])):
+            name = getattr(decl, 'name', None)
+            if not isinstance(name, str) or not name:
+                continue
+            full_mangled = (cur_prefix + '__' + name) if cur_prefix else name
+            if not any(v in live for v in _all_suffixes(full_mangled)):
+                continue
+            for ref in _collect_refs(decl):
+                if ref not in live:
+                    refs.add(ref)
+        for nested in getattr(ns, 'nested_namespaces', []):
+            refs |= _collect_type_field_refs(nested, cur_prefix)
+        return refs
+
+    type_frontier: Set[str] = set()
+    for stmt in program.statements:
+        ns = None
+        if isinstance(stmt, NamespaceDef):
+            ns = stmt
+        elif isinstance(stmt, NamespaceDefStatement):
+            ns = getattr(stmt, 'namespace_def', None)
+        if ns is not None:
+            type_frontier |= _collect_type_field_refs(ns, '')
+
+    frontier = type_frontier
+    while frontier:
+        new_frontier = set()
+        for name in frontier:
+            if name in live:
+                continue
+            live.add(name)
+            funcs = ns_func_index.get(name)
+            if funcs:
+                for func in funcs:
+                    for ref in _collect_refs(func):
+                        if ref not in live:
+                            new_frontier.add(ref)
+            tl_funcs = toplevel_func_index.get(name)
+            if tl_funcs:
+                for func in tl_funcs:
+                    for ref in _collect_refs(func):
                         if ref not in live:
                             new_frontier.add(ref)
         frontier = new_frontier
@@ -475,9 +756,15 @@ def _ns_is_used(full_prefix: str, used_ns_prefixes: set) -> bool:
     return False
 
 
+def _type_is_live(cur_prefix: str, name: str, live: Set[str]) -> bool:
+    """Return True if any qualified suffix variant of cur_prefix__name is live."""
+    full_mangled = (cur_prefix + '__' + name) if cur_prefix else name
+    return any(v in live for v in _all_suffixes(full_mangled))
+
+
 def _prune_namespace(ns_node: Any, live: Set[str], full_prefix: str,
                      verbose: bool, used_ns_prefixes: set,
-                     obj_method_index: dict) -> int:
+                     obj_method_index: dict, entry: str = '') -> int:
     from fast import FunctionDef, ObjectDef
 
     eliminated = 0
@@ -486,6 +773,17 @@ def _prune_namespace(ns_node: Any, live: Set[str], full_prefix: str,
 
     # Prune dead functions
     if hasattr(ns_node, 'functions'):
+        # Precompute which base names have at least one count-qualified key live.
+        # This enables arity narrowing: when println__1 is live but println__0
+        # and println__2 are not, only the 1-parameter overload survives.
+        names_with_count_live: Set[str] = set()
+        for func in ns_node.functions:
+            if not isinstance(func, FunctionDef) or not _is_str_name(func):
+                continue
+            nparams = len(getattr(func, 'parameters', []) or [])
+            if (func.name + '__' + str(nparams)) in live:
+                names_with_count_live.add(func.name)
+
         kept = []
         for func in ns_node.functions:
             if not isinstance(func, FunctionDef) or not _is_str_name(func):
@@ -493,9 +791,13 @@ def _prune_namespace(ns_node: Any, live: Set[str], full_prefix: str,
                 continue
 
             full_mangled = (cur_prefix + '__' + func.name) if cur_prefix else func.name
-            is_live = _func_is_entry_point(func) or any(
-                v in live for v in _all_suffixes(full_mangled)
-            )
+            name_live = any(v in live for v in _all_suffixes(full_mangled))
+            if name_live and func.name in names_with_count_live:
+                # Arity narrowing: at least one count-qualified key for this base
+                # name is live, so only keep overloads whose arity key is also live.
+                nparams = len(getattr(func, 'parameters', []) or [])
+                name_live = (func.name + '__' + str(nparams)) in live
+            is_live = _func_is_entry_point(func, entry) or name_live
 
             if is_live:
                 kept.append(func)
@@ -507,50 +809,124 @@ def _prune_namespace(ns_node: Any, live: Set[str], full_prefix: str,
                           file=sys.stdout)
         ns_node.functions = kept
 
-    # Prune dead methods from ObjectDefs, then drop entirely-dead objects.
-    #
-    # Granularity matters: an object can be *partially* live — e.g. string's
-    # __init__ is called by println, so the object must stay, but icompare/
-    # contains/split_lines etc. are never called and their callees may have
-    # already been eliminated.  If we kept those dead methods, codegen would
-    # crash trying to emit a call to a function that no longer exists.
-    #
-    # Strategy:
-    #   1. For each method, check liveness under  cur_prefix__ObjName__method.
-    #   2. Drop dead methods from obj.methods in place.
-    #   3. If ALL methods were dead, drop the whole ObjectDef too.
-    #
-    # Special methods (__init__, __exit__, __copy__, __move__) are kept as long
-    # as the object itself is referenced anywhere, because codegen may emit
-    # implicit calls to them.
-    # __exit__, __copy__, __move__ are kept implicitly when the object is live
-    # (codegen may emit them without explicit call sites).
-    # __init__ is NOT here — it appears explicitly as  TypeName.__init  in
-    # construction FunctionCall nodes, so _add() will register it as a regular
-    # ref and it is subject to normal per-method liveness.
-    _ALWAYS_KEEP_METHODS: frozenset = frozenset({
-        '__exit', '__copy', '__move',
-    })
+    # Prune dead namespace variables (globals/constants)
+    if hasattr(ns_node, 'variables'):
+        kept = []
+        for decl in ns_node.variables:
+            name = getattr(decl, 'name', None)
+            if not isinstance(name, str) or not name:
+                kept.append(decl)
+                continue
+            if _type_is_live(cur_prefix, name, live):
+                kept.append(decl)
+            else:
+                eliminated += 1
+                if verbose:
+                    print(f"[DCE] Eliminated unreferenced variable "
+                          f"(in namespace '{ns_name}'): '{name}'",
+                          file=sys.stdout)
+        ns_node.variables = kept
 
+    # Prune dead structs
+    if hasattr(ns_node, 'structs'):
+        kept = []
+        for decl in ns_node.structs:
+            name = getattr(decl, 'name', None)
+            if not isinstance(name, str) or not name:
+                kept.append(decl)
+                continue
+            if _type_is_live(cur_prefix, name, live):
+                kept.append(decl)
+            else:
+                eliminated += 1
+                if verbose:
+                    print(f"[DCE] Eliminated unreferenced StructDef "
+                          f"(in namespace '{ns_name}'): '{name}'",
+                          file=sys.stdout)
+        ns_node.structs = kept
+
+    # Prune dead enums
+    if hasattr(ns_node, 'enums'):
+        kept = []
+        for decl in ns_node.enums:
+            name = getattr(decl, 'name', None)
+            if not isinstance(name, str) or not name:
+                kept.append(decl)
+                continue
+            if _type_is_live(cur_prefix, name, live):
+                kept.append(decl)
+            else:
+                eliminated += 1
+                if verbose:
+                    print(f"[DCE] Eliminated unreferenced EnumDef "
+                          f"(in namespace '{ns_name}'): '{name}'",
+                          file=sys.stdout)
+        ns_node.enums = kept
+
+    # Prune dead unions
+    if hasattr(ns_node, 'unions'):
+        kept = []
+        for decl in ns_node.unions:
+            name = getattr(decl, 'name', None)
+            if not isinstance(name, str) or not name:
+                kept.append(decl)
+                continue
+            if _type_is_live(cur_prefix, name, live):
+                kept.append(decl)
+            else:
+                eliminated += 1
+                if verbose:
+                    print(f"[DCE] Eliminated unreferenced UnionDef "
+                          f"(in namespace '{ns_name}'): '{name}'",
+                          file=sys.stdout)
+        ns_node.unions = kept
+
+    # Prune dead objects and their methods.
+    #
+    # An object is live if its type name appears in the live set (e.g. it is
+    # constructed or passed somewhere in live code).  A dead object is removed
+    # entirely.  A live object has its methods pruned individually: only methods
+    # whose qualified name (containing the object name) appears in the live set
+    # are kept.  Special methods (__exit__, __copy__, __move__) are kept
+    # implicitly whenever the object itself is live because codegen may emit
+    # implicit calls to them.
+    #
+    # Trait-implementing objects are subject to the same liveness rule. They
+    # are NOT unconditionally preserved; if nothing in live code references the
+    # type, it is eliminated along with everything else.
     if hasattr(ns_node, 'objects'):
         kept_objs = []
         for obj in ns_node.objects:
             if not isinstance(obj, ObjectDef):
-                kept_objs.append(obj)
+                # TraitDef and other non-ObjectDef nodes: apply name liveness.
+                name = getattr(obj, 'name', None)
+                if not isinstance(name, str) or not name:
+                    kept_objs.append(obj)
+                    continue
+                if _type_is_live(cur_prefix, name, live):
+                    kept_objs.append(obj)
+                else:
+                    eliminated += 1
+                    if verbose:
+                        kind = type(obj).__name__
+                        print(f"[DCE] Eliminated unreferenced {kind} "
+                              f"(in namespace '{ns_name}'): '{name}'",
+                              file=sys.stdout)
                 continue
 
             obj_name = getattr(obj, 'name', '') or ''
 
-            # Objects that implement traits are part of a public interface contract.
-            # Their methods cannot be DCE'd because they may be called through the
-            # trait interface at any call site the DCE collector cannot see.
-            if getattr(obj, 'traits', None):
-                kept_objs.append(obj)
+            # Check object-level liveness by type name.
+            if not _type_is_live(cur_prefix, obj_name, live):
+                eliminated += 1
+                if verbose:
+                    print(f"[DCE] Eliminated unreferenced ObjectDef "
+                          f"(in namespace '{ns_name}'): '{obj_name}'",
+                          file=sys.stdout)
                 continue
 
-            # First pass: determine which methods are live.
+            # Object is live: prune dead methods individually.
             kept_methods = []
-            any_regular_method_live = False
             for method in getattr(obj, 'methods', []):
                 method_name = getattr(method, 'name', None)
                 if not isinstance(method_name, str):
@@ -559,36 +935,25 @@ def _prune_namespace(ns_node: Any, live: Set[str], full_prefix: str,
 
                 full_method = (cur_prefix + '__' + obj_name + '__' + method_name
                                if cur_prefix else obj_name + '__' + method_name)
-                # Only consider suffixes that still contain the object name — bare
-                # method name suffixes (e.g. 'println', 'len') must NOT be used
-                # because they collide with same-named namespace functions in the
-                # live set.  A method is only live if something explicitly referenced
-                # it in qualified form (e.g. 'string____init', 'string__println').
                 obj_anchor = obj_name + '__' + method_name
-                # Primary check: a qualified variant (containing the object name)
-                # appears in the live set. This is the normal case for explicit
-                # TypeName.__init or obj.method() call sites that the collector
-                # was able to qualify.
+                # Primary check: qualified variant containing the object name is live.
+                # This catches TypeName.__init and TypeName.method() call sites.
                 method_live = any(
                     v in live
                     for v in _all_suffixes(full_method)
                     if obj_anchor in v or v == full_method
                 )
-                # Fallback: the bare method name is live AND it appears in
-                # obj_method_index, meaning it was reached by walking a live
-                # method or function body (e.g. win.process_messages() where
-                # 'win' is a variable -- the collector cannot know its type,
-                # so it can only emit the bare method name into the live set).
-                if not method_live and method_name in live and method_name in obj_method_index:
+                # Fallback: bare method name is live. This catches obj.method() call
+                # sites where the receiver is a variable (type unknown at DCE time),
+                # which only emit the bare method name into refs. The object is
+                # already confirmed live above, so this cannot cause a dead object
+                # to survive -- it may conservatively keep some dead methods on a
+                # live object, which is safe.
+                if not method_live and method_name in live:
                     method_live = True
 
                 if method_live:
                     kept_methods.append(method)
-                    if method_name not in _ALWAYS_KEEP_METHODS:
-                        any_regular_method_live = True
-                elif method_name in _ALWAYS_KEEP_METHODS:
-                    # Defer: keep special methods only if the object is otherwise live.
-                    kept_methods.append(('__defer_special__', method))
                 else:
                     eliminated += 1
                     if verbose:
@@ -597,45 +962,13 @@ def _prune_namespace(ns_node: Any, live: Set[str], full_prefix: str,
                               f"'{method_name}'",
                               file=sys.stdout)
 
-            # Resolve deferred special methods.
-            # The object is live if any regular (non-special) method is live.
-            # Special methods (__init__, __exit__, etc.) are kept automatically
-            # whenever the object itself is live, since codegen may emit implicit
-            # calls to them. If NO regular method is live, the whole object is dead
-            # and special methods are dropped along with it.
-            obj_ref_live = any_regular_method_live
-
-            resolved_methods = []
-            for entry in kept_methods:
-                if isinstance(entry, tuple) and entry[0] == '__defer_special__':
-                    method = entry[1]
-                    if obj_ref_live:
-                        resolved_methods.append(method)
-                    else:
-                        eliminated += 1
-                        if verbose:
-                            mname = getattr(method, 'name', '?')
-                            print(f"[DCE] Eliminated unreferenced ObjectMethod "
-                                  f"(object '{obj_name}' in namespace '{ns_name}'): "
-                                  f"'{mname}'",
-                                  file=sys.stdout)
-                else:
-                    resolved_methods.append(entry)
-
-            if resolved_methods:
-                obj.methods = resolved_methods
-                kept_objs.append(obj)
-            else:
-                eliminated += 1
-                if verbose:
-                    print(f"[DCE] Eliminated unreferenced ObjectDef "
-                          f"(in namespace '{ns_name}'): '{obj_name}'",
-                          file=sys.stdout)
+            obj.methods = kept_methods
+            kept_objs.append(obj)
 
         ns_node.objects = kept_objs
 
     for nested in getattr(ns_node, 'nested_namespaces', []):
-        eliminated += _prune_namespace(nested, live, cur_prefix, verbose, used_ns_prefixes, obj_method_index)
+        eliminated += _prune_namespace(nested, live, cur_prefix, verbose, used_ns_prefixes, obj_method_index, entry)
 
     return eliminated
 
@@ -648,8 +981,10 @@ def eliminate(program, *, entry: str = 'FRTStartup', verbose: bool = False):
     """
     Run dead code elimination on a parsed Flux *Program* AST node.
 
-    Only namespace-level functions are eliminated.  All top-level structs,
-    objects, enums, traits, and variables are preserved unconditionally.
+    All namespace-level declarations are candidates for elimination: functions,
+    structs, objects (and their methods individually), enums, unions, and
+    traits.  Any declaration whose name is never referenced by live code is
+    removed.
 
     Parameters
     ----------
@@ -695,7 +1030,28 @@ def eliminate(program, *, entry: str = 'FRTStartup', verbose: bool = False):
     if verbose:
         print(f"[DCE] Live set: {len(live)} name variant(s).", file=sys.stdout)
 
+    from fast import FunctionDef as _FunctionDef
     total_eliminated = 0
+
+    # Prune dead top-level functions (no-mangle wrappers, CRT shims, etc.).
+    # These live in program.statements directly, not inside any namespace, so
+    # _prune_namespace never sees them. Apply the same liveness rule: a function
+    # is kept only if its name appears in the live set or it is a named entrypoint.
+    kept_stmts = []
+    for stmt in program.statements:
+        if isinstance(stmt, _FunctionDef) and _is_str_name(stmt):
+            is_live = _func_is_entry_point(stmt, entry) or any(
+                v in live for v in _all_suffixes(stmt.name)
+            )
+            if not is_live:
+                total_eliminated += 1
+                if verbose:
+                    print(f"[DCE] Eliminated unreferenced top-level FunctionDef: "
+                          f"'{stmt.name}'", file=sys.stdout)
+                continue
+        kept_stmts.append(stmt)
+    program.statements = kept_stmts
+
     for stmt in program.statements:
         ns = None
         if isinstance(stmt, NamespaceDef):
@@ -703,13 +1059,13 @@ def eliminate(program, *, entry: str = 'FRTStartup', verbose: bool = False):
         elif isinstance(stmt, NamespaceDefStatement):
             ns = getattr(stmt, 'namespace_def', None)
         if ns is not None:
-            total_eliminated += _prune_namespace(ns, live, '', verbose, used_ns_prefixes, obj_method_index)
+            total_eliminated += _prune_namespace(ns, live, '', verbose, used_ns_prefixes, obj_method_index, entry)
 
     if total_eliminated == 0:
-        print("[DCE] No dead namespace functions found.", file=sys.stdout)
+        print("[DCE] No dead namespace declarations found.", file=sys.stdout)
     else:
         print(f"[DCE] Eliminated {total_eliminated} unreferenced namespace "
-              f"function(s).", file=sys.stdout)
+              f"declaration(s).", file=sys.stdout)
 
     if verbose:
         print(f"[DCE] Done. {len(program.statements)} top-level statement(s) remain.",

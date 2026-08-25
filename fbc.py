@@ -252,6 +252,10 @@ class BorrowChecker:
         # cache for FVM expression evaluation -- keyed by id(ast_node)
         # stores the result (int, str, or None) so each node is only executed once
         self._fvm_cache: dict[int, object] = {}
+        # tracks which heap sites have been stored into arrays:
+        # array variable name -> set of heap site strings
+        # used to resolve ffree(arr[i]) back to the original heap site
+        self._array_heap_sites: dict[str, set] = {}
 
     def _remap(self, merged_line: int) -> tuple:
         """Map a merged-source line number back to (original_file, original_line)."""
@@ -342,6 +346,8 @@ class BorrowChecker:
         self.alias.freed_sites = {}
         prev_alloc_sizes = dict(self.alias.alloc_sizes)
         self.alias.alloc_sizes = {}
+        prev_array_heap_sites = self._array_heap_sites
+        self._array_heap_sites = {}
         self.alias.func_name = func.name
         self._in_thread_context = thread_context
         self._current_func_node = func
@@ -391,6 +397,7 @@ class BorrowChecker:
         self.alias.heap_sites = prev_heap_sites
         self.alias.freed_sites = prev_freed_sites
         self.alias.alloc_sizes = prev_alloc_sizes
+        self._array_heap_sites = prev_array_heap_sites
         self.alias.func_name = prev_func
         self._current_func_node = prev_func_node
         self._in_thread_context = prev_thread_ctx
@@ -490,13 +497,19 @@ class BorrowChecker:
                 pre_freed = dict(self.alias.freed_sites)
                 pre_heap  = dict(self.alias.heap_sites)
                 self._walk_block(node.body)
-                # restore freed_sites -- loop may not execute
+                # restore freed_sites -- loop may not execute (UAF tracking)
                 self.alias.freed_sites = dict(pre_freed)
-                # keep any new heap allocations from the body (they may leak)
-                # but restore frees -- a free inside a loop is not guaranteed
+                # loop_heap is the post-walk state: sites freed inside the loop
+                # body have already been removed from heap_sites by record_free.
+                # Merge: keep post-walk state (respects in-loop frees) but also
+                # retain any pre-existing sites that were not touched by the loop.
                 loop_heap = dict(self.alias.heap_sites)
-                merged_heap = dict(pre_heap)
-                merged_heap.update(loop_heap)
+                # Sites in pre_heap that are also absent from loop_heap were freed
+                # inside the loop body -- keep them absent (freed).
+                # Sites in loop_heap that were not in pre_heap are new allocations
+                # from inside the loop body -- keep them present (may leak).
+                merged_heap = {s: v for s, v in pre_heap.items() if s in loop_heap}
+                merged_heap.update({s: v for s, v in loop_heap.items() if s not in pre_heap})
                 self.alias.heap_sites = merged_heap
 
         elif isinstance(node, fast.DoWhileLoop):
@@ -506,8 +519,8 @@ class BorrowChecker:
                 self._walk_block(node.body)
                 self.alias.freed_sites = dict(pre_freed)
                 loop_heap = dict(self.alias.heap_sites)
-                merged_heap = dict(pre_heap)
-                merged_heap.update(loop_heap)
+                merged_heap = {s: v for s, v in pre_heap.items() if s in loop_heap}
+                merged_heap.update({s: v for s, v in loop_heap.items() if s not in pre_heap})
                 self.alias.heap_sites = merged_heap
             self._walk_expr(node.condition)
 
@@ -524,8 +537,8 @@ class BorrowChecker:
                 self._walk_block(node.body)
                 self.alias.freed_sites = dict(pre_freed)
                 loop_heap = dict(self.alias.heap_sites)
-                merged_heap = dict(pre_heap)
-                merged_heap.update(loop_heap)
+                merged_heap = {s: v for s, v in pre_heap.items() if s in loop_heap}
+                merged_heap.update({s: v for s, v in loop_heap.items() if s not in pre_heap})
                 self.alias.heap_sites = merged_heap
 
         elif isinstance(node, fast.ForInLoop):
@@ -535,8 +548,8 @@ class BorrowChecker:
                 self._walk_block(node.body)
                 self.alias.freed_sites = dict(pre_freed)
                 loop_heap = dict(self.alias.heap_sites)
-                merged_heap = dict(pre_heap)
-                merged_heap.update(loop_heap)
+                merged_heap = {s: v for s, v in pre_heap.items() if s in loop_heap}
+                merged_heap.update({s: v for s, v in loop_heap.items() if s not in pre_heap})
                 self.alias.heap_sites = merged_heap
 
         elif isinstance(node, fast.SwitchStatement):
@@ -623,10 +636,28 @@ class BorrowChecker:
         # other statement types (break, continue, label, goto, assert etc.)
         # don't introduce pointers so we skip them
 
+    @staticmethod
+    def _rhs_is_heap_alloc(expr) -> bool:
+        """Return True if expr is fmalloc() or a cast/type-convert wrapping fmalloc()."""
+        if expr is None:
+            return False
+        if _is_fmalloc(expr):
+            return True
+        if isinstance(expr, (fast.CastExpression, fast.TypeConvertExpression)):
+            return BorrowChecker._rhs_is_heap_alloc(expr.expression)
+        return False
+
     def _on_var_decl(self, node: fast.VariableDeclaration):
         file = _node_file(node)
         line = _node_line(node)
         is_ptr = _is_pointer_type(node.type_spec)
+
+        # A variable that stores an fmalloc result must be tracked as a heap
+        # pointer regardless of its declared type (e.g. long addr = fmalloc(n)).
+        # Without this, ffree(addr) cannot resolve the site and the allocation
+        # appears to leak.
+        if not is_ptr and self.check_leaks and self._rhs_is_heap_alloc(node.initial_value):
+            is_ptr = True
 
         # Always register the stack site for this variable so its address
         # can be tracked if taken later
@@ -699,6 +730,35 @@ class BorrowChecker:
                 new_site = self._resolve_site(node.value, var_name, file, line)
                 source_var = node.value.name if isinstance(node.value, fast.Identifier) else None
                 self.alias.assign_ptr(var_name, new_site, True, file, line, source_var=source_var)
+            elif self.check_leaks and self._rhs_is_heap_alloc(node.value):
+                # non-pointer-typed variable being assigned an fmalloc result --
+                # register it so ffree(var) can resolve the site later
+                new_site = self._resolve_site(node.value, var_name, file, line)
+                self.alias.declare_ptr(
+                    var_name=var_name,
+                    site=new_site,
+                    mutable=True,
+                    file=file,
+                    line=line,
+                    is_stack_owner=False,
+                    source_var=None,
+                )
+
+        # arr[i] = ptr -- record that arr contains heap sites so ffree(arr[j])
+        # can be resolved back to a valid heap site
+        if self.check_leaks and isinstance(node.target, fast.ArrayAccess):
+            base = node.target.array
+            if isinstance(base, fast.Identifier):
+                arr_name = base.name
+                rhs_site = None
+                if isinstance(node.value, fast.Identifier):
+                    info = self.alias._find_ptr(node.value.name)
+                    if info and info.site in self.alias.heap_sites:
+                        rhs_site = info.site
+                if rhs_site:
+                    if arr_name not in self._array_heap_sites:
+                        self._array_heap_sites[arr_name] = set()
+                    self._array_heap_sites[arr_name].add(rhs_site)
 
     _SPAWN_IMPL_FUNCS = {'thread_create', 'thread_create_stack', 'pthread_create', 'CreateThread'}
 
@@ -840,6 +900,17 @@ class BorrowChecker:
         # type convert: long(argv), u64(argv) etc.
         if isinstance(arg, fast.TypeConvertExpression):
             return self._resolve_ffree_arg(arg.expression)
+        # arr[i] -- if arr is known to hold heap sites, return and remove one
+        # This handles the pattern: argv[k] = fmalloc(...) then ffree(argv[k])
+        if isinstance(arg, fast.ArrayAccess):
+            base = arg.array
+            if isinstance(base, fast.Identifier):
+                arr_name = base.name
+                sites = self._array_heap_sites.get(arr_name)
+                if sites:
+                    site = next(iter(sites))
+                    sites.discard(site)
+                    return site
         return 'unknown'
 
     def _resolve_site_via_fvm(self, expr, var_name: str, file: str, line: int) -> str | None:
@@ -1117,7 +1188,7 @@ class BorrowChecker:
                 arg = node.arguments[0]
                 # resolve the argument to a site -- handles Identifier, @x, cast(x), etc.
                 freed_site = self._resolve_ffree_arg(arg)
-                #import sys as _sys; _sys.stderr.write(f'[FBC DEBUG] ffree: arg type={type(arg).__name__!r} freed_site={freed_site!r} func={self.alias.func_name!r} heap_sites={list(self.alias.heap_sites.keys())!r} freed_sites={list(self.alias.freed_sites.keys())!r}\n'); _sys.stderr.flush()
+                #import sys as _sys; _sys.stderr.write(f'[FBC DEBUG] ffree: arg type={type(arg).__name__!r} freed_site={freed_site!r} func={self.alias.func_name!r} heap_sites={list(self.alias.heap_sites.keys())!r}\n'); _sys.stderr.flush()
                 if freed_site and freed_site != 'unknown':
                     self.alias.record_free(freed_site)
                     self.alias.mark_freed(freed_site, file, line)
@@ -1349,6 +1420,14 @@ class BorrowChecker:
                     self.alias.check_use_after_free(arr.name, file, line)
                     self.alias.check_write_alias(arr.name, file, line)
                     self._check_bounds_at_access(arr.name, node.target.index, file, line, write=True)
+                    # arr[i] = ptr -- track heap sites stored into arrays so
+                    # ffree(arr[j]) can resolve back to the original heap site
+                    if self.check_leaks and isinstance(node.value, fast.Identifier):
+                        info = self.alias._find_ptr(node.value.name)
+                        if info and info.site in self.alias.heap_sites:
+                            if arr.name not in self._array_heap_sites:
+                                self._array_heap_sites[arr.name] = set()
+                            self._array_heap_sites[arr.name].add(info.site)
             # if target is a known pointer, update its site
             if isinstance(node.target, fast.Identifier):
                 existing = self.alias._find_ptr(node.target.name)

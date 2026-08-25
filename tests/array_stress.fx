@@ -12,7 +12,7 @@
 //   9. Interleaved push/remove/insert
 //  10. Multi-type: 8-byte (u64) elements
 
-#import "standard.fx", "redcollections.fx";
+#import <standard.fx>, <collections.fx>;
 
 using standard::io::console,
       standard::collections;

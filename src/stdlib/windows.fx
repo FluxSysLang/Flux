@@ -54,7 +54,8 @@ namespace standard
             // HRESULT - standard COM return code
             signed data{32} as HRESULT;
 
-            unsigned data{64} as HFONT;
+            unsigned data{64} as HFONT,
+                                 HRGN;       // Region handle
 
             // String types
             byte* as LPCSTR,      // Pointer to const string
@@ -90,6 +91,16 @@ namespace standard
                 HBRUSH hbrBackground;
                 LPCSTR lpszMenuName,lpszClassName;
                 HICON hIconSm;
+            };
+
+            // MINMAXINFO structure (sent with WM_GETMINMAXINFO)
+            struct MINMAXINFO
+            {
+                POINT ptReserved,
+                      ptMaxSize,
+                      ptMaxPosition,
+                      ptMinTrackSize,
+                      ptMaxTrackSize;
             };
 
             // RECT structure
@@ -146,8 +157,9 @@ namespace standard
                          WS_EX_APPWINDOW     = 0x00040000;
 
             // Window Class Styles (CS_*)
-            global UINT CS_VREDRAW = 0x0001,
-                        CS_HREDRAW = 0x0002,
+            global UINT CS_VREDRAW  = 0x0001,
+                        CS_HREDRAW  = 0x0002,
+                        CS_DBLCLKS  = 0x0008,
                         CS_OWNDC   = 0x0020;
 
             // ShowWindow Commands (SW_*)
@@ -170,6 +182,7 @@ namespace standard
                         WM_DESTROY     = 0x0002,
                         WM_MOVE        = 0x0003,
                         WM_SIZE        = 0x0005,
+                        WM_GETMINMAXINFO = 0x0024,
                         WM_ACTIVATE    = 0x0006,
                         WM_PAINT       = 0x000F,
                         WM_ERASEBKGND  = 0x0014,
@@ -179,9 +192,10 @@ namespace standard
                         WM_KEYUP       = 0x0101,
                         WM_CHAR        = 0x0102,
                         WM_MOUSEMOVE   = 0x0200,
-                        WM_LBUTTONDOWN = 0x0201,
-                        WM_LBUTTONUP   = 0x0202,
-                        WM_RBUTTONDOWN = 0x0204,
+                        WM_LBUTTONDOWN    = 0x0201,
+                        WM_LBUTTONUP      = 0x0202,
+                        WM_LBUTTONDBLCLK  = 0x0203,
+                        WM_RBUTTONDOWN    = 0x0204,
                         WM_RBUTTONUP   = 0x0205;
 
             // PeekMessage flags (PM_*)
@@ -231,6 +245,18 @@ namespace standard
             // Background modes (SetBkMode)
             global int TRANSPARENT = 1,
                        OPAQUE      = 2;
+
+            // DrawTextA format flags
+            global UINT DT_TOP        = 0x00000000,
+                        DT_LEFT       = 0x00000000,
+                        DT_CENTER     = 0x00000001,
+                        DT_RIGHT      = 0x00000002,
+                        DT_VCENTER    = 0x00000004,
+                        DT_BOTTOM     = 0x00000008,
+                        DT_WORDBREAK  = 0x00000010,
+                        DT_SINGLELINE = 0x00000020,
+                        DT_NOCLIP     = 0x00000100,
+                        DT_CALCRECT   = 0x00000400;
 
             // RGB color helper - packs R,G,B into a COLORREF (0x00BBGGRR)
             def RGB(byte r, byte g, byte b) -> DWORD
@@ -292,10 +318,15 @@ namespace standard
                     Ellipse(HDC, int, int, int, int) -> bool,
                     Rectangle(HDC, int, int, int, int) -> bool,
                     FillRect(HDC, RECT*, HBRUSH) -> int,
+                    FrameRect(HDC, RECT*, HBRUSH) -> int,
                     SetPixel(HDC, int, int, DWORD) -> DWORD,
                     Arc(HDC, int, int, int, int, int, int, int, int) -> bool,
                     Polyline(HDC, POINT*, int) -> bool,
                     Polygon(HDC, POINT*, int) -> bool,
+
+                // GDI clipping
+                    IntersectClipRect(HDC, int, int, int, int) -> int,
+                    SelectClipRgn(HDC, HRGN) -> int,
 
                 // GDI pen and brush
                     CreatePen(int, int, DWORD) -> HDC,
@@ -356,6 +387,7 @@ namespace standard
                     SetCapture(HWND) -> HWND,
                     ReleaseCapture() -> bool,
                     ExtTextOutA(HDC, int, int, UINT, RECT*, LPCSTR, UINT, void*) -> bool,
+                    DrawTextA(HDC, LPCSTR, int, RECT*, UINT) -> int,
                     OpenClipboard(HWND) -> bool,
                     CloseClipboard() -> bool,
                     EmptyClipboard() -> bool,

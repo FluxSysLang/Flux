@@ -46,8 +46,8 @@ _BUILTIN_OP_SYMBOL_MANGLE: dict = {
 def _mangle_builtin_op(symbol: str) -> str:
     """Reproduce the parser's _mangle_op_symbol logic for built-in operator names."""
     multi = sorted(
-        ['^^!&', '^^!|', '^^!', '^^', '!&', '!|', '<=', '>=', '==', '!=',
-         '++', '--', '<<', '>>', '`!&', '`!|', '`^^'],
+        ['^|!&', '^|!|', '^|!', '^|', '!&', '!|', '<=', '>=', '==', '!=',
+         '++', '--', '<<', '>>', '`!&', '`!|', '`^|'],
         key=len, reverse=True)
     parts = []
     i = 0
@@ -261,6 +261,9 @@ def _member_access_get_ptr(node, builder: ir.IRBuilder, module: ir.Module) -> ir
     if isinstance(obj_val.type, ir.PointerType) and MemberAccessTypeHandler.is_struct_pointer(obj_val.type):
         struct_type = obj_val.type.pointee
         member_index = MemberAccessTypeHandler.get_member_index(struct_type, node.member)
+        if getattr(obj_val, '_flux_union_struct', False):
+            n_fields = len(struct_type.elements)
+            member_index = n_fields - 1 - member_index
         return builder.gep(
             obj_val,
             [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), member_index)],
@@ -537,6 +540,23 @@ class CodegenVisitor:
         )
 
     def visit_ExpressionStatement(self, node, builder, module):
+        # At global scope the builder has no active basic block.  Emitting
+        # instructions for pure expressions (no function call, no assignment)
+        # would append dead IR after the terminator of whatever LLVM function
+        # happens to be current (e.g. FRTStartup), producing invalid IR.
+        # Only expressions with observable side-effects need to be lowered at
+        # global scope; everything else is a no-op.
+        if module.symbol_table.is_global_scope():
+            from fast import FunctionCall, Assignment, BinaryOp
+            expr = node.expression
+            # BinaryOp with ASSIGN has a side-effect (store); plain BinaryOp
+            # (e.g. `0 xor 1;`) does not -- skip it.
+            if isinstance(expr, BinaryOp) and expr.operator is not Operator.ASSIGN:
+                return None
+            # Non-call, non-assignment bare expressions at global scope are
+            # discarded (they evaluate to a constant with no observable effect).
+            if not isinstance(expr, (FunctionCall, Assignment, BinaryOp)):
+                return None
         return self.visit(node.expression, builder, module)
 
     # -- using / !using --------------------------------------------------
@@ -3105,6 +3125,15 @@ class CodegenVisitor:
                 if _st_entry is not None and hasattr(_st_entry, 'llvm_value'):
                     gvar = _st_entry.llvm_value
             if gvar is not None and hasattr(gvar, 'initializer') and gvar.initializer is not None:
+                # Only treat the initializer as a compile-time constant if the
+                # global is marked constant (i.e. declared `const`).  Mutable
+                # globals (e.g. `int g_passed`) have an initializer of 0 at
+                # definition time but their value changes at runtime, so reading
+                # the initializer here would silently return the wrong value.
+                if not getattr(gvar, 'global_constant', False):
+                    raise FluxCodegenError(
+                        f"Cannot evaluate mutable global '{expr.name}' at compile time for f-string",
+                        node, module)
                 init = gvar.initializer
                 if hasattr(init, 'constant'):
                     v = init.constant
@@ -3324,7 +3353,7 @@ class CodegenVisitor:
                                     arguments=node.arguments),
                 builder, module)
 
-        # ── Resolve the overload entry early so we can read param_types ──────
+        # -- Resolve the overload entry early so we can read param_types ------
         # (arg_vals aren't built yet, but a count-based pre-check is enough
         #  for the tied/non-tied check which is purely structural.)
         current_ns = (module.symbol_table.current_namespace
@@ -3346,7 +3375,7 @@ class CodegenVisitor:
                         f"Compile error: local variable '{arg.name}' cannot "
                         f"leave its scope via function call ", node, module)
 
-            # ── New: enforce tied-parameter contract ─────────────────────────
+            # -- New: enforce tied-parameter contract -------------------------
             if overload_entry and i < len(overload_entry['param_types']):
                 param_spec = overload_entry['param_types'][i]
                 arg_is_tie = isinstance(arg, TieExpression)
@@ -3388,7 +3417,7 @@ class CodegenVisitor:
                     arg_vals.append(self.visit(default_expr, builder, module))
                 break
 
-        # ── Enforce endianness-parameter contract ─────────────────────────────
+        # -- Enforce endianness-parameter contract -----------------------------
         # Passing a little-endian value to a big-endian parameter (or vice versa)
         # is a compile error.  Assignment auto-swaps, but parameter passing does not.
         if overload_entry:
@@ -3534,7 +3563,7 @@ class CodegenVisitor:
             available_counts = [o['param_count'] for o in module._function_overloads[node.name]]
             if len(node.arguments) not in available_counts:
                 raise FluxCodegenError(
-                    f"Function {node.name} found but no overload accepts {len(node.arguments, node, module)} arguments. "
+                    f"Function {node.name} found but no overload accepts {len(node.arguments)} arguments. "
                     f"Available overloads accept: {available_counts} arguments. ", node, module)
         raise FluxCodegenError(
             f"Function '{node.name}' not found in module or any imported namespaces ", node, module)
@@ -3689,6 +3718,13 @@ class CodegenVisitor:
                 union_name = MemberAccessTypeHandler.get_union_name_from_type(struct_type, module)
                 return self._member_access_union(node, builder, module, obj_val, union_name)
             member_index = MemberAccessTypeHandler.get_member_index(struct_type, node.member)
+            # Flux is big-endian: field 0 = MSB = highest byte offset on a
+            # little-endian host.  When the struct pointer was produced by a
+            # union bitcast, reverse the index so the declared field order
+            # matches the expected byte layout of the overlaid integer.
+            if getattr(obj_val, '_flux_union_struct', False):
+                n_fields = len(struct_type.elements)
+                member_index = n_fields - 1 - member_index
             member_ptr = builder.gep(obj_val,
                 [ir.Constant(ir.IntType(32), 0), ir.Constant(ir.IntType(32), member_index)], inbounds=True)
             if isinstance(member_ptr.type, ir.PointerType):
@@ -3703,6 +3739,15 @@ class CodegenVisitor:
                 if MemberAccessTypeHandler.should_return_pointer_for_member(pointee):
                     return member_ptr
             loaded = builder.load(member_ptr)
+            # Directly stamp _flux_type_spec from _struct_member_type_specs using
+            # the struct type's own name — bypasses get_struct_name_from_type's
+            # identity comparison which can fail for bitcast-derived pointers.
+            struct_name = getattr(struct_type, 'name', None)
+            if struct_name and hasattr(module, '_struct_member_type_specs'):
+                member_spec = module._struct_member_type_specs.get(struct_name, {}).get(node.member)
+                if member_spec is not None:
+                    loaded._flux_type_spec = member_spec
+                    return loaded
             return MemberAccessTypeHandler.attach_member_type_metadata(loaded, struct_type, node.member, module)
         raise FluxCodegenError(f"Member access on unsupported type: {obj_val.type}", node, module)
 
@@ -3725,6 +3770,12 @@ class CodegenVisitor:
             casted_ptr = builder.bitcast(data_ptr, ir.PointerType(member_type), name=f"union_as_{node.member}")
             return builder.load(casted_ptr, name=f"union_{node.member}_value")
         casted_ptr = builder.bitcast(union_ptr, ir.PointerType(member_type), name=f"union_as_{node.member}")
+        # Tag struct-member pointers so visit_MemberAccess can reverse the GEP
+        # index for big-endian field layout (Flux is big-endian; the host is
+        # little-endian, so field 0 = MSB = highest byte offset).
+        if isinstance(member_type, (ir.IdentifiedStructType, ir.LiteralStructType)):
+            casted_ptr._flux_union_struct = True
+            return casted_ptr
         return builder.load(casted_ptr, name=f"union_{node.member}_value")
 
     def visit_MethodCall(self, node, builder, module):
@@ -3749,9 +3800,23 @@ class CodegenVisitor:
         else:
             # Not an object/struct pointer - try type func dispatch.
             # If the receiver was a variable (Identifier), obj_ptr is an alloca so load once.
-            # If it was a literal or expression, obj_ptr is already the value - don't load.
+            # Exception: if the alloca holds an array, GEP-decay to a pointer to the first
+            # element rather than loading the whole array value -- matching how array params
+            # decay in C/LLVM and matching the receiver type the type func expects.
             if var_name is not None:
-                recv = builder.load(obj_ptr, name="typefunc_recv_load")
+                if isinstance(slot_pointee, ir.ArrayType):
+                    zero = ir.Constant(ir.IntType(32), 0)
+                    recv = builder.gep(obj_ptr, [zero, zero], name="typefunc_arr_decay")
+                    recv_type_name = self._llvm_type_to_flux_type_name(slot_pointee, module)
+                    # Pass the concrete type spec from the caller alloca so that
+                    # _dispatch_type_func_call can emit a size-specialized variant
+                    # of the type function, making sizeof(_) correct inside it.
+                    concrete_ts = getattr(obj_ptr, '_flux_type_spec', None)
+                    return self._dispatch_type_func_call(node, recv, builder, module,
+                                                         override_type_name=recv_type_name,
+                                                         concrete_receiver_type_spec=concrete_ts)
+                else:
+                    recv = builder.load(obj_ptr, name="typefunc_recv_load")
             else:
                 recv = obj_ptr
             # Decay [N x i8]* to i8* so string literals are recognised as 'string'
@@ -3921,10 +3986,27 @@ class CodegenVisitor:
             name = llvm_type.name
             if hasattr(module, '_struct_types') and name in module._struct_types:
                 return name
+        if isinstance(llvm_type, ir.ArrayType):
+            # Array receiver: derive element type name and append _arr to match
+            # the mangling used for T[].func() type functions.
+            elem = llvm_type.element
+            if isinstance(elem, ir.IntType):
+                elem_name = _INT_WIDTH_MAP.get(elem.width, f'data{elem.width}')
+            elif isinstance(elem, ir.FloatType):
+                elem_name = 'float'
+            elif isinstance(elem, ir.DoubleType):
+                elem_name = 'double'
+            elif isinstance(elem, ir.IdentifiedStructType):
+                elem_name = elem.name if (hasattr(module, '_struct_types') and elem.name in module._struct_types) else None
+            else:
+                elem_name = None
+            if elem_name is not None:
+                return f'{elem_name}_arr'
         return None
 
     def _dispatch_type_func_call(self, node, recv_val: ir.Value, builder, module,
-                                  override_type_name: Optional[str] = None):
+                                  override_type_name: Optional[str] = None,
+                                  concrete_receiver_type_spec=None):
         """
         Emit a call to a type function.
 
@@ -3932,6 +4014,11 @@ class CodegenVisitor:
         ``recv_val`` is the already-loaded receiver LLVM value (not a pointer).
         ``override_type_name`` allows callers to supply the Flux type name when
         it is already known (e.g. for named struct types).
+        ``concrete_receiver_type_spec`` is the caller-side TypeSystem spec for
+        the receiver (e.g. MyStru[] with array_size=4).  When supplied and the
+        receiver is a sized array, a size-specialized variant of the type function
+        is emitted (monomorphized) so that sizeof(_) inside the body returns the
+        true array size rather than pointer width.
         """
         type_name = override_type_name
         if type_name is None:
@@ -3960,6 +4047,59 @@ class CodegenVisitor:
             method_name = ''.join(parts)
 
         mangled = f"__typefunc__{type_name}__{method_name}"
+
+        # Monomorphize for concrete sized array receivers so sizeof(_) works.
+        # If we have a concrete type spec with a known array_size, emit (or reuse)
+        # a size-specialized variant named __typefunc__<type>_sz<N>__<method>.
+        if (concrete_receiver_type_spec is not None
+                and getattr(concrete_receiver_type_spec, 'is_array', False)
+                and getattr(concrete_receiver_type_spec, 'array_size', None) is not None
+                and hasattr(module, 'type_func_ast')
+                and mangled in module.type_func_ast):
+            arr_size = concrete_receiver_type_spec.array_size
+            specialized_mangled = f"__typefunc__{type_name}_sz{arr_size}__{method_name}"
+            func = module.globals.get(specialized_mangled)
+            if func is None:
+                import copy
+                from fast import Parameter, FunctionDef
+                orig_node, orig_params = module.type_func_ast[mangled]
+                # Use the original (unsized) receiver type spec so the LLVM
+                # parameter type stays MyStru* — matching what the call site
+                # passes (a GEP-decayed pointer).  Attach the concrete sized
+                # spec separately so visit_FunctionDef can stamp it onto the
+                # alloca's _flux_type_spec, making sizeof(_) return 128.
+                receiver_param = Parameter(name='_', type_spec=orig_node.receiver_type_spec)
+                receiver_param._flux_concrete_type_spec = copy.copy(concrete_receiver_type_spec)
+                all_params = [receiver_param] + list(orig_params)
+                specialized = FunctionDef(
+                    name=specialized_mangled,
+                    parameters=all_params,
+                    return_type=orig_node.return_type,
+                    body=orig_node.body,
+                    is_const=orig_node.is_const,
+                    is_volatile=orig_node.is_volatile,
+                    is_prototype=orig_node.is_prototype,
+                    no_mangle=True,
+                    is_variadic=False,
+                    calling_conv=orig_node.calling_conv,
+                    is_recursive=False,
+                    is_inline=orig_node.is_inline,
+                )
+                specialized.source_line = orig_node.source_line
+                specialized.source_col  = orig_node.source_col
+                # Save the caller's insert point — visit_FunctionDef creates a
+                # new ir.Function and repositions the builder, which would corrupt
+                # the current function's basic block if not restored afterwards.
+                saved_block = builder.block
+                self.visit_FunctionDef(specialized, builder, module)
+                # Restore the caller's insert point so codegen continues correctly.
+                builder.position_at_end(saved_block)
+                # no_mangle=True means the key in module.globals is exactly
+                # specialized_mangled — direct lookup is sufficient.
+                func = module.globals.get(specialized_mangled)
+            if func is not None:
+                mangled = specialized_mangled
+
         func = module.globals.get(mangled)
         if func is None and hasattr(module, '_function_overloads') and mangled in module._function_overloads:
             arg_vals = [self.visit(arg, builder, module) for arg in node.arguments]
@@ -4008,8 +4148,8 @@ class CodegenVisitor:
         """
         Lower a TypeFuncDef to an LLVM function.
 
-        The function is named  ``__typefunc__<type_name>__<func_name>`` and
-        receives ``_`` as its first (implicit) parameter, whose type is the
+        The function is named  `__typefunc__<type_name>__<func_name>` and
+        receives `_` as its first (implicit) parameter, whose type is the
         receiver type.  All other parameters follow in declaration order.
         """
         if getattr(node, '_is_comptime_only', False):
@@ -4029,17 +4169,30 @@ class CodegenVisitor:
                     except (ValueError, NotImplementedError) as e:
                         raise FluxCodegenError(
                             f"f-string type function name cannot be evaluated at compile time "
-                            f": {e}"
-                        , node, module) from e
+                            f": {e}", node, module) from e
             node.func_name = ''.join(parts)
 
-        receiver_param = Parameter(
-            name='_',
-            type_spec=node.receiver_type_spec,
-        )
+        receiver_param = Parameter(name='_',
+                                   type_spec=node.receiver_type_spec)
+
         all_params = [receiver_param] + list(node.parameters)
 
         mangled_base = f"__typefunc__{node.type_name}__{node.func_name}"
+
+        # Store the AST node so _dispatch_type_func_call can emit size-specialized
+        # variants when the receiver is a concrete sized array (monomorphization).
+        if not hasattr(module, 'type_func_ast'):
+            module.type_func_ast = {}
+        module.type_func_ast[mangled_base] = (node, list(node.parameters))
+
+        # For unsized array receivers (e.g. MyStru[]), skip emitting the generic
+        # IR function entirely.  Every call site will monomorphize to a sized
+        # variant (_sz<N>) via _dispatch_type_func_call, so the generic would
+        # be dead code.  Emitting it also causes a redefinition error when the
+        # no_mangle=True specialized variant shares the same base name.
+        if (getattr(node.receiver_type_spec, 'is_array', False)
+                and getattr(node.receiver_type_spec, 'array_size', None) is None):
+            return None
 
         synthetic = FunctionDef(
             name=mangled_base,
@@ -4292,10 +4445,10 @@ class CodegenVisitor:
                 f"Tie operator ~ can only be applied to variables ", node, module)
         var_name = node.operand.name
 
-        # ── Use-after-untie check (must come before re-tie) ──────────────────
+        # -- Use-after-untie check (must come before re-tie) ------------------
         IdentifierTypeHandler.check_validity(var_name, builder)
 
-        # ── Resolve the pointer ───────────────────────────────────────────────
+        # -- Resolve the pointer -----------------------------------------------
         if module.symbol_table.get_llvm_value(var_name) is not None:
             var_ptr = module.symbol_table.get_llvm_value(var_name)
         elif var_name in module.globals:
@@ -4306,12 +4459,12 @@ class CodegenVisitor:
 
         tied_value = builder.load(var_ptr, name=f"{var_name}_tied")
 
-        # ── Mark as untied (Python-side, compile-time tracking) ──────────────
+        # -- Mark as untied (Python-side, compile-time tracking) --------------
         if not hasattr(builder, '_untied_vars'):
             builder._untied_vars = set()
         builder._untied_vars.add(var_name)
 
-        # ── Zero out the source variable in LLVM IR (move-safety / crypto zeroing) ──
+        # -- Zero out the source variable in LLVM IR (move-safety / crypto zeroing) --
         # Every supported type is explicitly zeroed so no stale data remains
         # in the source location after ownership is transferred.
         pointee = var_ptr.type.pointee
@@ -4513,7 +4666,7 @@ class CodegenVisitor:
 
         val = self.visit(node.value, builder, module)
 
-        # ── Tied return-type check ────────────────────────────────────────────
+        # -- Tied return-type check --------------------------------------------
         # If the RHS is a function call whose return type is ~T, the LHS must
         # also be a ~T variable.  Assigning a tied return value to a non-tied
         # variable is a compile error.
@@ -4562,11 +4715,122 @@ class CodegenVisitor:
                 builder, module, node.target.name, val, node.value)
 
         elif isinstance(node.target, MemberAccess):
+            # At global scope, LLVM IR does not permit gep/store instructions
+            # outside a function body.  The only legal approach is to patch the
+            # global variable's constant aggregate initializer directly.
+            #
+            # Case 1: `a.x = 10`  -- object is a plain Identifier
+            #   @a = global %A {i32 0,...}  →  @a = global %A {i32 10,...}
+            #
+            # Case 2: `g_arr[0].x = 20`  -- object is an ArrayAccess
+            #   patch element [0] of @g_arr's constant array initializer
+            if module.symbol_table.is_global_scope():
+                from fast import Identifier as _Ident, ArrayAccess as _AAcc, Literal as _Lit
+                obj = node.target.object
+                member_name = node.target.member
+
+                def _patch_struct_const(struct_const, struct_type, member_name, new_val):
+                    """Return a new ir.Constant with the named member replaced."""
+                    if not (isinstance(struct_type, ir.IdentifiedStructType)
+                            and hasattr(struct_type, 'names')
+                            and struct_type.names):
+                        return None
+                    try:
+                        idx = struct_type.names.index(member_name)
+                    except ValueError:
+                        return None
+                    field_type = struct_type.elements[idx]
+                    patched = new_val
+                    if isinstance(patched, ir.Constant) and patched.type != field_type:
+                        if (isinstance(patched.type, ir.IntType)
+                                and isinstance(field_type, ir.IntType)):
+                            patched = ir.Constant(field_type, getattr(patched, 'constant', 0))
+                    raw = struct_const.constant
+                    if raw is None:
+                        # zeroinitializer -- expand to explicit per-field zero constants
+                        from ftypesys import TypeSystem as _TS
+                        fields = [_TS.get_default_initializer(t) for t in struct_type.elements]
+                    else:
+                        fields = list(raw)
+                    fields[idx] = patched
+                    return ir.Constant(struct_type, fields)
+
+                # Case 1: plain struct variable
+                if isinstance(obj, _Ident):
+                    gvar = module.globals.get(obj.name)
+                    if (gvar is not None
+                            and isinstance(gvar, ir.GlobalVariable)
+                            and isinstance(gvar.initializer, ir.Constant)):
+                        patched = _patch_struct_const(
+                            gvar.initializer, gvar.value_type, member_name, val)
+                        if patched is not None:
+                            gvar.initializer = patched
+                            return gvar
+
+                # Case 2: array element  g_arr[idx].member = val
+                elif isinstance(obj, _AAcc) and isinstance(obj.array, _Ident):
+                    gvar = module.globals.get(obj.array.name)
+                    if (gvar is not None
+                            and isinstance(gvar, ir.GlobalVariable)
+                            and isinstance(gvar.initializer, ir.Constant)
+                            and isinstance(gvar.value_type, ir.ArrayType)):
+                        # Index must be a compile-time constant
+                        idx_node = obj.index
+                        if isinstance(idx_node, _Lit):
+                            arr_idx = int(idx_node.value)
+                            arr_raw = gvar.initializer.constant
+                            arr_count = gvar.value_type.count
+                            elem_zero_type = gvar.value_type.element
+                            if arr_raw is None:
+                                from ftypesys import TypeSystem as _TS
+                                elems = [_TS.get_default_initializer(elem_zero_type) for _ in range(arr_count)]
+                            else:
+                                elems = list(arr_raw)
+                            if 0 <= arr_idx < len(elems):
+                                elem_struct_type = gvar.value_type.element
+                                patched_elem = _patch_struct_const(
+                                    elems[arr_idx], elem_struct_type, member_name, val)
+                                if patched_elem is not None:
+                                    elems[arr_idx] = patched_elem
+                                    gvar.initializer = ir.Constant(gvar.value_type, elems)
+                                    return gvar
+
             return AssignmentTypeHandler.handle_member_assignment(
                 builder, module, node.target.object, node.target.member, val,
                 value_expr=node.value)
 
         elif isinstance(node.target, ArrayAccess):
+            # At global scope, GEP/store instructions are illegal outside a function
+            # body.  Patch the global variable's constant array initializer directly,
+            # mirroring the MemberAccess global-scope path above.
+            if module.symbol_table.is_global_scope():
+                from fast import Identifier as _Ident, Literal as _Lit
+                arr_expr = node.target.array
+                idx_expr = node.target.index
+                # Only handle the simple case: named global array, constant integer index.
+                if isinstance(arr_expr, _Ident) and isinstance(idx_expr, _Lit):
+                    gvar = module.globals.get(arr_expr.name)
+                    if (gvar is not None
+                            and isinstance(gvar, ir.GlobalVariable)
+                            and isinstance(gvar.initializer, ir.Constant)
+                            and isinstance(gvar.initializer.type, ir.ArrayType)):
+                        idx = int(idx_expr.value)
+                        elems = list(gvar.initializer.constant)
+                        # If val is a GlobalVariable pointing to a string array
+                        # ([N x i8]*) but the slot expects i8*, decay it to a
+                        # GEP constant expression so the initializer stays all-constant.
+                        element_type = gvar.initializer.type.element
+                        if (isinstance(val, ir.GlobalVariable)
+                                and isinstance(val.value_type, ir.ArrayType)
+                                and isinstance(element_type, ir.PointerType)
+                                and isinstance(element_type.pointee, ir.IntType)
+                                and element_type.pointee.width == 8):
+                            zero = ir.Constant(ir.IntType(32), 0)
+                            val = val.gep([zero, zero])
+                        elems[idx] = val
+                        gvar.initializer = ir.Constant(gvar.initializer.type, elems)
+                        return val
+                # Fall through to runtime path if not patchable at compile time.
             if isinstance(node.target.array, MemberAccess):
                 member_ptr = node.target.array._get_member_ptr(builder, module)
                 if (isinstance(member_ptr.type, ir.PointerType) and
@@ -4611,6 +4875,14 @@ class CodegenVisitor:
                         elif (isinstance(val.type, ir.PointerType) and
                               str(val.type.pointee) == str(element_type)):
                             val = builder.load(val, name="struct_elem_load")
+                        elif (isinstance(val.type, ir.PointerType) and
+                                  isinstance(val.type.pointee, ir.ArrayType) and
+                                  isinstance(element_type, ir.PointerType) and
+                                  val.type.pointee.element == element_type.pointee):
+                                # val is [N x T]* (e.g. [1 x i8]*), element slot wants T* (e.g. i8*)
+                                # Decay the array pointer to a pointer to its first element.
+                                gep_zero = ir.Constant(ir.IntType(32), 0)
+                                val = builder.gep(val, [gep_zero, gep_zero], inbounds=True, name="arr_decay")
                     builder.store(val, elem_ptr)
                     return val
             return AssignmentTypeHandler.handle_array_element_assignment(
@@ -5359,7 +5631,7 @@ class CodegenVisitor:
         func = builder.block.function
         from fast import Identifier as _Ident
 
-        # ── Helper: resolve array size from symbol-table entry ────────────────────
+        # -- Helper: resolve array size from symbol-table entry --------------------
         def _array_size_from_sym(ast_node):
             if isinstance(ast_node, _Ident):
                 entry = module.symbol_table.lookup_any(ast_node.name)
@@ -5377,7 +5649,7 @@ class CodegenVisitor:
                         return lv.allocated_type.count
             return None
 
-        # ── Helper: decay [N x iW]* -> iW* via GEP [0,0] ─────────────────────
+        # -- Helper: decay [N x iW]* -> iW* via GEP [0,0] ---------------------
         def _decay(ptr_val, ast_node=None):
             """Return (decayed_iW_ptr, elem_type, count_or_None).
 
@@ -5521,7 +5793,7 @@ class CodegenVisitor:
                 f"'{getattr(node.haystack, 'name', '?', node, module)}' "
                 f"at compile time", node, module)
 
-        # ── Common result blocks ───────────────────────────────────────────────
+        # -- Common result blocks -----------------------------------------------
         found_block  = func.append_basic_block('in.found')
         notfound_blk = func.append_basic_block('in.notfound')
         merge_block  = func.append_basic_block('in.merge')
@@ -5607,7 +5879,7 @@ class CodegenVisitor:
             builder.store(ir.Constant(i32, 0), outer_idx_ptr)
             builder.branch(outer_cond)
 
-            # ── Outer cond ────────────────────────────────────────────────────
+            # -- Outer cond ----------------------------------------------------
             builder.position_at_start(outer_cond)
             o_idx = builder.load(outer_idx_ptr, name='o.idx')
             if is_nul_haystack:
@@ -5623,7 +5895,7 @@ class CodegenVisitor:
                                              ir.Constant(i32, hay_count), name='hay.done')
                 builder.cbranch(done, notfound_blk, outer_body)
 
-            # ── Outer body: reset inner state and start inner loop ────────────
+            # -- Outer body: reset inner state and start inner loop ------------
             builder.position_at_start(outer_body)
             inner_ndl_idx_ptr = builder.alloca(i32, name='in.ndl.idx')
             builder.store(ir.Constant(i32, 0), inner_ndl_idx_ptr)
@@ -5632,7 +5904,7 @@ class CodegenVisitor:
             builder.store(o_idx2, inner_hay_idx_ptr)
             builder.branch(inner_cond)
 
-            # ── Inner cond: have we exhausted the needle? ─────────────────────
+            # -- Inner cond: have we exhausted the needle? ---------------------
             builder.position_at_start(inner_cond)
             n_idx = builder.load(inner_ndl_idx_ptr, name='n.idx')
             if is_nul_needle:
@@ -5648,7 +5920,7 @@ class CodegenVisitor:
                                                  ir.Constant(i32, ndl_count), name='ndl.done')
                 builder.cbranch(ndl_done, found_block, inner_body)
 
-            # ── Inner body: compare one element ───────────────────────────────
+            # -- Inner body: compare one element -------------------------------
             builder.position_at_start(inner_body)
             n_idx2  = builder.load(inner_ndl_idx_ptr, name='n.idx2')
             h_idx2  = builder.load(inner_hay_idx_ptr, name='h.idx2')
@@ -5686,13 +5958,13 @@ class CodegenVisitor:
             builder.store(builder.add(h_idx2, ir.Constant(i32, 1)), inner_hay_idx_ptr)
             builder.cbranch(mismatch, inner_fail, inner_cond)
 
-            # ── Inner fail: advance outer window by 1 and retry ───────────────
+            # -- Inner fail: advance outer window by 1 and retry ---------------
             builder.position_at_start(inner_fail)
             o_idx3 = builder.load(outer_idx_ptr, name='o.idx3')
             builder.store(builder.add(o_idx3, ir.Constant(i32, 1)), outer_idx_ptr)
             builder.branch(outer_cond)
 
-        # ── Merge: phi i1 ─────────────────────────────────────────────────────
+        # -- Merge: phi i1 -----------------------------------------------------
         builder.position_at_start(found_block)
         builder.branch(merge_block)
 
@@ -5853,8 +6125,74 @@ class CodegenVisitor:
     def visit_Case(self, node, builder, module):
         return self.visit(node.body, builder, module)
 
+    def _visit_switch_typeof(self, node, builder, module):
+        """
+        Lower  switch (typeof(x)) { case (typeof(T)) { ... } ... }  as a
+        pointer-equality if/else-if chain.  typeof() returns a deduplicated
+        global byte-array pointer so icmp eq on the pointers is correct.
+        """
+        from fast import TypeOf
+        switch_ptr = self.visit(node.expression, builder, module)
+
+        # GEP the global down to i8* for comparison
+        zero = ir.Constant(ir.IntType(32), 0)
+        def _to_i8ptr(gv):
+            return builder.gep(gv, [zero, zero], name="typeof_ptr")
+
+        switch_i8 = _to_i8ptr(switch_ptr)
+
+        func = builder.block.function
+        merge_block   = func.append_basic_block("switch_typeof_merge")
+        default_block = None
+        case_blocks   = []
+
+        for i, case in enumerate(node.cases):
+            if case.value is None:
+                default_block = func.append_basic_block("switch_typeof_default")
+                case_blocks.append((None, default_block))
+            else:
+                case_block = func.append_basic_block(f"switch_typeof_case_{i}")
+                case_blocks.append((case.value, case_block))
+
+        if default_block is None:
+            default_block = merge_block
+
+        # Build the comparison chain
+        for i, (case_expr, case_block) in enumerate(case_blocks):
+            if case_expr is None:
+                builder.branch(default_block)
+                break
+            case_ptr  = self.visit(case_expr, builder, module)
+            case_i8   = _to_i8ptr(case_ptr)
+            cmp       = builder.icmp_unsigned('==', switch_i8, case_i8, name=f"typeof_cmp_{i}")
+            next_check = func.append_basic_block(f"switch_typeof_next_{i}")
+            builder.cbranch(cmp, case_block, next_check)
+            builder.position_at_start(next_check)
+        else:
+            # Fell through all cases — jump to default
+            builder.branch(default_block)
+
+        # Emit case bodies
+        for i, (case_expr, case_block) in enumerate(case_blocks):
+            builder.position_at_start(case_block)
+            func_entry = builder.function.entry_basic_block
+            outer_alloca_block = getattr(builder, '_switch_case_alloca_block', None)
+            builder._switch_case_alloca_block = func_entry
+            self.visit(node.cases[i].body, builder, module)
+            builder._switch_case_alloca_block = outer_alloca_block
+            if not builder.block.is_terminated:
+                builder.branch(merge_block)
+
+        builder.position_at_start(merge_block)
+        return None
+
     def visit_SwitchStatement(self, node, builder, module):
-        from fast import Literal, Identifier
+        from fast import Literal, Identifier, TypeOf
+        # typeof() returns a deduplicated global pointer, not an integer.
+        # LLVM switch requires an integer discriminant, so lower
+        # switch(typeof(x)) as a pointer-equality if/else-if chain instead.
+        if isinstance(node.expression, TypeOf):
+            return self._visit_switch_typeof(node, builder, module)
         switch_val = self.visit(node.expression, builder, module)
 
         func = builder.block.function
@@ -6251,9 +6589,15 @@ class CodegenVisitor:
             param_type_spec = node.parameters[i].type_spec
             if param_type_spec is not None:
                 alloca._flux_type_spec = param_type_spec
+            # If the parameter carries a concrete type spec override (set by the
+            # monomorphizer for sized-array type functions), stamp it onto the
+            # alloca so sizeof(_) resolves to the true array size.
+            concrete_override = getattr(node.parameters[i], '_flux_concrete_type_spec', None)
+            if concrete_override is not None:
+                alloca._flux_type_spec = concrete_override
             param_with_metadata = TypeSystem.attach_type_metadata(param, type_spec=param_type_spec)
             # Tag the _ parameter of string type funcs so that '+' routes to concat.
-            if (param_name == '_' and param_type_spec is not None and
+            if (param_name == 'this' and param_type_spec is not None and
                     getattr(param_type_spec, 'pointer_depth', 0) >= 1 and
                     getattr(param_type_spec, 'base_type', None) == DataType.BYTE):
                 param_with_metadata._is_typefunc_string = True
@@ -6262,7 +6606,7 @@ class CodegenVisitor:
             module.symbol_table.define(
                 param_name,
                 SymbolKind.VARIABLE,
-                type_spec=param_type_spec,
+                type_spec=concrete_override if concrete_override is not None else param_type_spec,
                 llvm_value=alloca
             )
 
@@ -6701,6 +7045,37 @@ class CodegenVisitor:
         struct_name = StructTypeHandler.infer_struct_name(instance, module)
         vtable = module._struct_vtables[struct_name]
         new_value = self.visit(node.value, builder, module)
+        # For large structs (LLVM struct type, not packed int), assign_field_value
+        # cannot handle array fields. Use GEP+memcpy/store directly here instead.
+        if not isinstance(instance.type, ir.IntType) and hasattr(instance.type, 'names'):
+            try:
+                idx = instance.type.names.index(node.field_name)
+            except ValueError:
+                raise FluxCodegenError(
+                    f"Field '{node.field_name}' not found in struct '{struct_name}'", node, module)
+            field_ptr = builder.gep(
+                instance_ptr,
+                [ir.Constant(ir.IntType(32), 0),
+                 ir.Constant(ir.IntType(32), idx)],
+                inbounds=True)
+            field_type = field_ptr.type.pointee
+            if (isinstance(field_type, ir.ArrayType) and
+                    isinstance(new_value.type, ir.PointerType) and
+                    isinstance(new_value.type.pointee, ir.ArrayType)):
+                src_count = new_value.type.pointee.count
+                dst_count = field_type.count
+                elem_bits = field_type.element.width if isinstance(field_type.element, ir.IntType) else 8
+                elem_bytes = max(elem_bits // 8, 1)
+                if src_count < dst_count:
+                    ArrayTypeHandler.emit_memset(builder, module, field_ptr, 0, dst_count * elem_bytes)
+                ArrayTypeHandler.emit_memcpy(builder, module, field_ptr, new_value, src_count * elem_bytes)
+            elif (isinstance(new_value.type, ir.PointerType) and
+                    not isinstance(field_type, ir.PointerType) and
+                    new_value.type.pointee == field_type):
+                builder.store(builder.load(new_value), field_ptr)
+            else:
+                builder.store(new_value, field_ptr)
+            return new_value
         return StructTypeHandler.assign_field_value(
             builder, module, instance_ptr, struct_name, node.field_name, new_value, vtable)
 
@@ -7196,7 +7571,7 @@ class CodegenVisitor:
         """
         import copy
 
-        # ── 1. Locate the definition ──────────────────────────────────────────
+        # -- 1. Locate the definition ------------------------------------------
         macro_def = None
         if hasattr(module, '_macros'):
             macro_def = module._macros.get(node.name)
@@ -7208,27 +7583,27 @@ class CodegenVisitor:
             raise FluxCodegenError(
                 f"Unknown expression macro '{node.name}' ", node, module)
 
-        # ── 2. Arity check ────────────────────────────────────────────────────
+        # -- 2. Arity check ----------------------------------------------------
         if len(node.arguments) != len(macro_def.params):
             raise FluxCodegenError(
                 f"Expression macro '{node.name}' expects {len(macro_def.params)} "
                 f"argument(s), got {len(node.arguments)} ", node, module)
 
-        # ── 3. Detect self-referential body ───────────────────────────────────
+        # -- 3. Detect self-referential body -----------------------------------
         if self._macro_body_is_self_referential(macro_def.body, node.name):
             return self._eval_self_referential_macro(node, macro_def, builder, module)
 
-        # ── 4. Build substitution map: param_name -> deep-copied arg expression
+        # -- 4. Build substitution map: param_name -> deep-copied arg expression
         subst = {
             param: copy.deepcopy(arg)
             for param, arg in zip(macro_def.params, node.arguments)
         }
 
-        # ── 5. Deep-copy the body and substitute ─────────────────────────────
+        # -- 5. Deep-copy the body and substitute -----------------------------
         body_copy = copy.deepcopy(macro_def.body)
         expanded  = self._macro_substitute(body_copy, subst)
 
-        # ── 6. Codegen the expanded expression ───────────────────────────────
+        # -- 6. Codegen the expanded expression -------------------------------
         return self.visit(expanded, builder, module)
 
     @staticmethod
@@ -8328,8 +8703,34 @@ class CodegenVisitor:
             # sub-object fields (e.g. arr.len, arr.cap inside JSONNode) start at zero per
             # Flux semantics. Constructors that are empty (just return this) rely on this.
             if isinstance(alloca.type.pointee, (ir.LiteralStructType, ir.IdentifiedStructType)):
-                zero = TypeSystem.get_default_initializer(alloca.type.pointee)
-                builder.store(zero, alloca)
+                _struct_ty = alloca.type.pointee
+                _is_large = any(
+                    isinstance(el, ir.ArrayType) and el.count > 64
+                    for el in getattr(_struct_ty, 'elements', [])
+                )
+                if _is_large:
+                    i8_ptr_ty = ir.PointerType(ir.IntType(8))
+                    i8_ty     = ir.IntType(8)
+                    i64_ty    = ir.IntType(64)
+                    i1_ty     = ir.IntType(1)
+                    ms_name   = 'llvm.memset.p0i8.i64'
+                    if ms_name not in module.globals:
+                        ir.Function(module,
+                            ir.FunctionType(ir.VoidType(), [i8_ptr_ty, i8_ty, i64_ty, i1_ty]),
+                            name=ms_name)
+                    null_ptr   = ir.Constant(ir.PointerType(_struct_ty), None)
+                    size_ptr   = builder.gep(null_ptr, [ir.Constant(ir.IntType(32), 1)], name='obj_sizeof_gep')
+                    sizeof_val = builder.ptrtoint(size_ptr, i64_ty, name='obj_sizeof')
+                    cast_ptr   = builder.bitcast(alloca, i8_ptr_ty, name='obj_memset_ptr')
+                    builder.call(module.globals[ms_name], [
+                        cast_ptr,
+                        ir.Constant(i8_ty,  0),
+                        sizeof_val,
+                        ir.Constant(i1_ty,  0),
+                    ])
+                else:
+                    zero = TypeSystem.get_default_initializer(_struct_ty)
+                    builder.store(zero, alloca)
             self._vardecl_call_constructor(node, builder, module, alloca)
             return
 
@@ -8366,18 +8767,22 @@ class CodegenVisitor:
         # Try to resolve the constructor using the same multi-step resolution as regular calls
         func = None
 
+        # Normalize any '::' in the constructor name to '__' so that qualified names like
+        # 'argparse::Parser.__init' match the mangled symbols actually registered in globals.
+        constructor_name = func_call.name.replace('::', '__')
+
         # Step 1: Try direct lookup
-        func = module.globals.get(func_call.name, None)
+        func = module.globals.get(constructor_name, None)
         if func and isinstance(func, ir.Function):
-            #print(f"[CONSTRUCTOR] Found via direct lookup: {func_call.name}", file=sys.stdout)
+            #print(f"[CONSTRUCTOR] Found via direct lookup: {constructor_name}", file=sys.stdout)
             pass  # Found it
         else:
             #print("[CONSTRUCTOR] ATTEMPTING OVERLOAD RESOLUTION", file=sys.stdout)
             # Step 2: Try overload resolution
-            if hasattr(module, '_function_overloads') and func_call.name in module._function_overloads:
-                func = TypeResolver.resolve_function(module, func_call.name)
+            if hasattr(module, '_function_overloads') and constructor_name in module._function_overloads:
+                func = TypeResolver.resolve_function(module, constructor_name)
                 #if func:
-                #    print(f"[CONSTRUCTOR] Found via overload resolution: {func_call.name}", file=sys.stdout)
+                #    print(f"[CONSTRUCTOR] Found via overload resolution: {constructor_name}", file=sys.stdout)
 
         # Step 3: Try namespace resolution if still not found
         if func is None and hasattr(module, '_using_namespaces'):
@@ -8385,7 +8790,7 @@ class CodegenVisitor:
             for namespace in module._using_namespaces:
                 #print(f"[CONSTRUCTOR]   Trying namespace: {namespace}", file=sys.stdout)
                 mangled_prefix = namespace.replace("::", "__") + "__"
-                mangled_name = mangled_prefix + func_call.name
+                mangled_name = mangled_prefix + constructor_name
                 #print(f"[CONSTRUCTOR]   Mangled name: {mangled_name}", file=sys.stdout)
 
                 # Try direct lookup with namespace prefix
@@ -8408,7 +8813,7 @@ class CodegenVisitor:
         if func is None and hasattr(module, '_namespaces'):
             for namespace in module._namespaces:
                 mangled_prefix = namespace.replace("::", "__") + "__"
-                mangled_name = mangled_prefix + func_call.name
+                mangled_name = mangled_prefix + constructor_name
 
                 func = module.globals.get(mangled_name, None)
                 if func and isinstance(func, ir.Function):
@@ -8422,17 +8827,17 @@ class CodegenVisitor:
         # Step 5: Scan all overload keys for a suffix match (handles cross-namespace constructor calls
         # where the target namespace was registered after the caller's namespace was first processed)
         if func is None and hasattr(module, '_function_overloads'):
-            suffix = "__" + func_call.name
+            suffix = "__" + constructor_name
             for key, overloads in module._function_overloads.items():
-                if key.endswith(suffix) or key == func_call.name:
+                if key.endswith(suffix) or key == constructor_name:
                     func = TypeResolver.resolve_function(module, key)
                     if func:
                         break
 
         # Step 6: Scan module.globals directly for a function whose name ends with the constructor pattern
         if func is None:
-            # func_call.name is e.g. "JSONNode.__init"; look for "*__JSONNode.__init*" in globals
-            base = func_call.name  # e.g. "JSONNode.__init"
+            # constructor_name is e.g. "JSONNode.__init"; look for "*__JSONNode.__init*" in globals
+            base = constructor_name  # e.g. "JSONNode.__init"
             dot = base.find(".")
             if dot != -1:
                 obj_part = base[:dot]   # e.g. "JSONNode"
@@ -8444,7 +8849,7 @@ class CodegenVisitor:
                         break
 
         if func is None:
-            raise FluxCodegenError(f"Constructor not found: {func_call.name}", node, module)
+            raise FluxCodegenError(f"Constructor not found: {constructor_name}", node, module)
         # Build arguments: 'this' pointer first, then constructor arguments
         args = [alloca]
 
@@ -9128,7 +9533,7 @@ class CodegenVisitor:
             import traceback as _tb; _tb.print_exc()
             raise FluxCodegenError(f'comptime execution failed: {e}{snippet}', node, module)
 
-        # Persist locals for subsequent comptime blocks (scalars only — PTR values
+        # Persist locals for subsequent comptime blocks (scalars only - PTR values
         # point into the VM heap which is not shared between blocks)
         from fvm import TTag as _TTag
         # The VM is now persistent across blocks so PTR values remain valid;

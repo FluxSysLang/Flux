@@ -482,7 +482,7 @@ class FluxVM:
                     raise VMError(
                         f'comptime execution exceeded {_watchdog_limit:.0f}s '
                         f'({_instr_count} instructions executed) in function '
-                        f'{frame.func_name!r} at ip={frame.ip} — likely an infinite loop.\n'
+                        f'{frame.func_name!r} at ip={frame.ip} - likely an infinite loop.\n'
                         f'  locals: {_locals_dump}\n'
                         f'  stack (top 6): {_stack_dump}\n'
                         f'Last executed source line is shown below.'
@@ -2175,7 +2175,7 @@ class FluxVM:
         # so FXPreprocessor resolves relative #import paths correctly via its
         # _dir_stack.  For stdlib/package the temp file location doesn't
         # matter for resolution, so use cwd (/sandbox in the container) which
-        # is always writable — this avoids a PermissionError when the line map
+        # is always writable - this avoids a PermissionError when the line map
         # points to a stdlib file and src_dir resolves to the read-only
         # /opt/flux/src/stdlib/ directory.
         if kind == 'local':
@@ -2358,7 +2358,7 @@ class FluxVM:
         Expand ~$f"..." and ~$i"...":{...} codification tokens in source_text,
         then append ('flux', result) to emit_results.
 
-        Everything else — identifiers, strings, f-strings — is passed through
+        Everything else - identifiers, strings, f-strings - is passed through
         verbatim.  Variable substitution is NOT performed on the surrounding
         source text; that is entirely the job of the ~$f / ~$i operators.
         """
@@ -2394,11 +2394,11 @@ class FluxVM:
             if i + 2 >= n or src[i] != '~' or src[i+1] != '$':
                 return None
             kind = src[i+2]
-            # ~$f"..." or ~$i"..." codify expression — must check BEFORE bare ident
+            # ~$f"..." or ~$i"..." codify expression - must check BEFORE bare ident
             # because 'f' and 'i' are valid ident chars but have special meaning here.
             if kind in ('f', 'i') and i + 3 < n and src[i+3] == '"':
                 pass  # fall through to quoted body scanner below
-            # ~$IDENT  — bare variable substitution
+            # ~$IDENT  - bare variable substitution
             elif src[i+2].isalpha() or src[i+2] == '_':
                 j = i + 2
                 while j < n and (src[j].isalnum() or src[j] == '_'):
@@ -2470,7 +2470,7 @@ class FluxVM:
         def _expand_fstr_body(body: str) -> str:
             """
             Expand {name} slots in a ~$f body.
-            Bare text outside {} is copied verbatim — NOT substituted.
+            Bare text outside {} is copied verbatim - NOT substituted.
             ~$f"clamp_{T}" -> "clamp_int"
             ~$f"is_T"      -> "is_T"   (no braces, nothing touched)
             """

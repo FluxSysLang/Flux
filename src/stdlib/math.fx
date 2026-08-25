@@ -250,6 +250,8 @@ namespace standard
             return result;
         };
 
+        // Using u32 because int can change size
+        // A 16-bit system int will be 16 bits, not 32.
         def fisr(float x) -> float
         {
             float  x2, y;

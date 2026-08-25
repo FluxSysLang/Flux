@@ -123,7 +123,7 @@ namespace gzip
             c = (u32)n;
             for (k = 0; k < 8; k++)
             {
-                if (c `& 1) { c = 0xEDB88320u `^^ (c >> 1); }
+                if (c `& 1) { c = 0xEDB88320u `^| (c >> 1); }
                 else        { c = c >> 1; };
             };
             g_crc_table[n] = c;
@@ -137,12 +137,12 @@ namespace gzip
         size_t i;
 
         crc32_init();
-        c = crc `^^ 0xFFFFFFFFu;
+        c = crc `^| 0xFFFFFFFFu;
         for (i = 0; i < len; i++)
         {
-            c = g_crc_table[(c `^^ (u32)buf[i]) `& 0xFFu] `^^ (c >> 8);
+            c = g_crc_table[(c `^| (u32)buf[i]) `& 0xFFu] `^| (c >> 8);
         };
-        return c `^^ 0xFFFFFFFFu;
+        return c `^| 0xFFFFFFFFu;
     };
 
     def crc32(byte* buf, size_t len) -> u32
@@ -495,7 +495,7 @@ namespace gzip
 
         if (pos + (size_t)lp.LZ77_MIN_LEN > src_len) { return best; };
 
-        h     = (((int)src[pos] << 10) `^^ ((int)src[pos + 1] << 5) `^^ (int)src[pos + 2]) `& hp.HASH_MASK;
+        h     = (((int)src[pos] << 10) `^| ((int)src[pos + 1] << 5) `^| (int)src[pos + 2]) `& hp.HASH_MASK;
         limit = pos > (size_t)lp.LZ77_MAX_DIST ? pos - (size_t)lp.LZ77_MAX_DIST : 0;
         chain = 128;
         cpos  = head[h];
@@ -623,8 +623,8 @@ namespace gzip
 
                 for (i = 0; i < (size_t)m.len; i++)
                 {
-                    h = (((int)src[pos + i] << 10) `^^
-                         ((int)src[pos + i + 1] << 5) `^^
+                    h = (((int)src[pos + i] << 10) `^|
+                         ((int)src[pos + i + 1] << 5) `^|
                           (int)src[pos + i + 2]) `& hp.HASH_MASK;
                     prev[(pos + i) `& (size_t)lp.LZ77_WIN_MASK] = head[h];
                     head[h] = (int)(pos + i);
@@ -636,8 +636,8 @@ namespace gzip
                 r = huff_emit_lit(bw, @g_fixed_tree, (int)src[pos]);
                 if (r != errs.ERR_OK) { return r; };
 
-                h = (((int)src[pos] << 10) `^^
-                     ((int)src[pos + 1] << 5) `^^
+                h = (((int)src[pos] << 10) `^|
+                     ((int)src[pos + 1] << 5) `^|
                       (int)src[pos + 2]) `& hp.HASH_MASK;
                 prev[pos `& (size_t)lp.LZ77_WIN_MASK] = head[h];
                 head[h] = (int)pos;
@@ -764,7 +764,7 @@ namespace gzip
         br_byte_align(br);
         blen  = br_read_le16(br);
         bnlen = br_read_le16(br);
-        if ((blen `^^ bnlen) != 0xFFFFu) { return errs.ERR_BAD_BLOCK; };
+        if ((blen `^| bnlen) != 0xFFFFu) { return errs.ERR_BAD_BLOCK; };
 
         for (i = 0; i < (size_t)blen; i++)
         {

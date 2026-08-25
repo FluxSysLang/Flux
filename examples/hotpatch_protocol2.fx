@@ -83,8 +83,8 @@ def hmac_sha256(byte* key, int key_len, byte* xdata, int xdata_len, byte* out) -
     for (int i; i < 64; i++)
     {
         k = (i < key_len) ? key[i] : (byte)0;
-        ipad_key[i] = k ^^ (byte)0x36;
-        opad_key[i] = k ^^ (byte)0x5C;
+        ipad_key[i] = k ^| (byte)0x36;
+        opad_key[i] = k ^| (byte)0x5C;
     };
 
     // inner = SHA256(ipad_key || xdata)
@@ -109,7 +109,7 @@ def sig_equal(byte* a, byte* b) -> bool
     
     for (int i = 0; i < 32; i++)
     {
-        diff = diff | (a[i] ^^ b[i]);
+        diff = diff | (a[i] ^| b[i]);
     };
     return diff == 0;
 };

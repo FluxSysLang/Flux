@@ -27,6 +27,7 @@ KIND_COLOR = {
     'thread_race':     'red',
     'thread_self_race':'yellow',
     'heap_leak':       'yellow',
+    'potential_leak':  'yellow',
     'use_after_free':  'red',
     'buffer_overflow': 'red',
     'out_of_bounds':   'red',

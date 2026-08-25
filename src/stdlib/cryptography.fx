@@ -58,32 +58,32 @@ namespace standard
                                 // SHA-256 functions
                 def ch(u32 x, u32 y, u32 z) -> u32
                 {
-                    return (x `& y) `^^ (`!x `& z);
+                    return (x `& y) `^| (`!x `& z);
                 };
 
                 def maj(u32 x, u32 y, u32 z) -> u32
                 {
-                    return (x `& y) `^^ (x `& z) `^^ (y `& z);
+                    return (x `& y) `^| (x `& z) `^| (y `& z);
                 };
 
                 def sigma0(u32 x) -> u32
                 {
-                    return rotr(x, 2) `^^ rotr(x, 13) `^^ rotr(x, 22);
+                    return rotr(x, 2) `^| rotr(x, 13) `^| rotr(x, 22);
                 };
 
                 def sigma1(u32 x) -> u32
                 {
-                    return rotr(x, 6) `^^ rotr(x, 11) `^^ rotr(x, 25);
+                    return rotr(x, 6) `^| rotr(x, 11) `^| rotr(x, 25);
                 };
 
                 def gamma0(u32 x) -> u32
                 {
-                    return rotr(x, 7) `^^ rotr(x, 18) `^^ (x >> 3);
+                    return rotr(x, 7) `^| rotr(x, 18) `^| (x >> 3);
                 };
 
                 def gamma1(u32 x) -> u32
                 {
-                    return rotr(x, 17) `^^ rotr(x, 19) `^^ (x >> 10);
+                    return rotr(x, 17) `^| rotr(x, 19) `^| (x >> 10);
                 };
                 
                 // Initialize SHA-256 context
@@ -281,34 +281,34 @@ namespace standard
                 // SHA-512/384 logical functions
                 def ch64(u64 x, u64 y, u64 z) -> u64
                 {
-                    return (x `& y) `^^ (`!x `& z);
+                    return (x `& y) `^| (`!x `& z);
                 };
 
                 def maj64(u64 x, u64 y, u64 z) -> u64
                 {
-                    return (x `& y) `^^ (x `& z) `^^ (y `& z);
+                    return (x `& y) `^| (x `& z) `^| (y `& z);
                 };
 
                 // Capital-Sigma functions
                 def Sigma0(u64 x) -> u64
                 {
-                    return rotr64(x, 28u) `^^ rotr64(x, 34u) `^^ rotr64(x, 39u);
+                    return rotr64(x, 28u) `^| rotr64(x, 34u) `^| rotr64(x, 39u);
                 };
 
                 def Sigma1(u64 x) -> u64
                 {
-                    return rotr64(x, 14u) `^^ rotr64(x, 18u) `^^ rotr64(x, 41u);
+                    return rotr64(x, 14u) `^| rotr64(x, 18u) `^| rotr64(x, 41u);
                 };
 
                 // Lower-sigma (message schedule) functions
                 def sigma0_64(u64 x) -> u64
                 {
-                    return rotr64(x, 1u) `^^ rotr64(x, 8u) `^^ (x >> 7u);
+                    return rotr64(x, 1u) `^| rotr64(x, 8u) `^| (x >> 7u);
                 };
 
                 def sigma1_64(u64 x) -> u64
                 {
-                    return rotr64(x, 19u) `^^ rotr64(x, 61u) `^^ (x >> 6u);
+                    return rotr64(x, 19u) `^| rotr64(x, 61u) `^| (x >> 6u);
                 };
 
                 // Initialize SHA-384 context
@@ -539,12 +539,12 @@ namespace standard
                 
                 def H(u32 x, u32 y, u32 z) -> u32
                 {
-                    return x ^^ y ^^ z;
+                    return x ^| y ^| z;
                 };
                 
                 def I(u32 x, u32 y, u32 z) -> u32
                 {
-                    return y ^^ (x | (!z));
+                    return y ^| (x | (!z));
                 };
                 
                 // Initialize MD5 context
@@ -786,7 +786,7 @@ namespace standard
                 {
                     if ((b & 0x80) != 0)
                     {
-                        return (byte)((b << 1) ^^ 0x1B);
+                        return (byte)((b << 1) ^| 0x1B);
                     }
                     else
                     {
@@ -798,7 +798,7 @@ namespace standard
                 // Galois Field multiplication by 3
                 def gmul3(byte b) -> byte
                 {
-                    return gmul2(b) ^^ b;
+                    return gmul2(b) ^| b;
                 };
                 
                 // SubBytes transformation
@@ -893,10 +893,10 @@ namespace standard
                         base = col * 4;
                         temp[0..3] = [state[base + 0], state[base + 1], state[base + 2], state[base + 3]];
                         
-                        state[base + 0] = gmul2(temp[0]) ^^ gmul3(temp[1]) ^^ temp[2] ^^ temp[3];
-                        state[base + 1] = temp[0] ^^ gmul2(temp[1]) ^^ gmul3(temp[2]) ^^ temp[3];
-                        state[base + 2] = temp[0] ^^ temp[1] ^^ gmul2(temp[2]) ^^ gmul3(temp[3]);
-                        state[base + 3] = gmul3(temp[0]) ^^ temp[1] ^^ temp[2] ^^ gmul2(temp[3]);
+                        state[base + 0] = gmul2(temp[0]) ^| gmul3(temp[1]) ^| temp[2] ^| temp[3];
+                        state[base + 1] = temp[0] ^| gmul2(temp[1]) ^| gmul3(temp[2]) ^| temp[3];
+                        state[base + 2] = temp[0] ^| temp[1] ^| gmul2(temp[2]) ^| gmul3(temp[3]);
+                        state[base + 3] = gmul3(temp[0]) ^| temp[1] ^| temp[2] ^| gmul2(temp[3]);
                     };
                     return;
                 };
@@ -916,31 +916,31 @@ namespace standard
                         // Multiply by inverse matrix in GF(2^8)
                         // 0x0E, 0x0B, 0x0D, 0x09
                         state[base + 0] = (byte)(
-                            gmul2(gmul2(gmul2(temp[0]))) ^^ gmul2(gmul2(temp[0])) ^^ gmul2(temp[0]) ^^  // 0x0E
-                            gmul2(gmul2(gmul2(temp[1]))) ^^ gmul2(temp[1]) ^^ temp[1] ^^                // 0x0B
-                            gmul2(gmul2(gmul2(temp[2]))) ^^ gmul2(gmul2(temp[2])) ^^ temp[2] ^^         // 0x0D
-                            gmul2(gmul2(gmul2(temp[3]))) ^^ temp[3]                                      // 0x09
+                            gmul2(gmul2(gmul2(temp[0]))) ^| gmul2(gmul2(temp[0])) ^| gmul2(temp[0]) ^|  // 0x0E
+                            gmul2(gmul2(gmul2(temp[1]))) ^| gmul2(temp[1]) ^| temp[1] ^|                // 0x0B
+                            gmul2(gmul2(gmul2(temp[2]))) ^| gmul2(gmul2(temp[2])) ^| temp[2] ^|         // 0x0D
+                            gmul2(gmul2(gmul2(temp[3]))) ^| temp[3]                                      // 0x09
                         );
                         
                         state[base + 1] = (byte)(
-                            gmul2(gmul2(gmul2(temp[0]))) ^^ temp[0] ^^
-                            gmul2(gmul2(gmul2(temp[1]))) ^^ gmul2(gmul2(temp[1])) ^^ gmul2(temp[1]) ^^
-                            gmul2(gmul2(gmul2(temp[2]))) ^^ gmul2(temp[2]) ^^ temp[2] ^^
-                            gmul2(gmul2(gmul2(temp[3]))) ^^ gmul2(gmul2(temp[3])) ^^ temp[3]
+                            gmul2(gmul2(gmul2(temp[0]))) ^| temp[0] ^|
+                            gmul2(gmul2(gmul2(temp[1]))) ^| gmul2(gmul2(temp[1])) ^| gmul2(temp[1]) ^|
+                            gmul2(gmul2(gmul2(temp[2]))) ^| gmul2(temp[2]) ^| temp[2] ^|
+                            gmul2(gmul2(gmul2(temp[3]))) ^| gmul2(gmul2(temp[3])) ^| temp[3]
                         );
                         
                         state[base + 2] = (byte)(
-                            gmul2(gmul2(gmul2(temp[0]))) ^^ gmul2(gmul2(temp[0])) ^^ temp[0] ^^
-                            gmul2(gmul2(gmul2(temp[1]))) ^^ temp[1] ^^
-                            gmul2(gmul2(gmul2(temp[2]))) ^^ gmul2(gmul2(temp[2])) ^^ gmul2(temp[2]) ^^
-                            gmul2(gmul2(gmul2(temp[3]))) ^^ gmul2(temp[3]) ^^ temp[3]
+                            gmul2(gmul2(gmul2(temp[0]))) ^| gmul2(gmul2(temp[0])) ^| temp[0] ^|
+                            gmul2(gmul2(gmul2(temp[1]))) ^| temp[1] ^|
+                            gmul2(gmul2(gmul2(temp[2]))) ^| gmul2(gmul2(temp[2])) ^| gmul2(temp[2]) ^|
+                            gmul2(gmul2(gmul2(temp[3]))) ^| gmul2(temp[3]) ^| temp[3]
                         );
                         
                         state[base + 3] = (byte)(
-                            gmul2(gmul2(gmul2(temp[0]))) ^^ gmul2(temp[0]) ^^ temp[0] ^^
-                            gmul2(gmul2(gmul2(temp[1]))) ^^ gmul2(gmul2(temp[1])) ^^ temp[1] ^^
-                            gmul2(gmul2(gmul2(temp[2]))) ^^ temp[2] ^^
-                            gmul2(gmul2(gmul2(temp[3]))) ^^ gmul2(gmul2(temp[3])) ^^ gmul2(temp[3])
+                            gmul2(gmul2(gmul2(temp[0]))) ^| gmul2(temp[0]) ^| temp[0] ^|
+                            gmul2(gmul2(gmul2(temp[1]))) ^| gmul2(gmul2(temp[1])) ^| temp[1] ^|
+                            gmul2(gmul2(gmul2(temp[2]))) ^| temp[2] ^|
+                            gmul2(gmul2(gmul2(temp[3]))) ^| gmul2(gmul2(temp[3])) ^| gmul2(temp[3])
                         );
                     };
                     return;
@@ -954,10 +954,10 @@ namespace standard
                     for (u32 col; col < 4; col++)
                     {
                         base = col * 4;
-                        state[base + 0] = state[base + 0] ^^ (byte)((round_key[col] >> 24) & 0xFF);
-                        state[base + 1] = state[base + 1] ^^ (byte)((round_key[col] >> 16) & 0xFF);
-                        state[base + 2] = state[base + 2] ^^ (byte)((round_key[col] >> 8) & 0xFF);
-                        state[base + 3] = state[base + 3] ^^ (byte)(round_key[col] & 0xFF);
+                        state[base + 0] = state[base + 0] ^| (byte)((round_key[col] >> 24) & 0xFF);
+                        state[base + 1] = state[base + 1] ^| (byte)((round_key[col] >> 16) & 0xFF);
+                        state[base + 2] = state[base + 2] ^| (byte)((round_key[col] >> 8) & 0xFF);
+                        state[base + 3] = state[base + 3] ^| (byte)(round_key[col] & 0xFF);
                     };
                     return;
                 };
@@ -998,10 +998,10 @@ namespace standard
                         
                         if ((i % 4) == 0)
                         {
-                            temp = sub_word(rot_word(temp)) ^^ RCON[i / 4 - 1];
+                            temp = sub_word(rot_word(temp)) ^| RCON[i / 4 - 1];
                         };
                         
-                        ctx.round_keys[i] = ctx.round_keys[i - 4] ^^ temp;
+                        ctx.round_keys[i] = ctx.round_keys[i - 4] ^| temp;
                     };
                     
                     ctx.nr = 10;
@@ -1144,7 +1144,7 @@ namespace standard
                             {
                                 for (k = 0; k < 16; k++)
                                 {
-                                    Z[k] = Z[k] ^^ V[k];
+                                    Z[k] = Z[k] ^| V[k];
                                 };
                             };
 
@@ -1161,7 +1161,7 @@ namespace standard
                             // If the bit shifted out was 1, XOR with reduction polynomial
                             if (lsb != 0)
                             {
-                                V[0] = V[0] ^^ (byte)0xE1;
+                                V[0] = V[0] ^| (byte)0xE1;
                             };
                         };
                     };
@@ -1197,7 +1197,7 @@ namespace standard
                         offset = b * 16;
                         for (i = 0; i < 16; i++)
                         {
-                            tag[i] = tag[i] ^^ input[offset + i];
+                            tag[i] = tag[i] ^| input[offset + i];
                         };
                         ghash_mul(tag, H);
                     };
@@ -1216,7 +1216,7 @@ namespace standard
                         };
                         for (i = 0; i < 16; i++)
                         {
-                            tag[i] = tag[i] ^^ block[i];
+                            tag[i] = tag[i] ^| block[i];
                         };
                         ghash_mul(tag, H);
                     };
@@ -1323,7 +1323,7 @@ namespace standard
                         gcm_inc32(@ctr[0]);
                         for (i = 0; i < 16; i++)
                         {
-                            cipher[offset + i] = plain[offset + i] ^^ ks[i];
+                            cipher[offset + i] = plain[offset + i] ^| ks[i];
                         };
                     };
 
@@ -1333,7 +1333,7 @@ namespace standard
                         aes_encrypt_block(@ctx.aes, @ctr[0], @ks[0]);
                         for (i = 0; i < rem; i++)
                         {
-                            cipher[offset + i] = plain[offset + i] ^^ ks[i];
+                            cipher[offset + i] = plain[offset + i] ^| ks[i];
                         };
                     };
 
@@ -1352,7 +1352,7 @@ namespace standard
 
                     for (i = 0; i < 16; i++)
                     {
-                        auth_tag[i] = auth_tag[i] ^^ len_block[i];
+                        auth_tag[i] = auth_tag[i] ^| len_block[i];
                     };
                     ghash_mul(@auth_tag[0], @ctx.H[0]);
 
@@ -1360,7 +1360,7 @@ namespace standard
                     aes_encrypt_block(@ctx.aes, @J0[0], @ks[0]);
                     for (i = 0; i < 16; i++)
                     {
-                        tag[i] = auth_tag[i] ^^ ks[i];
+                        tag[i] = auth_tag[i] ^| ks[i];
                     };
                     return;
                 };
@@ -1432,7 +1432,7 @@ namespace standard
 
                     for (i = 0; i < 16; i++)
                     {
-                        auth_tag[i] = auth_tag[i] ^^ len_block[i];
+                        auth_tag[i] = auth_tag[i] ^| len_block[i];
                     };
                     ghash_mul(@auth_tag[0], @ctx.H[0]);
 
@@ -1440,14 +1440,14 @@ namespace standard
                     aes_encrypt_block(@ctx.aes, @J0[0], @ks[0]);
                     for (i = 0; i < 16; i++)
                     {
-                        expected_tag[i] = auth_tag[i] ^^ ks[i];
+                        expected_tag[i] = auth_tag[i] ^| ks[i];
                     };
 
                     // Constant-time tag comparison (prevent timing side-channels)
                     diff = 0;
                     for (i = 0; i < 16; i++)
                     {
-                        diff = diff | ((int)(expected_tag[i] ^^ tag[i]));
+                        diff = diff | ((int)(expected_tag[i] ^| tag[i]));
                     };
 
                     // CTR decryption (always performed; caller discards on diff != 0)
@@ -1461,7 +1461,7 @@ namespace standard
                         gcm_inc32(@ctr[0]);
                         for (i = 0; i < 16; i++)
                         {
-                            plain[offset + i] = cipher[offset + i] ^^ ks[i];
+                            plain[offset + i] = cipher[offset + i] ^| ks[i];
                         };
                     };
 
@@ -1471,7 +1471,7 @@ namespace standard
                         aes_encrypt_block(@ctx.aes, @ctr[0], @ks[0]);
                         for (i = 0; i < rem; i++)
                         {
-                            plain[offset + i] = cipher[offset + i] ^^ ks[i];
+                            plain[offset + i] = cipher[offset + i] ^| ks[i];
                         };
                     };
 
@@ -1701,7 +1701,7 @@ namespace standard
                     while (i <= 254)
                     {
                         bit  = (u64)((e[i >> 3] >> (i & 7)) & 1);
-                        swap = swap `^^ bit;
+                        swap = swap `^| bit;
                         fe_cswap(@x2, @x3, swap);
                         fe_cswap(@z2, @z3, swap);
                         swap = bit;
@@ -1791,8 +1791,8 @@ namespace standard
                     for (i = 0; i < 64; i++)
                     {
                         k = (i < effective_key_len) ? effective_key[i] : (byte)0;
-                        ipad_key[i] = k ^^ (byte)0x36;
-                        opad_key[i] = k ^^ (byte)0x5C;
+                        ipad_key[i] = k ^| (byte)0x36;
+                        opad_key[i] = k ^| (byte)0x5C;
                     };
 
                     SHA256::sha256_init(@inner_ctx);
