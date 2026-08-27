@@ -9001,6 +9001,41 @@ class CodegenVisitor:
             pending_tl, pending_ns_retry, pending_ex = still_tl, still_ns, still_ex
         module._prepass_only = False
 
+        # Pass 2.9: Forward-declare all top-level FunctionDef signatures before Pass 3.
+        # This ensures that when runtime.fx (or any file) references a mangled function name
+        # (e.g. main__0__ret_intE1) defined later in node.statements, the IR declaration
+        # already exists in module.globals so the call site resolves correctly regardless of
+        # source file ordering on any platform.
+        from fast import FunctionDef as _FwdFunctionDef
+        for _fwd_stmt in node.statements:
+            if not isinstance(_fwd_stmt, _FwdFunctionDef):
+                continue
+            if getattr(_fwd_stmt, '_is_comptime_only', False):
+                continue
+            if getattr(_fwd_stmt, '_source_namespace', None) is not None:
+                continue  # template instantiation -- handled later
+            _fwd_name = _fwd_stmt.name
+            if not isinstance(_fwd_name, str):
+                continue  # f-string name -- cannot resolve at this stage
+            try:
+                _fwd_ret = FunctionTypeHandler.convert_type_spec_to_llvm(_fwd_stmt.return_type, module)
+                _fwd_params = [
+                    FunctionTypeHandler.convert_type_spec_to_llvm(p.type_spec, module)
+                    for p in _fwd_stmt.parameters
+                ]
+                _fwd_ftype = ir.FunctionType(_fwd_ret, _fwd_params, var_arg=_fwd_stmt.is_variadic)
+                _fwd_mangled = SymbolTable.mangle_function_name(
+                    _fwd_name, _fwd_stmt.parameters, _fwd_stmt.return_type, _fwd_stmt.no_mangle)
+                if _fwd_mangled not in module.globals:
+                    _fwd_func = ir.Function(module, _fwd_ftype, _fwd_mangled)
+                    _fwd_base = _fwd_name.split('::')[-1] if '::' in _fwd_name else _fwd_name
+                    SymbolTable.register_function_overload(
+                        module, _fwd_base, _fwd_mangled,
+                        _fwd_stmt.parameters, _fwd_stmt.return_type,
+                        _fwd_func, is_deprecated=_fwd_stmt.is_deprecated)
+            except Exception:
+                pass  # silently defer; Pass 3 will emit or surface the real error
+
         # Pass 3: Process all other statements
         print("[AST] Pass 3: Processing all other statements...")
         from fast import ContractDef as _ContractDef, FunctionDef as _FunctionDef

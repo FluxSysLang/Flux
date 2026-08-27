@@ -391,7 +391,7 @@ def !!FRTStartup() -> int
             standard::io::console::print("SEGFAULT\n\0");
         };
     };
-    return return_code;
+    -> return_code;
 };
 #endif; // __WINDOWS__
 

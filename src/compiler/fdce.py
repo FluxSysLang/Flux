@@ -114,6 +114,21 @@ class _RefCollector:
         for variant in _all_suffixes(name):
             if variant and variant not in _PRIMITIVE_TYPES:
                 self.refs.add(variant)
+        # If this is a fully-mangled call name (e.g. main__0__ret_intE1),
+        # also emit the base__paramcount prefix so the toplevel_func_index
+        # entry keyed by  name__N  is reached during fixed-point expansion.
+        # The mangled form is  basename__N__<param types>__ret_<rettype>;
+        # the prefix before '__ret_' contains everything we need.
+        if '__ret_' in name:
+            prefix = name[:name.index('__ret_')]
+            for variant in _all_suffixes(prefix):
+                if variant and variant not in _PRIMITIVE_TYPES:
+                    self.refs.add(variant)
+            # Also add the bare base name (first component of the prefix)
+            # so the toplevel liveness check (_all_suffixes(stmt.name)) hits.
+            bare_base = prefix.split('__')[0]
+            if bare_base and bare_base not in _PRIMITIVE_TYPES:
+                self.refs.add(bare_base)
 
     def _walk(self, node: Any) -> None:
         if node is None:
@@ -265,7 +280,7 @@ def _func_is_entry_point(func: Any, entry: str) -> bool:
     name = getattr(func, 'name', '')
     if not isinstance(name, str):
         return False
-    return name == entry
+    return name == entry or name == '_start'
 
 
 # ---------------------------------------------------------------------------

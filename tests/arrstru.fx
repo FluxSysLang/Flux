@@ -24,6 +24,7 @@ struct ax
 def main() -> int
 {
     int i;
+
     println(test[i++]);
     #";
     #";
