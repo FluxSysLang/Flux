@@ -1,6 +1,7 @@
-#import <standard.fx>;
+#import <standard.fx>, <opengl.fx>;
 
-using standard::io::console;
+using standard::io::console,
+      OpenGL;
 
 noopstr[3] test =
 [

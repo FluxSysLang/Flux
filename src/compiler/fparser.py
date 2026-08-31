@@ -525,12 +525,12 @@ class FluxParser:
         return (None, global_line)
 
     @classmethod
-    def from_file(self, source_file: str, compiler_macros: Optional[Dict[str, str]] = None):
+    def from_file(self, source_file: str, compiler_macros: Optional[Dict[str, str]] = None, verbose: bool = False):
         """
         Create a parser by preprocessing and lexing a source file.
         """
         # Step 1: Preprocess
-        preprocessor = FXPreprocessor(source_file, compiler_constants=compiler_macros or {})
+        preprocessor = FXPreprocessor(source_file, compiler_constants=compiler_macros or {}, verbose=verbose)
         preprocessed_source = preprocessor.process()
 
         # Step 2: Lex

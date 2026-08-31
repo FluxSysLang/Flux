@@ -18,6 +18,8 @@ from fcodegen import visitor as _codegen_visitor
 from flogger import FluxLogger, FluxLoggerConfig, LogLevel
 from fconfig import *
 from fmacros import build_compiler_macros
+import fdce as _fdce_mod
+import fbc as _fbc_mod
 
 # Resolve compiler root: prefer FLUXC_SRCDIR env var, fall back to script location
 FLUXC_SRCDIR = Path(os.environ.get("FLUXC_SRCDIR", Path(__file__).parent)).resolve()
@@ -272,35 +274,13 @@ class FluxCompiler:
 
     def _run_borrow_check(self, ast, line_map, filename: str):
         """Run the borrow checker on an already-parsed AST without re-parsing."""
-        import importlib.util
-        from pathlib import Path as _Path
-        fbc_path = _Path(__file__).parent.parent.parent / 'fbc.py'
-        if not fbc_path.exists():
-            # try alongside fc.py
-            fbc_path = _Path(__file__).parent / 'fbc.py'
-        if not fbc_path.exists():
-            self.logger.warning("fbc.py not found, skipping borrow check.", "FBC"); return
-            return
-
-        spec = importlib.util.spec_from_file_location('fbc', fbc_path)
-        fbc_mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(fbc_mod)
-
         self.logger.step("Borrow checking", LogLevel.INFO, "FBC")
         try:
-            cg = fbc_mod.CallGraph()
+            cg = _fbc_mod.CallGraph()
             cg.collect(ast)
-            # register mangled main variants so the Linux FRTStartup call to
-            # main__0__ret_intE1 resolves to the user's main function
-            if 'main' in cg.funcs:
-                for mangled in list(cg.short_names.keys()):
-                    if mangled.startswith('main__') or mangled == 'main__0__ret_intE1':
-                        cg.funcs[mangled] = cg.funcs['main']
-                # always register the canonical no-arg form directly
-                cg.funcs['main__0__ret_intE1'] = cg.funcs['main']
-            checker = fbc_mod.BorrowChecker(
+            checker = _fbc_mod.BorrowChecker(
                 call_graph=cg,
-                entry='FRTStartup',
+                entry=self.entrypoint,
                 check_threads=True,
                 check_leaks=True,
                 line_map=line_map,
@@ -308,10 +288,10 @@ class FluxCompiler:
             checker.run()
             violations = checker.violations
             use_color = sys.stderr.isatty()
-            fbc_mod.print_violations(violations,
+            _fbc_mod.print_violations(violations,
                                      mode='warn' if self.borrow_check_warn else 'error',
                                      use_color=use_color)
-            fbc_mod.print_summary(violations, files_checked=1,
+            _fbc_mod.print_summary(violations, files_checked=1,
                                   funcs_checked=checker.funcs_checked,
                                   use_color=use_color)
             if violations and not self.borrow_check_warn:
@@ -324,23 +304,10 @@ class FluxCompiler:
 
     def _run_dce(self, ast, entry: str):
         """Run dead code elimination on an already-parsed AST."""
-        import importlib.util
-        from pathlib import Path as _Path
-        fdce_path = _Path(__file__).parent.parent.parent / 'fdce.py'
-        if not fdce_path.exists():
-            fdce_path = _Path(__file__).parent / 'fdce.py'
-        if not fdce_path.exists():
-            self.logger.warning("fdce.py not found, skipping DCE.", "dce")
-            return
-
-        spec = importlib.util.spec_from_file_location('fdce', fdce_path)
-        fdce_mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(fdce_mod)
-
         self.logger.step("Dead code elimination", LogLevel.INFO, "dce")
         try:
             verbose = (self.verbosity is not None and self.verbosity >= 1)
-            fdce_mod.eliminate(ast, entry=entry, verbose=verbose)
+            _fdce_mod.eliminate(ast, entry=entry, verbose=verbose)
         except Exception as e:
             self.logger.warning(f"DCE error: {e}", "dce")
 
@@ -363,9 +330,10 @@ class FluxCompiler:
                 module_triple=self.module_triple,
                 cfg_platform=self.cfg_platform,
             )
-            print("[COMPILER] Pre-defined / built in macros:\n")
-            for key, value in self.predefined_macros.items():
-                print("[COMPILER]", key, value)
+            if self.logger.level >= LogLevel.TRACE:
+                self.logger.log_data(LogLevel.TRACE, "Pre-defined / built-in macros",
+                                     '\n'.join(f"  {k} = {v}" for k, v in self.predefined_macros.items()),
+                                     "compiler")
             
             # NOTE: ADD DEBUG LEVEL IN COMPILER & CONFIG FOR PREPROCESSOR
             # WRAP IN DEBUGGER
@@ -374,7 +342,8 @@ class FluxCompiler:
             #    print("[PREPROCESSOR]", key, value)
             # /WRAP
             #self.logger.step("[INFO] ► Reading source file", LogLevel.INFO, "compiler")
-            parser = FluxParser.from_file(filename, compiler_macros=self.predefined_macros)
+            parser = FluxParser.from_file(filename, compiler_macros=self.predefined_macros,
+                                          verbose=(self.logger.level >= LogLevel.TRACE))
             ast = parser.parse()
 
             if parser.parse_errors:
@@ -582,69 +551,78 @@ class FluxCompiler:
                     self.logger.error(f"{compiler} compilation failed: {e.stderr}", compiler)
                     raise
                     
-            else:  # Linux and others - use traditional assembly step
-                asm_file = temp_dir / f"{base_name}.s"
+            else:  # Linux and others
                 obj_file = temp_dir / f"{base_name}.o"
-                
-                # Generate assembly
+
+                # Run opt to clean IR before llc, same as Windows.
+                opt_exe = None
+                for opt_candidate in ["opt-21", "opt-20", "opt-19", "opt-18", "opt"]:
+                    if subprocess.run(["which", opt_candidate], capture_output=True).returncode == 0:
+                        opt_exe = opt_candidate
+                        break
+
+                if opt_exe is not None:
+                    opt_ll = temp_dir / f"{base_name}.opt.ll"
+                    opt_cmd = [
+                        opt_exe,
+                        "-passes=mem2reg,sroa,dce,simplifycfg",
+                        "-S",
+                        str(ll_file),
+                        "-o",
+                        str(opt_ll)
+                    ]
+                    try:
+                        subprocess.run(opt_cmd, check=True, capture_output=True, text=True)
+                        ll_file = opt_ll
+                        self.temp_files.append(opt_ll)
+                        self.logger.info("opt IR optimization pass complete", "llc")
+                    except subprocess.CalledProcessError as opt_err:
+                        self.logger.warning(f"opt pass failed: {opt_err.stderr[:200]}", "llc")
+                else:
+                    self.logger.warning("opt pass skipped (not available)", "llc")
+
+                # Compile directly to object file
                 cmd = [
                     "llc",
                     "-O3",                        # Maximum optimization level
-                    #"-mtriple=x86_64-linux",      # Explicit target triple
                     *self._get_llc_target_flags(),   # march/mcpu/mattr
                     "-enable-misched",            # Enable machine instruction scheduler
                     "-enable-tail-merge",         # Merge similar tail code
                     "-disable-verify",            # Disable verification for speed
-                    "-filetype=asm",              # Assembly file output
+                    "-filetype=obj",              # Direct object file output
                     "-optimize-regalloc",         # Optimize register allocation
                     "-relocation-model=pic",      # PIC relocation for dynamic linking
                     "-tail-dup-size=3",           # Tail duplication threshold
                     "-tailcallopt",               # Enable tail call optimization
                     str(ll_file),
                     "-o",
-                    str(asm_file)                 # Output to assembly file
+                    str(obj_file)
                 ]
 
                 if not self.is_arm64:
                     cmd[-3:-3] = [
                         "-no-x86-call-frame-opt",     # Disable call frame optimization (smaller)
-                        "-x86-asm-syntax=att",        # ATT syntax assembly
                         "-x86-use-base-pointer",      # Use base pointer
                     ]
 
                 # If user/config didn't specify march/mcpu, fall back to native architecture
                 if not any(f.startswith('-march=') for f in cmd):
                     cmd.insert(2, '--march=aarch64' if self.is_arm64 else '--march=x86-64')
-                
+
                 if not any(f.startswith('-mcpu=') for f in cmd):
                     cmd.insert(3, '-mcpu=native')
 
                 self.logger.debug(f"Running: {' '.join(cmd)}", "llc")
-                
+
                 try:
                     result = subprocess.run(cmd, check=True, capture_output=True, text=True)
                     self.logger.trace(f"LLC output: {result.stdout}", "llc")
                     if result.stderr:
                         self.logger.warning(f"LLC stderr: {result.stderr}", "llc")
-                    self.temp_files.append(asm_file)
-                    
-                    # Log assembly if requested (legacy compatibility)
-                    if self.verbosity == 3 or self.logger.level >= LogLevel.TRACE:
-                        with open(asm_file, "r") as f:
-                            asm_content = f.read()
-                        self.logger.log_data(LogLevel.TRACE, "Generated Assembly", asm_content, "llc")
-                    
-                    # Assemble to object file
-                    as_cmd = ["as"] + (["--64"] if not self.is_arm64 else []) + [str(asm_file), "-o", str(obj_file)]
-                    self.logger.debug(f"Running: {' '.join(as_cmd)}", "as")
-                    
-                    as_result = subprocess.run(as_cmd, check=True, capture_output=True, text=True)
-                    self.logger.trace(f"AS output: {as_result.stdout}", "as")
-                    if as_result.stderr:
-                        self.logger.warning(f"AS stderr: {as_result.stderr}", "as")
-                        
+                    self.temp_files.append(obj_file)
+
                 except subprocess.CalledProcessError as e:
-                    self.logger.error(f"Assembly failed: {e.stderr}", "as")
+                    self.logger.error(f"LLC compilation failed: {e.stderr}", "llc")
                     raise
 
             self.temp_files.append(obj_file)
@@ -665,10 +643,6 @@ class FluxCompiler:
                 self.logger.log_data(LogLevel.INFO, "All Tokens", tokens, "legacy")
                 self.logger.log_data(LogLevel.INFO, "Complete AST", ast, "legacy")
                 self.logger.log_data(LogLevel.INFO, "Complete LLVM IR", llvm_ir, "legacy")
-                if self.platform == "Linux":
-                    with open(asm_file, "r") as f:
-                        asm_content = f.read()
-                    self.logger.log_data(LogLevel.INFO, "Complete Assembly", asm_content, "legacy")
             
             # Step 8: Link executable
             output_bin = output_bin or f"./{base_name}"
@@ -806,7 +780,7 @@ class FluxCompiler:
                                 "-Wl,/LTCG "
                                 "-Wl,/MERGE:.rdata=.text "
                                 #"-Wl,/ALIGN:16 "
-                                "-Wl,/ENTRY:FRTStartup " ## NEEDS TO USE ENTRYPOINT FROM CONFIG
+                                "-Wl,/ENTRY:" + self.entrypoint + " "
                                 "-Wl,/SUBSYSTEM:CONSOLE "
                                 # Link only necessary libraries:
                                 "-lkernel32 -lntdll -ldwmapi "  # Windows kernel functions (CreateFile, ReadFile, etc.)

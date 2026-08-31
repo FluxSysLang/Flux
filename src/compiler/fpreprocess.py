@@ -42,8 +42,9 @@ def _read_source_file(path) -> str:
         return content
 
 class FXPreprocessor:
-    def __init__(self, source_file, compiler_constants=None):
+    def __init__(self, source_file, compiler_constants=None, verbose=False):
         self.source_file = source_file
+        self.verbose = verbose
         self.processed_files: Set[str] = set()
         self.output_lines = []
         self.constants: Dict[str, str] = {}
@@ -70,7 +71,8 @@ class FXPreprocessor:
         iteration = 0
         while replaced:
             iteration += 1
-            print(f"[PREPROCESSOR] constant substitution passes: {iteration}")
+            if self.verbose:
+                print(f"[PREPROCESSOR] constant substitution passes: {iteration}")
             replaced = False
             lines = combined_source.split('\n')
             new_lines = []
@@ -83,7 +85,8 @@ class FXPreprocessor:
             
             combined_source = '\n'.join(new_lines)
         ending = "es." if iteration > 1 else "."
-        print(f"[PREPROCESSOR] Completed after {iteration} constant pass{ending}")
+        if self.verbose:
+            print(f"[PREPROCESSOR] Completed after {iteration} constant pass{ending}")
         
         # Step 5: Write to build/tmp.fx
         build_dir = Path("build")
@@ -93,8 +96,9 @@ class FXPreprocessor:
         with open(output_file, 'w', encoding='utf-8') as f:
             f.write(combined_source)
         
-        print(f"[PREPROCESSOR] Generated: {output_file}")
-        print(f"[PREPROCESSOR] Processed {len(self.processed_files)} file(s)")
+        if self.verbose:
+            print(f"[PREPROCESSOR] Generated: {output_file}")
+            print(f"[PREPROCESSOR] Processed {len(self.processed_files)} file(s)")
         
         return combined_source
     
@@ -264,8 +268,8 @@ class FXPreprocessor:
         if abs_path in self.processed_files:
             return
 
-        print(f"[PREPROCESSOR] Package import: {package_name} -> {entrypoint}")
-
+        if self.verbose:
+            print(f"[PREPROCESSOR] Package import: {package_name} -> {entrypoint}")
         # Push the package directory so the entrypoint's local imports resolve within it
         self._dir_stack.append(package_dir)
         self._process_file(str(entrypoint_path), resolver=self._resolve_path_local)
@@ -298,7 +302,8 @@ class FXPreprocessor:
             return
         
         self.processed_files.add(abs_path)
-        print(f"[PREPROCESSOR] Processing: {filepath}")
+        if self.verbose:
+            print(f"[PREPROCESSOR] Processing: {filepath}")
         
         # Read the file and strip comments immediately
         file_content = _read_source_file(resolved_path)
@@ -355,7 +360,8 @@ class FXPreprocessor:
                     dir_path = dir_path.replace('\\', '/')
                     if dir_path not in self.lib_dirs:
                         self.lib_dirs.append(dir_path)
-                        print(f"[PREPROCESSOR] Added library directory: {dir_path}")
+                        if self.verbose:
+                            print(f"[PREPROCESSOR] Added library directory: {dir_path}")
             self.line_map.append((getattr(self, '_current_file', self.source_file), self._current_local_lineno))
             self.output_lines.append('')
             return i + 1
@@ -387,7 +393,8 @@ class FXPreprocessor:
             params = [p.strip() for p in raw_params.split(',') if p.strip()]
             body = rest[paren_close + 1:].strip()
             self.psubs[name] = (params, body)
-            print(f"[PREPROCESSOR] Defined PSUB: {name}({', '.join(params)}) = {body}")
+            if self.verbose:
+                print(f"[PREPROCESSOR] Defined PSUB: {name}({', '.join(params)}) = {body}")
             self.line_map.append((getattr(self, '_current_file', self.source_file), self._current_local_lineno))
             self.output_lines.append('')
             return i + 1
@@ -413,7 +420,8 @@ class FXPreprocessor:
                     constant_value = constant_value.rstrip(';').strip()
                     
                 self.constants[constant_name] = constant_value
-                print(f"[PREPROCESSOR] Defined constant: {constant_name} = {constant_value}")
+                if self.verbose:
+                    print(f"[PREPROCESSOR] Defined constant: {constant_name} = {constant_value}")
             self.line_map.append((getattr(self, '_current_file', self.source_file), self._current_local_lineno))
             self.output_lines.append('')
             return i + 1
@@ -484,7 +492,8 @@ class FXPreprocessor:
                     if end == -1:
                         raise SyntaxError(f"[PREPROCESSOR] Unterminated <> in #import at line {i + 1}")
                     std_path = rest[j:end].strip()
-                    print(f"[PREPROCESSOR] Stdlib import: {std_path}")
+                    if self.verbose:
+                        print(f"[PREPROCESSOR] Stdlib import: {std_path}")
                     self._process_file(std_path, resolver=self._resolve_path_stdlib)
                     j = end + 1
 
@@ -495,7 +504,8 @@ class FXPreprocessor:
                     if end == -1:
                         raise SyntaxError(f"[PREPROCESSOR] Unterminated \"\" in #import at line {i + 1}")
                     local_path = rest[j:end].strip()
-                    print(f"[PREPROCESSOR] Local import: {local_path}")
+                    if self.verbose:
+                        print(f"[PREPROCESSOR] Local import: {local_path}")
                     self._process_file(local_path, resolver=self._resolve_path_local)
                     j = end + 1
 

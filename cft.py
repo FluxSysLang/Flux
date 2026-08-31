@@ -152,12 +152,12 @@ CFT_CONFIG = _load_config()
 _TYPEKIND_MAP = {
     TypeKind.VOID:      "void",
     TypeKind.BOOL:      "bool",
-    TypeKind.CHAR_U:    "byte",
-    TypeKind.UCHAR:     "byte",
-    TypeKind.CHAR_S:    "byte",
-    TypeKind.SCHAR:     "byte",
-    TypeKind.SHORT:     "int",
-    TypeKind.USHORT:    "uint",
+    TypeKind.CHAR_U:    "u8",
+    TypeKind.UCHAR:     "u8",
+    TypeKind.CHAR_S:    "i8",
+    TypeKind.SCHAR:     "i8",
+    TypeKind.SHORT:     "i16",
+    TypeKind.USHORT:    "u16",
     TypeKind.INT:       "int",
     TypeKind.UINT:      "uint",
     TypeKind.LONG:      "long",
@@ -175,16 +175,16 @@ _TYPEDEF_MAP = {
     "ptrdiff_t": "long",
     "intptr_t":  "long",
     "uintptr_t": "ulong",
-    "int8_t":    "byte",
-    "uint8_t":   "byte",
-    "int16_t":   "int",
-    "uint16_t":  "uint",
+    "int8_t":    "i8",
+    "uint8_t":   "u8",
+    "int16_t":   "i16",
+    "uint16_t":  "u16",
     "int32_t":   "int",
     "uint32_t":  "uint",
     "int64_t":   "long",
     "uint64_t":  "ulong",
-    "wchar_t":   "uint",
-    "char16_t":  "uint",
+    "wchar_t":   "u16",
+    "char16_t":  "u16",
     "char32_t":  "uint",
 }
 
@@ -193,17 +193,74 @@ _BINOP_MAP = {
     "+": "+", "-": "-", "*": "*", "/": "/", "%": "%",
     "==": "==", "!=": "!=", "<": "<", "<=": "<=", ">": ">", ">=": ">=",
     "&&": "&", "||": "|", "!": "!",
-    "&": "`&", "|": "`|", "^": "`^|", "~": "`!",
+    "&": "`&", "|": "`|", "^": "`^^", "~": "`!",
     "<<": "<<", ">>": ">>",
     "=": "=", "+=": "+=", "-=": "-=", "*=": "*=", "/=": "/=", "%=": "%=",
-    "&=": "`&=", "|=": "`|=", "^=": "`^|=", "<<=": "<<=", ">>=": ">>=",
+    "&=": "`&=", "|=": "`|=", "^=": "`^^=", "<<=": "<<=", ">>=": ">>=",
 }
 
 
-# Flux reserved keywords that are valid C identifiers -- rename on translation
+# Flux reserved keywords that are valid C identifiers -- rename on translation.
+# C keywords (if, else, for, while, do, switch, case, return, break, continue,
+# goto, struct, enum, union, void, int, char, float, double, signed, unsigned,
+# const, volatile, extern, static, auto, register, inline, default, typedef,
+# sizeof) are already illegal as C variable names so they need no entry here.
 _RESERVED_RENAME = {
-    "data": "dat",
-    "from": "frm",
+    "alignof":      "c_alignof",
+    "and":          "and_",
+    "as":           "as_",
+    "assert":       "assert_",
+    "bool":         "bool_",
+    "byte":         "byte_",
+    "cdecl":        "cdecl_",
+    "comptime":     "comptime_",
+    "constraint":   "constraint_",
+    "contract":     "contract_",
+    "data":         "dat",
+    "defer":        "defer_",
+    "deprecate":    "deprecate_",
+    "double":       "double_",
+    "elif":         "elif_",
+    "emitflux":     "emitflux_",
+    "escape":       "escape_",
+    "export":       "export_",
+    "false":        "false_",
+    "fastcall":     "fastcall_",
+    "float":        "float_",
+    "from":         "frm",
+    "global":       "global_",
+    "has":          "has_",
+    "heap":         "heap_",
+    "in":           "in_",
+    "interface":    "interface_",
+    "is":           "is_",
+    "jump":         "jump_",
+    "label":        "label_",
+    "local":        "local_",
+    "long":         "long_",
+    "macro":        "macro_",
+    "namespace":    "namespace_",
+    "noinit":       "noinit_",
+    "noreturn":     "noreturn_",
+    "not":          "not_",
+    "object":       "object_",
+    "operator":     "operator_",
+    "or":           "or_",
+    "private":      "private_",
+    "public":       "public_",
+    "singinit":     "singinit_",
+    "stack":        "stack_",
+    "stdcall":      "stdcall_",
+    "this":         "this_",
+    "thiscall":     "thiscall_",
+    "throw":        "throw_",
+    "trait":        "trait_",
+    "true":         "true_",
+    "uint":         "uint_",
+    "ulong":        "ulong_",
+    "using":        "using_",
+    "vectorcall":   "vectorcall_",
+    "xor":          "xor_",
 }
 
 # Macros that expand to nothing in Flux but must remain defined so other
@@ -254,12 +311,15 @@ class CTranslator:
         self.filepath = filepath
         self.lines = []
         self._emitted_types = set()
+        self._emitted_prototypes = set()  # function names emitted as prototypes only
         self._pending_typedefs = {}
         self._need_i128 = False
         self._need_u128 = False
         self._indent = 0
         self._switch_depth = 0  # incremented inside switch body
         self._loop_depth_in_switch_stack = []  # per-switch loop nesting depth
+        self._anon_counter = 0  # counter for synthesized anonymous struct/union names
+        self._cplusplus_depth = 0  # nesting depth inside #ifdef __cplusplus blocks
         self._index = cx.Index.create()
         clang_args = args or CFT_CONFIG.default_clang_args
         self.tu = self._index.parse(filepath, args=clang_args,
@@ -465,6 +525,8 @@ class CTranslator:
                 continue
 
             def make_comment_event(text=text):
+                if self._cplusplus_depth > 0:
+                    return
                 if text.startswith("/*"):
                     inner = text[2:]
                     if inner.endswith("*/"):
@@ -527,7 +589,27 @@ class CTranslator:
             lo = line_offset
 
             def make_event(kw=kw, fr=fr):
+                # C++ guard detection: ifdef/ifndef __cplusplus and if defined(__cplusplus)
+                def _is_cplusplus_cond(keyword, rest):
+                    r = rest.strip()
+                    if keyword in ('ifdef', 'ifndef') and r == '__cplusplus':
+                        return True
+                    # #if defined(__cplusplus)
+                    if keyword == 'if':
+                        stripped = r.replace(' ', '')
+                        if stripped in ('defined(__cplusplus)', 'defined(__cplusplus)'):
+                            return True
+                        if stripped == '__cplusplus':
+                            return True
+                    return False
+
                 if kw in ('ifndef', 'ifdef', 'if'):
+                    if _is_cplusplus_cond(kw, fr):
+                        self._cplusplus_depth += 1
+                        return  # suppress entirely
+                    if self._cplusplus_depth > 0:
+                        self._cplusplus_depth += 1
+                        return
                     cond = self._translate_pp_condition(fr)
                     if kw == 'ifndef':
                         if self._cond_is_psub_name(cond):
@@ -547,41 +629,57 @@ class CTranslator:
                             self._emit(f"#ifpsub {macro_name};")
                         else:
                             self._emit(f"// #if {fr}")
-                            self._emit(f"#ifdef {cond}")
+                            self._emit(f"// MANUAL REVIEW REQUIRED -- complex #if condition not translatable to Flux")
 
-                elif kw == 'elif':
-                    cond = self._translate_pp_condition(fr)
-                    m_neg = re.match(r'^!\s*defined\s*\(?(\w+)\)?$', fr.strip())
-                    m_def = re.match(r'^defined\s*\(?(\w+)\)?$', fr.strip())
-                    m_id  = re.match(r'^\w+$', fr.strip())
-                    if fr.strip():
-                        self._emit(f"// #elif {fr}")
-                    if m_neg:
-                        self._emit(f"#elif !defined({m_neg.group(1)});")
-                    elif m_def or m_id:
-                        self._emit(f"#elif {cond};")
+                elif kw in ('elif', 'else'):
+                    if self._cplusplus_depth > 0:
+                        return  # suppress
+                    if kw == 'elif':
+                        cond = self._translate_pp_condition(fr)
+                        m_neg = re.match(r'^!\s*defined\s*\(?(\w+)\)?$', fr.strip())
+                        m_def = re.match(r'^defined\s*\(?(\w+)\)?$', fr.strip())
+                        m_id  = re.match(r'^\w+$', fr.strip())
+                        if fr.strip():
+                            self._emit(f"// #elif {fr}")
+                        if m_neg:
+                            self._emit(f"#elif !defined({m_neg.group(1)});")
+                        elif m_def or m_id:
+                            self._emit(f"#elif {cond};")
+                        else:
+                            self._emit(f"#else")
+                            self._emit(f"// complex #elif condition above -- manual review needed")
                     else:
                         self._emit(f"#else")
-                        self._emit(f"// complex #elif condition above -- manual review needed")
-
-                elif kw == 'else':
-                    self._emit(f"#else")
 
                 elif kw == 'endif':
+                    if self._cplusplus_depth > 0:
+                        self._cplusplus_depth -= 1
+                        return  # suppress
                     self._emit(f"#endif;")
 
                 elif kw == 'undef':
+                    if self._cplusplus_depth > 0:
+                        return
                     self._emit(f"// #undef {fr}")
 
                 elif kw == 'define':
+                    if self._cplusplus_depth > 0:
+                        return
                     self._emit_pp_define(fr)
 
                 elif kw == 'include':
+                    if self._cplusplus_depth > 0:
+                        return
                     inc_m = re.match(r'^([<"])(.*?)[>"]', fr)
                     if inc_m:
                         bracket = inc_m.group(1)
                         path = inc_m.group(2)
                         fx_path = re.sub(r'\.h$', '.fx', path)
+                        # Skip self-import: a .c file including its own .h
+                        self_base = os.path.splitext(os.path.basename(self.filepath))[0]
+                        inc_base = os.path.splitext(os.path.basename(path))[0]
+                        if inc_base == self_base:
+                            return
                         close = '"' if bracket == '"' else '>'
                         self._emit(f'#import {bracket}{fx_path}{close};')
                     else:
@@ -699,19 +797,60 @@ class CTranslator:
 
     def _c_type_str_to_flux(self, c_type_str):
         """Best-effort translation of a C type string (e.g. 'LLVMValueRef',
-        'unsigned int', 'const char *') to a Flux type string.  Used when
-        translating macro-expanded function declaration bodies."""
+        'unsigned int', 'const char *', 'unsigned long long') to a Flux type
+        string.  Used when translating macro-expanded function declaration bodies."""
         import re
         s = c_type_str.strip()
-        # Strip 'const' and 'unsigned'/'signed' qualifiers (handled via type map).
-        s = re.sub(r'\bconst\b', '', s).strip()
-        # Count and strip trailing '*' for pointer depth.
+
+        # Strip struct/enum/union/class prefixes -- Flux types have no tag prefix
+        s = re.sub(r'\b(struct|enum|union|class)\b\s*', '', s).strip()
+
+        # Strip qualifiers that have no Flux equivalent
+        for qual in ('const', 'volatile', 'restrict', '__restrict', '__restrict__',
+                     '__volatile__', '__const'):
+            s = re.sub(r'\b' + re.escape(qual) + r'\b', '', s)
+        s = re.sub(r'\s+', ' ', s).strip()
+
+        # Count and strip trailing '*' for pointer depth (before multi-word resolution)
         ptr_depth = 0
         while s.endswith('*'):
             ptr_depth += 1
             s = s[:-1].strip()
-        s = re.sub(r'\s+', ' ', s).strip()
-        # Look up in typedef map first, then simple name.
+
+        # Multi-word type normalization (order matters: longest match first)
+        _MULTI_WORD = {
+            'unsigned long long': 'ulong',
+            'signed long long':   'long',
+            'long long unsigned': 'ulong',
+            'long long signed':   'long',
+            'long long':          'long',
+            'unsigned long':      'ulong',
+            'signed long':        'long',
+            'long unsigned':      'ulong',
+            'long signed':        'long',
+            'unsigned short':     'u16',
+            'signed short':       'i16',
+            'short unsigned':     'u16',
+            'short signed':       'i16',
+            'unsigned char':      'u8',
+            'signed char':        'i8',
+            'char unsigned':      'u8',
+            'char signed':        'i8',
+            'unsigned int':       'uint',
+            'signed int':         'int',
+            'int unsigned':       'uint',
+            'int signed':         'int',
+            'long double':        'double',
+            'unsigned':           'uint',
+            'signed':             'int',
+            'long':               'long',
+            'short':              'i16',
+        }
+        matched = _MULTI_WORD.get(s)
+        if matched:
+            return matched + '*' * ptr_depth
+
+        # Single-word: check typedef map then return as-is
         flux = _TYPEDEF_MAP.get(s, s)
         return flux + '*' * ptr_depth
 
@@ -900,28 +1039,143 @@ class CTranslator:
 
     def _translate_pp_macro_body_str(self, body):
         """Translate a macro body string (already joined, no backslash continuations)
-        to Flux syntax.  Applies the same transforms as _translate_macro_body but
-        works on a plain string rather than a token list."""
-        import re
-        # ## token-paste: prefix##param -> prefix{param}
-        body = re.sub(r'(\w*)##(\w+)', lambda m2: f"{m2.group(1)}{{{m2.group(2)}}}", body)
-        # Bitwise NOT: ~ -> `! (only when used as unary, i.e. after operator chars)
-        body = re.sub(r'(?<![a-zA-Z0-9_])~', '`!', body)
-        # Address-of: unary & -> @  (heuristic: & after (, ,, =, or at start)
-        body = re.sub(r'(?<=[(,=\s])&(?=\w)', '@', body)
-        # -> member access -> .
-        body = body.replace('->', '.')
-        # Uppercase hex literals
-        body = re.sub(r'0x([0-9a-fA-F]+)', lambda m2: '0x' + m2.group(1).upper(), body)
-        # /* ... */ comments -> /// ... ///
-        body = re.sub(r'/\*.*?\*/', lambda m2: '/// ' + m2.group(0)[2:-2].strip() + ' ///', body)
-        return body.strip()
+        to Flux syntax. Character-by-character scan, no regex."""
+        out = []
+        i = 0
+        n = len(body)
+
+        def is_ident(c):
+            return c.isalnum() or c == '_'
+
+        while i < n:
+            # /* ... */ comment -> /// inner ///
+            if body[i] == '/' and i + 1 < n and body[i+1] == '*':
+                end = body.find('*/', i + 2)
+                if end == -1:
+                    out.append('/// ' + body[i+2:].strip() + ' ///')
+                    break
+                inner = body[i+2:end].strip()
+                out.append('/// ' + inner + ' ///')
+                i = end + 2
+                continue
+
+            # ## token-paste: word##word -> word{word}
+            if body[i] == '#' and i + 1 < n and body[i+1] == '#':
+                # Replace the ## and next identifier with {ident}
+                i += 2
+                j = i
+                while j < n and is_ident(body[j]):
+                    j += 1
+                out.append('{' + body[i:j] + '}')
+                i = j
+                continue
+
+            # -> member access
+            if body[i] == '-' and i + 1 < n and body[i+1] == '>':
+                out.append('.')
+                i += 2
+                continue
+
+            # 0x hex literal: uppercase the digits
+            if body[i] == '0' and i + 1 < n and body[i+1] in ('x', 'X'):
+                j = i + 2
+                while j < n and body[j] in '0123456789abcdefABCDEF':
+                    j += 1
+                out.append('0x' + body[i+2:j].upper())
+                i = j
+                continue
+
+            # C-style cast of primitive type: (type) or (type*)
+            # Handles: (long), (short), (char), (int), (void),
+            #          (unsigned X), (signed X) and pointer variants
+            if body[i] == '(':
+                # Try to parse a cast -- look ahead for ')' with only type tokens inside
+                j = i + 1
+                # Skip whitespace
+                while j < n and body[j] == ' ':
+                    j += 1
+                # Collect the potential type string up to the matching ')'
+                depth = 1
+                k = j
+                while k < n and depth > 0:
+                    if body[k] == '(':
+                        depth += 1
+                    elif body[k] == ')':
+                        depth -= 1
+                    k += 1
+                # k is now past the ')'
+                type_str = body[j:k-1].strip()
+                # Check if type_str is a pure C primitive type (possibly with *)
+                ptr_suffix = ''
+                ts = type_str
+                while ts.endswith('*'):
+                    ptr_suffix += '*'
+                    ts = ts[:-1].strip()
+                _CAST_MAP = {
+                    'void': 'void', 'char': 'i8', 'signed char': 'i8',
+                    'unsigned char': 'u8', 'short': 'i16',
+                    'unsigned short': 'u16', 'signed short': 'i16',
+                    'int': 'int', 'unsigned int': 'uint', 'unsigned': 'uint',
+                    'signed': 'int', 'long': 'long', 'unsigned long': 'ulong',
+                    'signed long': 'long', 'long long': 'long',
+                    'unsigned long long': 'ulong', 'float': 'float',
+                    'double': 'double',
+                }
+                if ts in _CAST_MAP:
+                    out.append('(' + _CAST_MAP[ts] + ptr_suffix + ')')
+                    i = k
+                    continue
+                # Not a recognizable cast -- emit as-is
+                out.append('(')
+                i += 1
+                continue
+
+            # Bitwise NOT: ~ only when not preceded by an identifier char
+            if body[i] == '~':
+                prev = out[-1][-1] if out and out[-1] else ''
+                if not is_ident(prev):
+                    out.append('`!')
+                else:
+                    out.append('~')
+                i += 1
+                continue
+
+            # Address-of: & after (, ,, =, or whitespace and before identifier
+            if body[i] == '&':
+                prev = out[-1][-1] if out and out[-1] else ''
+                if prev in ('(', ',', '=', ' ', '\t', ''):
+                    # peek ahead: must be followed by identifier char
+                    if i + 1 < n and is_ident(body[i+1]):
+                        out.append('@')
+                        i += 1
+                        continue
+                out.append('&')
+                i += 1
+                continue
+
+            # Identifier: collect and check for ## following
+            if is_ident(body[i]):
+                j = i
+                while j < n and is_ident(body[j]):
+                    j += 1
+                word = body[i:j]
+                # Peek: if followed by ##, emit word and let ## handler add {next}
+                out.append(word)
+                i = j
+                continue
+
+            out.append(body[i])
+            i += 1
+
+        return ''.join(out).strip()
 
     # -----------------------------------------------------------------------
     # Top-level dispatcher
     # -----------------------------------------------------------------------
 
     def _visit_top(self, cursor):
+        if self._cplusplus_depth > 0:
+            return
         kind = cursor.kind
 
         if kind == CursorKind.STRUCT_DECL:
@@ -938,6 +1192,25 @@ class CTranslator:
             self._emit_global_var(cursor)
         elif kind == CursorKind.MACRO_DEFINITION:
             self._emit_macro(cursor)
+
+    # -----------------------------------------------------------------------
+    # Anonymous struct/union helper
+    # -----------------------------------------------------------------------
+
+    def _emit_anon_record(self, field):
+        """Emit an anonymous struct or union field as a named declaration.
+        Synthesizes a name (_anon_N), emits the declaration immediately, and
+        returns the synthesized name to use as the field type."""
+        decl = field.type.get_canonical().get_declaration()
+        self._anon_counter += 1
+        synth_name = f"_anon_{self._anon_counter}"
+        # Patch the declaration into _pending_typedefs so _struct_name finds it
+        self._pending_typedefs[decl.hash] = synth_name
+        if decl.kind == CursorKind.UNION_DECL:
+            self._emit_union(decl)
+        else:
+            self._emit_struct(decl)
+        return synth_name
 
     # -----------------------------------------------------------------------
     # Struct
@@ -971,8 +1244,17 @@ class CTranslator:
 
         for field in fields:
             if field.kind == CursorKind.FIELD_DECL:
-                ftype = self._flux_type(field.type, field.spelling)
                 fc = _field_comment(field)
+                # Resolve anonymous nested struct/union: emit it first, get synthesized name
+                canon_kind = field.type.get_canonical().kind
+                if canon_kind == TypeKind.RECORD:
+                    fdecl = field.type.get_canonical().get_declaration()
+                    if not fdecl.spelling and not self._pending_typedefs.get(fdecl.hash):
+                        ftype = self._emit_anon_record(field)
+                    else:
+                        ftype = self._flux_type(field.type, field.spelling)
+                else:
+                    ftype = self._flux_type(field.type, field.spelling)
                 # Bitfield
                 if field.is_bitfield():
                     width = field.get_bitfield_width()
@@ -1013,8 +1295,25 @@ class CTranslator:
         self._emit("{")
         for field in fields:
             if field.kind == CursorKind.FIELD_DECL:
-                ftype = self._flux_type(field.type, field.spelling)
-                self._emit(f"    {ftype} {_rename(field.spelling)};")
+                if field.is_bitfield():
+                    width = field.get_bitfield_width()
+                    canon = field.type.get_canonical()
+                    signed = canon.kind in (TypeKind.CHAR_S, TypeKind.SCHAR, TypeKind.SHORT,
+                                            TypeKind.INT, TypeKind.LONG, TypeKind.LONGLONG)
+                    prefix = "signed " if signed else ""
+                    self._emit(f"    {prefix}data{{{width}}} {_rename(field.spelling)};")
+                else:
+                    # Resolve anonymous nested struct before calling _flux_type
+                    canon_kind = field.type.get_canonical().kind
+                    if canon_kind == TypeKind.RECORD:
+                        fdecl = field.type.get_canonical().get_declaration()
+                        if not fdecl.spelling and not self._pending_typedefs.get(fdecl.hash):
+                            ftype = self._emit_anon_record(field)
+                        else:
+                            ftype = self._flux_type(field.type, field.spelling)
+                    else:
+                        ftype = self._flux_type(field.type, field.spelling)
+                    self._emit(f"    {ftype} {_rename(field.spelling)};")
         self._emit("};")
         self._emit("")
 
@@ -1171,9 +1470,22 @@ class CTranslator:
 
     def _emit_function(self, cursor):
         name = cursor.spelling
-        if not name or name in self._emitted_types:
+        if not name:
             return
-        self._emitted_types.add(name)
+
+        # Check if this cursor has a body
+        body = None
+        for child in cursor.get_children():
+            if child.kind == CursorKind.COMPOUND_STMT:
+                body = child
+                break
+
+        # Skip if already emitted as a full definition
+        if name in self._emitted_types:
+            return
+        # Skip prototype if a prototype was already emitted and this is also a prototype
+        if body is None and name in self._emitted_prototypes:
+            return
 
         ft = cursor.type
         ret = ft.get_result()
@@ -1192,16 +1504,11 @@ class CTranslator:
         param_str = ", ".join(params)
         noreturn_comment = " // noreturn" if noreturn else ""
 
-        # Check if this has a body
-        body = None
-        for child in cursor.get_children():
-            if child.kind == CursorKind.COMPOUND_STMT:
-                body = child
-                break
-
         if body is None:
             self._emit(f"cdecl {name}({param_str}) -> {ret_str};{noreturn_comment}")
+            self._emitted_prototypes.add(name)
         else:
+            self._emitted_types.add(name)
             self._emit(f"cdecl {name}({param_str}) -> {ret_str}{noreturn_comment}")
             self._emit_compound(body)
             self._emit("")
@@ -1215,14 +1522,52 @@ class CTranslator:
         if not name:
             return
         ftype = self._flux_type(cursor.type, name)
-        # Check for initializer
-        children = list(cursor.get_children())
-        init = children[0] if children else None
+        # Find actual initializer -- skip TYPE_REF, TEMPLATE_REF, array
+        # size INTEGER_LITERAL children, and attribute nodes.
+        _ATTR_KINDS = {
+            CursorKind.ANNOTATE_ATTR, CursorKind.ASM_LABEL_ATTR,
+            CursorKind.PACKED_ATTR, CursorKind.PURE_ATTR,
+            CursorKind.CONST_ATTR, CursorKind.NODUPLICATE_ATTR,
+            CursorKind.VISIBILITY_ATTR, CursorKind.DLLIMPORT_ATTR,
+            CursorKind.DLLEXPORT_ATTR,
+        }
+        init = None
+        for child in cursor.get_children():
+            if child.kind in (CursorKind.TYPE_REF, CursorKind.TEMPLATE_REF):
+                continue
+            if child.kind in _ATTR_KINDS:
+                continue
+            if (cursor.type.get_canonical().kind == TypeKind.CONSTANTARRAY
+                    and child.kind == CursorKind.INTEGER_LITERAL):
+                continue
+            init = child
+            break
+
+        # static const char name[] = "..." -> g-string global constant
+        canon = cursor.type.get_canonical()
+        is_const_char_array = (
+            canon.kind == TypeKind.CONSTANTARRAY
+            and canon.element_type.get_canonical().kind in (TypeKind.CHAR_S, TypeKind.CHAR_U,
+                                                             TypeKind.SCHAR, TypeKind.UCHAR)
+            and cursor.storage_class == cx.StorageClass.STATIC
+        )
+        if is_const_char_array and init and init.kind == CursorKind.STRING_LITERAL:
+            tokens = list(init.get_tokens())
+            str_val = tokens[0].spelling if tokens else '""'
+            # Strip surrounding quotes and re-emit as g-string
+            inner = str_val[1:-1] if str_val.startswith('"') else str_val
+            self._emit(f'i8* {name} = g"{inner}";')
+            return
+
         if init:
             val = self._emit_expr(init)
             self._emit(f"{ftype} {name} = {val};")
-        else:
+        elif cursor.storage_class == cx.StorageClass.EXTERN:
+            # True extern declaration -- symbol defined elsewhere
             self._emit(f"extern {ftype} {name};")
+        else:
+            # No initializer: C zero-initializes globals (BSS); Flux also zero-initializes by default
+            self._emit(f"{ftype} {name};")
 
     def _emit_codegen_macro(self, name, params, body_toks):
         """Translate a ##-pasting code-generating macro into a comptime/emitflux block.
@@ -1591,9 +1936,15 @@ class CTranslator:
         children = list(cursor.get_children())
         init = None
         for child in children:
-            if child.kind not in (CursorKind.TYPE_REF, CursorKind.TEMPLATE_REF):
-                init = child
-                break
+            if child.kind in (CursorKind.TYPE_REF, CursorKind.TEMPLATE_REF):
+                continue
+            # For array types, libclang may expose the array size as an INTEGER_LITERAL
+            # child even when there is no C initializer. Skip it.
+            if (cursor.type.get_canonical().kind == TypeKind.CONSTANTARRAY
+                    and child.kind == CursorKind.INTEGER_LITERAL):
+                continue
+            init = child
+            break
         vname = _rename(cursor.spelling)
         if init:
             val = self._emit_expr(init)
@@ -1656,12 +2007,26 @@ class CTranslator:
         # Use token-based reconstruction for the header since absent parts are hard to detect
         init_str = cond_str = inc_str = ""
         body = None
+        body_single = None  # non-compound single-statement body
         parts = []
         for child in children:
             if child.kind == CursorKind.COMPOUND_STMT:
                 body = child
             else:
                 parts.append(child)
+
+        # The body is the last part if it is not a NULL_STMT and there are more
+        # parts than the expected 3 (init, cond, inc). A single-statement body
+        # has no braces so it appears as a 4th non-compound child.
+        if len(parts) > 3 and parts[-1].kind != CursorKind.NULL_STMT:
+            body_single = parts.pop()
+        elif len(parts) == 3 and body is None:
+            # All three slots filled and no compound -- last may still be body
+            # if the for header has fewer than 3 meaningful parts. Check via
+            # source extent: the body must start after the closing ')' of the for.
+            # Simpler heuristic: if parts[2] is not an increment-like expression
+            # (e.g. it's a full statement kind), treat it as body.
+            pass  # leave as-is; covered by NULL_STMT guards below
 
         if len(parts) >= 1 and parts[0].kind != CursorKind.NULL_STMT:
             if parts[0].kind == CursorKind.DECL_STMT:
@@ -1684,6 +2049,10 @@ class CTranslator:
         if self._loop_depth_in_switch_stack: self._loop_depth_in_switch_stack[-1] += 1
         if body:
             self._emit_compound(body)
+        elif body_single:
+            self._indent += 1
+            self._emit_stmt(body_single)
+            self._indent -= 1
         else:
             self._emit(f"{pad}{{}};")
         if self._loop_depth_in_switch_stack: self._loop_depth_in_switch_stack[-1] -= 1
@@ -1770,13 +2139,15 @@ class CTranslator:
         self._indent -= 1
         self._emit(f"{pad}}}")
 
-    def _emit_default(self, cursor, body_stmts):
+    def _emit_default(self, cursor, body_stmts, has_break=True, is_last=True):
         pad = "    " * self._indent
         self._emit(f"{pad}default")
         self._emit(f"{pad}{{")
         self._indent += 1
         for stmt in body_stmts:
             self._emit_stmt(stmt)
+        if not has_break and not is_last:
+            self._emit(f"{'    ' * self._indent}// FALLTHROUGH -- manual review required")
         self._indent -= 1
         self._emit(f"{pad}}};")
 
@@ -1821,9 +2192,10 @@ class CTranslator:
         if current_case is not None:
             groups.append((current_case, current_body, current_break))
 
-        for case_cursor, body_stmts, has_break in groups:
+        for group_idx, (case_cursor, body_stmts, has_break) in enumerate(groups):
+            is_last = (group_idx == len(groups) - 1)
             if case_cursor.kind == CursorKind.DEFAULT_STMT:
-                self._emit_default(case_cursor, body_stmts)
+                self._emit_default(case_cursor, body_stmts, has_break=(has_break or is_last), is_last=is_last)
             else:
                 pad = "    " * self._indent
                 children_c = list(case_cursor.get_children())
@@ -1841,15 +2213,50 @@ class CTranslator:
                     self._emit_stmt(stmt)
                 if has_break:
                     self._emit(f"{'    ' * self._indent}break switch;")
+                elif not is_last:
+                    self._emit(f"{'    ' * self._indent}// FALLTHROUGH -- manual review required")
                 self._indent -= 1
                 self._emit(f"{pad}}}")
 
     def _norm(self, s):
         """Normalise a raw C expression string to Flux conventions."""
+        import re as _re
+        # Collapse platform-specific stdio handle expansions back to standard names.
+        _STDIO_RESTORE = [
+            (r'__acrt_iob_func\s*\(\s*0\s*\)', 'stdin'),
+            (r'__acrt_iob_func\s*\(\s*1\s*\)', 'stdout'),
+            (r'__acrt_iob_func\s*\(\s*2\s*\)', 'stderr'),
+            (r'\b__stdin\b',  'stdin'),
+            (r'\b__stdout\b', 'stdout'),
+            (r'\b__stderr\b', 'stderr'),
+        ]
+        for pattern, replacement in _STDIO_RESTORE:
+            s = _re.sub(pattern, replacement, s)
         s = s.replace("->", ".")
         # Bitwise NOT: ~ -> `!  (must be preceded by non-identifier, i.e. operator context)
-        import re as _re
         s = _re.sub(r'(?<![a-zA-Z0-9_])~', '`!', s)
+        # C-style casts in raw token strings: translate known C types to Flux
+        def _replace_cast(m):
+            inner_type = m.group(1).strip()
+            # Count and strip trailing '*'
+            ptr_depth = 0
+            t = inner_type
+            while t.endswith('*'):
+                ptr_depth += 1
+                t = t[:-1].strip()
+            flux = _c_type_str_to_flux_simple(t) + '*' * ptr_depth
+            return f"({flux})"
+        def _c_type_str_to_flux_simple(t):
+            _CAST_MAP = {
+                'void': 'void', 'char': 'i8', 'signed char': 'i8',
+                'unsigned char': 'u8', 'short': 'i16', 'unsigned short': 'u16',
+                'int': 'int', 'unsigned int': 'uint', 'unsigned': 'uint',
+                'long': 'long', 'unsigned long': 'ulong',
+                'long long': 'long', 'unsigned long long': 'ulong',
+                'float': 'float', 'double': 'double',
+            }
+            return _CAST_MAP.get(t, t)
+        s = _re.sub(r'\(\s*((?:unsigned\s+|signed\s+)?(?:long\s+long|long|short|char|int|float|double|void)\s*\*?\s*)\)', _replace_cast, s)
         # Uppercase hex literals
         s = _re.sub(r'0x([0-9a-fA-F]+)', lambda m: "0x" + m.group(1).upper(), s)
         return s
@@ -1889,7 +2296,14 @@ class CTranslator:
 
         if kind == CursorKind.INTEGER_LITERAL:
             tokens = list(cursor.get_tokens())
-            spelling = tokens[0].spelling if tokens else "0"
+            if not tokens:
+                # No tokens -- try source slice (e.g. enum constants with empty token list)
+                raw = self._src_slice(cursor)
+                return raw if raw else "0"
+            spelling = tokens[0].spelling
+            # If the source token is an identifier (enum constant or macro name), preserve it
+            if tokens[0].kind == cx.TokenKind.IDENTIFIER:
+                return spelling
             # Uppercase hex literals: 0xdeadbeef -> 0xDEADBEEF
             if spelling.lower().startswith("0x"):
                 spelling = "0x" + spelling[2:].upper()
@@ -1916,12 +2330,20 @@ class CTranslator:
             return f"{base}.{cursor.spelling}"
 
         if kind == CursorKind.CALL_EXPR:
+            # Platform stdio handle expanders: __acrt_iob_func(N) etc.
+            # Their entire extent maps back to the original macro name in source.
+            _STDIO_EXPANDERS = ('__acrt_iob_func', '__iob_func')
+            if cursor.spelling in _STDIO_EXPANDERS:
+                raw = self._src_slice(cursor)
+                if raw and raw.isidentifier():
+                    return raw
             children = list(cursor.get_children())
             if not children:
                 return f"{cursor.spelling}()"
             fn = self._emit_expr(children[0])
             args = [self._emit_expr(c) for c in children[1:]]
-            return f"{fn}({', '.join(args)})"
+            result = f"{fn}({', '.join(args)})"
+            return self._norm(result)
 
         if kind == CursorKind.UNARY_OPERATOR:
             children = list(cursor.get_children())
@@ -1952,14 +2374,29 @@ class CTranslator:
                 return f"{operand}{op}"
             return f"{op}{operand}"
 
+        _CAST_KINDS = (CursorKind.CSTYLE_CAST_EXPR,)
+        _AST_PREFERRED = (CursorKind.CSTYLE_CAST_EXPR, CursorKind.BINARY_OPERATOR,
+                          CursorKind.CXX_UNARY_EXPR)
+
+        def _rhs_expr(rhs_cursor):
+            """Emit RHS, using AST path for casts and sizeof-containing exprs."""
+            c = rhs_cursor
+            # Unwrap UNEXPOSED_EXPR wrapper
+            while c.kind in (CursorKind.UNEXPOSED_EXPR, CursorKind.UNEXPOSED_STMT):
+                ch = list(c.get_children())
+                if ch:
+                    c = ch[0]
+                else:
+                    break
+            if c.kind in _AST_PREFERRED:
+                return self._emit_expr(rhs_cursor)
+            return self._src_slice(rhs_cursor) or self._emit_expr(rhs_cursor)
+
         if kind == CursorKind.BINARY_OPERATOR:
             children = list(cursor.get_children())
             lhs = self._emit_expr(children[0]) if len(children) > 0 else "?"
             rhs_cursor = children[1] if len(children) > 1 else None
-            if rhs_cursor is not None:
-                rhs = self._src_slice(rhs_cursor) or self._emit_expr(rhs_cursor)
-            else:
-                rhs = "?"
+            rhs = _rhs_expr(rhs_cursor) if rhs_cursor is not None else "?"
             c_op = self._extract_binary_op(cursor, children)
             flux_op = _BINOP_MAP.get(c_op, c_op)
             return f"{lhs} {flux_op} {rhs}"
@@ -1968,10 +2405,7 @@ class CTranslator:
             children = list(cursor.get_children())
             lhs = self._emit_expr(children[0]) if len(children) > 0 else "?"
             rhs_cursor = children[1] if len(children) > 1 else None
-            if rhs_cursor is not None:
-                rhs = self._src_slice(rhs_cursor) or self._emit_expr(rhs_cursor)
-            else:
-                rhs = "?"
+            rhs = _rhs_expr(rhs_cursor) if rhs_cursor is not None else "?"
             c_op = self._extract_binary_op(cursor, children)
             flux_op = _BINOP_MAP.get(c_op, c_op)
             return f"{lhs} {flux_op} {rhs}"
@@ -2012,14 +2446,19 @@ class CTranslator:
             return ""
 
         if kind in (CursorKind.UNEXPOSED_EXPR, CursorKind.UNEXPOSED_STMT):
+            # Try raw source slice first -- preserves macro names like stderr/stdout/stdin
+            # before they get expanded to platform internals
+            raw = self._src_slice(cursor)
+            if raw and raw.isidentifier():
+                return raw
             children = list(cursor.get_children())
             if children:
-                return self._emit_expr(children[0])
+                return self._norm(self._emit_expr(children[0]))
             if cursor.spelling:
                 return cursor.spelling
             tokens = list(cursor.get_tokens())
             if tokens:
-                return " ".join(t.spelling for t in tokens)
+                return self._norm(" ".join(t.spelling for t in tokens))
             return "?"
 
         if kind == CursorKind.ADDR_LABEL_EXPR:
@@ -2028,8 +2467,10 @@ class CTranslator:
         if kind == CursorKind.CXX_UNARY_EXPR:
             tokens = list(cursor.get_tokens())
             raw = " ".join(t.spelling for t in tokens)
-            # Flux sizeof returns bits, C sizeof returns bytes -- divide by 8
-            return f"({raw} / 8)"
+            # Flux sizeof returns bits, C sizeof returns bytes -- multiply by 8.
+            # If this value is used as a byte count (e.g. malloc, read), divide the
+            # result by 8 or use sizeof(T) / 8 instead. Manual review required.
+            return f"({raw} * 8) /* C sizeof=bytes; Flux sizeof=bits -- verify usage */"
 
         # Fallback: reconstruct from tokens
         tokens = list(cursor.get_tokens())
@@ -2254,7 +2695,7 @@ class CTranslator:
             try:
                 t = CTranslator(inc_abs, args=clang_args)
                 content = t.translate()
-                with open(out_path, "w") as f:
+                with open(out_path, "w", encoding="utf-8") as f:
                     f.write(content)
                 print(f"cft: include -> {out_path}", file=sys.stderr)
                 written.add(inc_abs)
@@ -2314,7 +2755,7 @@ def translate_pair(c_path, h_path, out_path, clang_args=None,
     result = translate_file(primary, clang_args=clang_args,
                             already_translated=already_translated)
 
-    with open(out_path, "w") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         f.write(result)
     print(f"cft: wrote {out_path}", file=sys.stderr)
 
@@ -2432,11 +2873,12 @@ def main():
 
     if len(sys.argv) >= 3:
         out_path = sys.argv[2]
-        with open(out_path, "w") as f:
+        with open(out_path, "w", encoding="utf-8") as f:
             f.write(result)
         print(f"cft: wrote {out_path}", file=sys.stderr)
     else:
-        print(result)
+        sys.stdout.buffer.write(result.encode('utf-8'))
+        sys.stdout.buffer.write(b'\n')
 
 
 if __name__ == "__main__":
