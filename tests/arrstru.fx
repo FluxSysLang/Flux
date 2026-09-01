@@ -26,6 +26,8 @@ def main() -> int
 {
     int i;
 
+    test
+
     println(test[i++]);
     #";
     #";

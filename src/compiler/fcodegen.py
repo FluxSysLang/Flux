@@ -2673,6 +2673,44 @@ class CodegenVisitor:
             pass
         return masked
 
+    def visit_BitIndexAccess(self, node, builder, module):
+        """Read a single bit: value[`index] using MSB-first addressing.
+
+        Bit 0 = MSB of the integer. For an N-bit integer, bit N-1 = LSB.
+        Returns 0 or 1 as i8.
+        """
+        from fast import BitIndexAccess as _BIA
+        val = self.visit(node.value, builder, module)
+        idx_val = self.visit(node.index, builder, module)
+        i8  = ir.IntType(8)
+        i32 = ir.IntType(32)
+        # Normalise val to an integer of known width
+        if isinstance(val.type, ir.PointerType) and isinstance(val.type.pointee, ir.IntType):
+            val = builder.load(val, name="bia_load")
+        if not isinstance(val.type, ir.IntType):
+            raise FluxCodegenError(
+                f"Bit-index operator [`] requires an integer operand, got {val.type} ", node, module)
+        w = val.type.width
+        # Normalise index to i32
+        if isinstance(idx_val.type, ir.IntType):
+            if idx_val.type.width < 32:
+                idx_i32 = builder.zext(idx_val, i32, name="bia_idx_ext")
+            elif idx_val.type.width > 32:
+                idx_i32 = builder.trunc(idx_val, i32, name="bia_idx_trunc")
+            else:
+                idx_i32 = idx_val
+        else:
+            raise FluxCodegenError(
+                f"Bit-index must be an integer, got {idx_val.type} ", node, module)
+        # MSB-first: shift amount = (w - 1 - index)
+        w_const = ir.Constant(i32, w - 1)
+        shift_amt = builder.sub(w_const, idx_i32, name="bia_shift")
+        # Widen val to i32 for the shift if narrow
+        wval = builder.zext(val, i32) if w < 32 else val
+        shifted = builder.lshr(wval, shift_amt, name="bia_shifted")
+        bit = builder.and_(shifted, ir.Constant(i32, 1), name="bia_bit")
+        return builder.trunc(bit, i8, name="bia_result")
+
     def visit_VariadicAccess(self, node, builder, module):
         va_list_alloca = getattr(builder, '_flux_va_list', None)
         if va_list_alloca is None:
@@ -4635,7 +4673,7 @@ class CodegenVisitor:
 
     def visit_Assignment(self, node, builder, module):
         from fast import (ArrayLiteral, StructLiteral, Identifier, MemberAccess, ArrayAccess,
-                          PointerDeref, BitSlice, RangeExpression, Literal)
+                          PointerDeref, BitSlice, BitIndexAccess, RangeExpression, Literal)
         # Seed element_type on ArrayLiteral from target's type_spec so large
         # unsigned literals aren't promoted to i64 when target is e.g. u32[N].
         if isinstance(node.value, ArrayLiteral) and node.value.element_type is None:
@@ -4930,8 +4968,64 @@ class CodegenVisitor:
             builder.store(result, ptr)
             return result
 
+        elif isinstance(node.target, BitIndexAccess):
+            # x[`index] = val -- set a single bit using MSB-first addressing.
+            # Bit 0 = MSB. For an N-bit integer, bit N-1 = LSB.
+            if not isinstance(node.target.value, Identifier):
+                raise FluxCodegenError(f"Bit-index assignment target must be a simple variable", node, module)
+            var_name = node.target.value.name
+            ptr = module.symbol_table.get_llvm_value(var_name)
+            if ptr is None:
+                raise FluxCodegenError(f"Unknown variable '{var_name}'", node, module)
+            int_type = ptr.type.pointee
+            if not isinstance(int_type, ir.IntType):
+                raise FluxCodegenError(f"Bit-index assignment requires an integer variable", node, module)
+            w = int_type.width
+            i32 = ir.IntType(32)
+            idx_val = self.visit(node.target.index, builder, module)
+            # Normalise index to i32
+            if isinstance(idx_val.type, ir.IntType):
+                if idx_val.type.width < 32:
+                    idx_i32 = builder.zext(idx_val, i32, name="bia_idx_ext")
+                elif idx_val.type.width > 32:
+                    idx_i32 = builder.trunc(idx_val, i32, name="bia_idx_trunc")
+                else:
+                    idx_i32 = idx_val
+            else:
+                raise FluxCodegenError(f"Bit-index must be an integer", node, module)
+            # shift amount for MSB-first: position (w - 1 - index) from the LSB end
+            shift_amt_i32 = builder.sub(ir.Constant(i32, w - 1), idx_i32, name="bia_shift")
+            shift_amt = builder.trunc(shift_amt_i32, int_type, name="bia_shift_trunc") \
+                if int_type.width < 32 else \
+                (builder.trunc(shift_amt_i32, int_type, name="bia_shift_trunc")
+                 if int_type.width < shift_amt_i32.type.width else shift_amt_i32)
+            # normalise shift to int_type width
+            if shift_amt.type != int_type:
+                if shift_amt.type.width > int_type.width:
+                    shift_amt = builder.trunc(shift_amt, int_type, name="bia_shift_t")
+                else:
+                    shift_amt = builder.zext(shift_amt, int_type, name="bia_shift_e")
+            # build single-bit mask
+            one = ir.Constant(int_type, 1)
+            bit_mask = builder.shl(one, shift_amt, name="bia_mask")
+            inv_mask = builder.not_(bit_mask, name="bia_inv_mask")
+            cur = builder.load(ptr, name="bia_cur")
+            cleared = builder.and_(cur, inv_mask, name="bia_cleared")
+            # coerce rhs to int_type, mask to single bit
+            rhs = val
+            if isinstance(rhs.type, ir.IntType):
+                if rhs.type.width < int_type.width:
+                    rhs = builder.zext(rhs, int_type, name="bia_rhs_widen")
+                elif rhs.type.width > int_type.width:
+                    rhs = builder.trunc(rhs, int_type, name="bia_rhs_trunc")
+            rhs_masked = builder.and_(rhs, one, name="bia_rhs_bit")
+            rhs_shifted = builder.shl(rhs_masked, shift_amt, name="bia_rhs_shift")
+            result = builder.or_(cleared, rhs_shifted, name="bia_result")
+            builder.store(result, ptr)
+            return result
+
         else:
-            raise FluxCodegenError(f"Cannot assign to {type(node.target, node, module).__name__}", node, module)
+            raise FluxCodegenError(f"Cannot assign to {type(node.target).__name__}", node, module)
 
     def visit_CompoundAssignment(self, node, builder, module):
         return AssignmentTypeHandler.handle_compound_assignment(
@@ -9000,41 +9094,6 @@ class CodegenVisitor:
                 break
             pending_tl, pending_ns_retry, pending_ex = still_tl, still_ns, still_ex
         module._prepass_only = False
-
-        # Pass 2.9: Forward-declare all top-level FunctionDef signatures before Pass 3.
-        # This ensures that when runtime.fx (or any file) references a mangled function name
-        # (e.g. main__0__ret_intE1) defined later in node.statements, the IR declaration
-        # already exists in module.globals so the call site resolves correctly regardless of
-        # source file ordering on any platform.
-        from fast import FunctionDef as _FwdFunctionDef
-        for _fwd_stmt in node.statements:
-            if not isinstance(_fwd_stmt, _FwdFunctionDef):
-                continue
-            if getattr(_fwd_stmt, '_is_comptime_only', False):
-                continue
-            if getattr(_fwd_stmt, '_source_namespace', None) is not None:
-                continue  # template instantiation -- handled later
-            _fwd_name = _fwd_stmt.name
-            if not isinstance(_fwd_name, str):
-                continue  # f-string name -- cannot resolve at this stage
-            try:
-                _fwd_ret = FunctionTypeHandler.convert_type_spec_to_llvm(_fwd_stmt.return_type, module)
-                _fwd_params = [
-                    FunctionTypeHandler.convert_type_spec_to_llvm(p.type_spec, module)
-                    for p in _fwd_stmt.parameters
-                ]
-                _fwd_ftype = ir.FunctionType(_fwd_ret, _fwd_params, var_arg=_fwd_stmt.is_variadic)
-                _fwd_mangled = SymbolTable.mangle_function_name(
-                    _fwd_name, _fwd_stmt.parameters, _fwd_stmt.return_type, _fwd_stmt.no_mangle)
-                if _fwd_mangled not in module.globals:
-                    _fwd_func = ir.Function(module, _fwd_ftype, _fwd_mangled)
-                    _fwd_base = _fwd_name.split('::')[-1] if '::' in _fwd_name else _fwd_name
-                    SymbolTable.register_function_overload(
-                        module, _fwd_base, _fwd_mangled,
-                        _fwd_stmt.parameters, _fwd_stmt.return_type,
-                        _fwd_func, is_deprecated=_fwd_stmt.is_deprecated)
-            except Exception:
-                pass  # silently defer; Pass 3 will emit or surface the real error
 
         # Pass 3: Process all other statements
         print("[AST] Pass 3: Processing all other statements...")

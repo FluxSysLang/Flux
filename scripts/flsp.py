@@ -127,7 +127,7 @@ builtins.print = _silent_print
 # Server instance
 # ---------------------------------------------------------------------------
 SERVER_NAME    = "flux-lsp"
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "2.0.0"
 
 flux_server = LanguageServer(SERVER_NAME, SERVER_VERSION)
 
@@ -499,6 +499,10 @@ async def _validate_async(ls: LanguageServer, uri: str) -> None:
 
     if result.program is not None:
         _parse_cache[uri] = result.program
+        try:
+            result.program._lsp_uri = uri
+        except Exception:
+            pass
         log.debug("Parse succeeded, cache updated for %s", path)
     else:
         log.debug("Parse failed for %s, keeping stale cache", path)
@@ -565,7 +569,104 @@ def _toplevel_namespace_completions(program: Program) -> List[lsp.CompletionItem
     return items
 
 
-def _namespace_completions(program: Program, ns_path: str) -> List[lsp.CompletionItem]:
+# ---------------------------------------------------------------------------
+# Function snippet helper
+# ---------------------------------------------------------------------------
+
+def _build_location_index(program: Program) -> Dict[str, tuple]:
+    """Build a name -> (short_filename, line) index for all definitions in the program.
+    Cached on the program object.
+    """
+    if hasattr(program, '_lsp_location_index'):
+        return program._lsp_location_index
+
+    uri = getattr(program, '_lsp_uri', '')
+    short_name = Path(_uri_to_path(uri)).name if uri else ''
+
+    index: Dict[str, tuple] = {}
+
+    def _record(name, defn):
+        line = getattr(defn, 'source_line', 0)
+        if line and name:
+            index[name] = (short_name, line)
+
+    def _index_stmts(stmts):
+        for stmt in stmts:
+            if isinstance(stmt, FunctionDefStatement):
+                _record(stmt.function_def.name, stmt.function_def)
+            elif isinstance(stmt, StructDefStatement):
+                _record(stmt.struct_def.name, stmt.struct_def)
+            elif isinstance(stmt, ObjectDefStatement):
+                _record(stmt.object_def.name, stmt.object_def)
+            elif isinstance(stmt, EnumDefStatement):
+                _record(stmt.enum_def.name, stmt.enum_def)
+            elif isinstance(stmt, UnionDefStatement):
+                _record(stmt.union_def.name, stmt.union_def)
+            elif isinstance(stmt, VariableDeclaration):
+                _record(stmt.name, stmt)
+            elif isinstance(stmt, NamespaceDefStatement):
+                ns = stmt.namespace_def
+                for fn in ns.functions:
+                    _record(fn.name, fn)
+                for s in ns.structs:
+                    _record(s.name, s)
+                for o in ns.objects:
+                    _record(o.name, o)
+                for e in ns.enums:
+                    _record(e.name, e)
+                for u in ns.unions:
+                    _record(u.name, u)
+                for v in ns.variables:
+                    _record(v.name, v)
+                for nested in ns.nested_namespaces:
+                    _index_stmts([NamespaceDefStatement(nested)])
+
+    _index_stmts(program.statements)
+
+    try:
+        program._lsp_location_index = index
+    except Exception:
+        pass
+    return index
+
+
+def _location_detail(bare_name: str, program: Program, type_detail: str, doc_text: str = "") -> str:
+    """Return a detail string combining type info and source location.
+    Only shows location if the name appears in the current document text,
+    to avoid showing misleading locations from transitively imported files.
+    """
+    if doc_text and bare_name not in doc_text:
+        return type_detail
+    loc_index = _build_location_index(program)
+    loc = loc_index.get(bare_name)
+    if loc:
+        filename, line = loc
+        loc_str = f"{filename}:{line}" if filename else f"line {line}"
+        return f"{type_detail}  [{loc_str}]" if type_detail else f"[{loc_str}]"
+    return type_detail
+
+
+def _func_snippet(label: str, program: Program, mangled_name: str = "") -> tuple:
+    """Build a snippet insert text for a function call, e.g. 'print(${1:msg})'.
+    Returns (insert_text, insert_text_format).
+    Falls back to bare label with $0 cursor if no FunctionDef is found.
+    """
+    bare = label.split('::')[-1]
+    func_def = _find_function_def(program, bare, mangled_name)
+    if func_def is None or not func_def.parameters:
+        return f"{label}($0)", lsp.InsertTextFormat.Snippet
+    params = []
+    for idx, p in enumerate(func_def.parameters, 1):
+        pname = p.name or f"arg{idx}"
+        params.append(f"${{{idx}:{pname}}}")
+    return f"{label}({', '.join(params)})", lsp.InsertTextFormat.Snippet
+
+
+# ---------------------------------------------------------------------------
+# Namespace completions
+# ---------------------------------------------------------------------------
+
+def _namespace_completions(program: Program, ns_path: str, doc_text: str = "") -> List[lsp.CompletionItem]:
     """Return all symbols whose name is directly inside ns_path (__ separated)."""
     if not ns_path:
         return []
@@ -594,12 +695,17 @@ def _namespace_completions(program: Program, ns_path: str) -> List[lsp.Completio
                 seen.add(remainder)
                 if entry.kind == SymbolKind.FUNCTION:
                     detail = f"-> {_type_spec_str(entry.type_spec)}" if entry.type_spec else "function"
+                    insert, fmt = _func_snippet(remainder, program, sym_name)
                 else:
                     detail = _type_spec_str(entry.type_spec) if entry.type_spec else entry.kind.value
+                    insert, fmt = remainder, lsp.InsertTextFormat.PlainText
+                detail = _location_detail(entry.name, program, detail, doc_text)
                 items.append(lsp.CompletionItem(
                     label=remainder,
                     kind=_symbol_kind_to_lsp(entry.kind),
                     detail=detail,
+                    insert_text=insert,
+                    insert_text_format=fmt,
                     documentation=lsp.MarkupContent(
                         kind=lsp.MarkupKind.PlainText,
                         value=f"{entry.kind.value}: {sym_name.replace('__', '::')}",
@@ -623,45 +729,27 @@ def _member_completions(program: Program, var_name: str) -> List[lsp.CompletionI
     if not type_name:
         return []
 
-    # Walk AST statements to find the matching struct/object/union definition
-    for stmt in program.statements:
-        if isinstance(stmt, StructDefStatement):
-            defn = stmt.struct_def
-            if getattr(defn, 'name', None) == type_name:
-                return [
-                    lsp.CompletionItem(
-                        label=m.name,
-                        kind=lsp.CompletionItemKind.Field,
-                        detail=_type_spec_str(m.type_spec),
-                        documentation=f"field of {type_name}",
-                    )
-                    for m in defn.members
-                ]
-        elif isinstance(stmt, ObjectDefStatement):
-            defn = stmt.object_def
-            if getattr(defn, 'name', None) == type_name:
-                return [
-                    lsp.CompletionItem(
-                        label=m.name,
-                        kind=lsp.CompletionItemKind.Field,
-                        detail=_type_spec_str(m.type_spec),
-                        documentation=f"member of {type_name}",
-                    )
-                    for m in defn.members
-                ]
-        elif isinstance(stmt, UnionDefStatement):
-            defn = stmt.union_def
-            if getattr(defn, 'name', None) == type_name:
-                return [
-                    lsp.CompletionItem(
-                        label=m.name,
-                        kind=lsp.CompletionItemKind.Field,
-                        detail=_type_spec_str(m.type_spec),
-                        documentation=f"member of union {type_name}",
-                    )
-                    for m in defn.members
-                ]
-    return []
+    type_index = _build_type_index(program)
+    hit = type_index.get(type_name)
+    if hit is None:
+        return []
+
+    kind_str, defn = hit
+    label_suffix = {
+        'struct': f"field of {type_name}",
+        'object': f"member of {type_name}",
+        'union':  f"member of union {type_name}",
+    }.get(kind_str, f"member of {type_name}")
+
+    return [
+        lsp.CompletionItem(
+            label=m.name,
+            kind=lsp.CompletionItemKind.Field,
+            detail=_type_spec_str(m.type_spec),
+            documentation=label_suffix,
+        )
+        for m in defn.members
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -780,7 +868,7 @@ def completion(ls: LanguageServer, params: lsp.CompletionParams):
         ns_path = _namespace_before_colons(text, params.position)
         log.debug("completion :: detected, ns_path=%r", ns_path)
         if ns_path:
-            ns_items = _namespace_completions(program, ns_path)
+            ns_items = _namespace_completions(program, ns_path, text)
         else:
             ns_items = _toplevel_namespace_completions(program)
         return lsp.CompletionList(is_incomplete=False, items=ns_items)
@@ -789,6 +877,20 @@ def completion(ls: LanguageServer, params: lsp.CompletionParams):
     stripped = line_text[:col].lstrip()
     if stripped.startswith('#import') and '<' in stripped and '>' not in stripped:
         return lsp.CompletionList(is_incomplete=False, items=_import_completions())
+
+    # Detect #import "" context -- offer local .fx files relative to document
+    if stripped.startswith('#import') and '"' in stripped and stripped.count('"') % 2 == 1:
+        doc_dir = str(Path(_uri_to_path(uri)).parent)
+        local_items = []
+        if os.path.isdir(doc_dir):
+            for fname in sorted(os.listdir(doc_dir)):
+                if fname.endswith('.fx'):
+                    local_items.append(lsp.CompletionItem(
+                        label=fname,
+                        kind=lsp.CompletionItemKind.File,
+                        detail="local file",
+                    ))
+        return lsp.CompletionList(is_incomplete=False, items=local_items)
 
     items = _get_keyword_completions()
 
@@ -818,7 +920,7 @@ def completion(ls: LanguageServer, params: lsp.CompletionParams):
                 return lsp.CompletionList(is_incomplete=False, items=member_items)
 
     # Symbols from active 'using' namespaces
-    items.extend(_using_aware_completions(program))
+    items.extend(_using_aware_completions(program, text))
 
     # Global symbol completions -- skip namespaced symbols (those belong to :: navigation)
     seen = set()
@@ -840,6 +942,7 @@ def completion(ls: LanguageServer, params: lsp.CompletionParams):
             detail = _type_spec_str(entry.type_spec) if entry.type_spec else entry.kind.value
             insert, fmt = display_name, lsp.InsertTextFormat.PlainText
 
+        detail = _location_detail(bare, program, detail, text)
         full_display = entry.full_name.replace('__', '::') if entry.full_name else display_name
 
         items.append(lsp.CompletionItem(
@@ -898,9 +1001,18 @@ def hover(ls: LanguageServer, params: lsp.HoverParams):
     bare_name = entry.name  # unmangled short name for AST lookup
 
     if entry.kind == SymbolKind.FUNCTION:
-        md = f"**function** `{full}`"
-        if type_str:
-            md += f"\n\nReturns: `{type_str}`"
+        func_def = _find_function_def(program, bare_name, entry.name)
+        if func_def and func_def.parameters:
+            param_strs = []
+            for p in func_def.parameters:
+                type_str_p = _type_spec_str(p.type_spec)
+                param_strs.append(f"{type_str_p} {p.name}" if type_str_p else p.name)
+            ret = _type_spec_str(func_def.return_type) if func_def.return_type else (type_str or "void")
+            md = f"**function** `{full}({', '.join(param_strs)}) -> {ret}`"
+        else:
+            md = f"**function** `{full}`"
+            if type_str:
+                md += f"\n\nReturns: `{type_str}`"
     elif entry.kind in (SymbolKind.STRUCT, SymbolKind.OBJECT):
         md = f"**{kind_label}** `{full}`"
         for stmt in program.statements:
@@ -1003,35 +1115,90 @@ def _active_param_index(text: str, position: lsp.Position) -> int:
     return commas
 
 
-def _find_function_def(program: Program, func_name: str, mangled_name: str = "") -> Optional["FunctionDef"]:
-    """Walk the AST to find a FunctionDef matching func_name or mangled_name.
-    Searches top-level statements and inside NamespaceDefStatement trees.
+def _build_func_index(program: Program) -> Dict[str, "FunctionDef"]:
+    """Build a name -> FunctionDef index for a program, checking both bare and mangled names.
+    Result is cached on the program object to avoid repeated AST walks.
     """
-    bare = func_name.split('::')[-1]
+    if hasattr(program, '_lsp_func_index'):
+        return program._lsp_func_index
 
-    def _search_stmts(stmts):
+    index: Dict[str, "FunctionDef"] = {}
+
+    def _index_stmts(stmts):
         for stmt in stmts:
             if isinstance(stmt, FunctionDefStatement):
                 defn = stmt.function_def
-                if defn.name == func_name or defn.name == bare:
-                    return defn
-                if mangled_name and (defn.name == mangled_name or defn.name.endswith('__' + bare)):
-                    return defn
+                index[defn.name] = defn
+                # Also index by bare name (last segment)
+                bare = defn.name.split('__')[-1]
+                if bare not in index:
+                    index[bare] = defn
             elif isinstance(stmt, NamespaceDefStatement):
                 ns = stmt.namespace_def
                 for fn in ns.functions:
-                    if fn.name == bare or fn.name == func_name:
-                        return fn
-                    if mangled_name and (fn.name == mangled_name or fn.name.endswith('__' + bare)):
-                        return fn
-                # Recurse into nested namespaces
+                    index[fn.name] = fn
+                    bare = fn.name.split('__')[-1]
+                    if bare not in index:
+                        index[bare] = fn
                 for nested in ns.nested_namespaces:
-                    result = _search_stmts([NamespaceDefStatement(nested)])
-                    if result:
-                        return result
-        return None
+                    _index_stmts([NamespaceDefStatement(nested)])
 
-    return _search_stmts(program.statements)
+    _index_stmts(program.statements)
+    try:
+        program._lsp_func_index = index
+    except Exception:
+        pass
+    return index
+
+
+def _find_function_def(program: Program, func_name: str, mangled_name: str = "") -> Optional["FunctionDef"]:
+    """Look up a FunctionDef by name using the cached index."""
+    index = _build_func_index(program)
+    bare = func_name.split('::')[-1]
+    return (
+        index.get(func_name) or
+        index.get(bare) or
+        (index.get(mangled_name) if mangled_name else None)
+    )
+
+
+def _build_type_index(program: Program) -> Dict[str, object]:
+    """Build a type_name -> (kind, defn) index covering top-level and namespace types.
+    Cached on the program object.
+    """
+    if hasattr(program, '_lsp_type_index'):
+        return program._lsp_type_index
+
+    index: Dict[str, tuple] = {}
+
+    def _index_stmts(stmts):
+        for stmt in stmts:
+            if isinstance(stmt, StructDefStatement):
+                d = stmt.struct_def
+                index[d.name] = ('struct', d)
+            elif isinstance(stmt, ObjectDefStatement):
+                d = stmt.object_def
+                index[d.name] = ('object', d)
+            elif isinstance(stmt, UnionDefStatement):
+                d = stmt.union_def
+                index[d.name] = ('union', d)
+            elif isinstance(stmt, NamespaceDefStatement):
+                ns = stmt.namespace_def
+                for s in ns.structs:
+                    index[s.name] = ('struct', s)
+                for o in ns.objects:
+                    index[o.name] = ('object', o)
+                for u in ns.unions:
+                    index[u.name] = ('union', u)
+                for nested in ns.nested_namespaces:
+                    _index_stmts([NamespaceDefStatement(nested)])
+
+    _index_stmts(program.statements)
+    try:
+        program._lsp_type_index = index
+    except Exception:
+        pass
+    return index
 
 
 @flux_server.feature(
@@ -1140,8 +1307,9 @@ def definition(ls: LanguageServer, params: lsp.DefinitionParams):
 
     entry = _resolve_qualified(program, word)
     bare_name = entry.name if entry else word.split('::')[-1]
+    locations: List[lsp.Location] = []
 
-    def _search_for_def(stmts, target_uri):
+    def _collect_defs(stmts, target_uri):
         _STMT_ATTRS = (
             ('struct_def',   StructDefStatement),
             ('object_def',   ObjectDefStatement),
@@ -1161,7 +1329,7 @@ def definition(ls: LanguageServer, params: lsp.DefinitionParams):
                 line = getattr(defn, 'source_line', 0)
                 col  = getattr(defn, 'source_col',  0)
                 if line:
-                    return lsp.Location(uri=target_uri, range=_make_range(line, col))
+                    locations.append(lsp.Location(uri=target_uri, range=_make_range(line, col)))
             if isinstance(stmt, NamespaceDefStatement):
                 ns = stmt.namespace_def
                 for fn in ns.functions:
@@ -1169,34 +1337,28 @@ def definition(ls: LanguageServer, params: lsp.DefinitionParams):
                         line = getattr(fn, 'source_line', 0)
                         col  = getattr(fn, 'source_col',  0)
                         if line:
-                            return lsp.Location(uri=target_uri, range=_make_range(line, col))
+                            locations.append(lsp.Location(uri=target_uri, range=_make_range(line, col)))
                 for collection in (ns.structs, ns.objects, ns.enums, ns.unions):
                     for defn in collection:
                         if getattr(defn, 'name', None) == bare_name:
                             line = getattr(defn, 'source_line', 0)
                             col  = getattr(defn, 'source_col',  0)
                             if line:
-                                return lsp.Location(uri=target_uri, range=_make_range(line, col))
+                                locations.append(lsp.Location(uri=target_uri, range=_make_range(line, col)))
                 for nested in ns.nested_namespaces:
-                    result = _search_for_def([NamespaceDefStatement(nested)], target_uri)
-                    if result:
-                        return result
-        return None
+                    _collect_defs([NamespaceDefStatement(nested)], target_uri)
 
-    # Search current file first
-    result = _search_for_def(program.statements, uri)
-    if result:
-        return result
-
-    # Search all other cached programs
+    _collect_defs(program.statements, uri)
     for other_uri, other_program in _parse_cache.items():
         if other_uri == uri:
             continue
-        result = _search_for_def(other_program.statements, other_uri)
-        if result:
-            return result
+        _collect_defs(other_program.statements, other_uri)
 
-    return None
+    if not locations:
+        return None
+    if len(locations) == 1:
+        return locations[0]
+    return locations
 
 
 # ---------------------------------------------------------------------------
@@ -1215,7 +1377,7 @@ def _get_using_namespaces(program: Program) -> List[str]:
     return result
 
 
-def _using_aware_completions(program: Program) -> List[lsp.CompletionItem]:
+def _using_aware_completions(program: Program, doc_text: str = "") -> List[lsp.CompletionItem]:
     """Return completion items for all symbols reachable via active using statements.
     Symbols are shown by their short (unqualified) name.
     """
@@ -1241,6 +1403,7 @@ def _using_aware_completions(program: Program) -> List[lsp.CompletionItem]:
             else:
                 detail = _type_spec_str(entry.type_spec) if entry.type_spec else entry.kind.value
                 insert, fmt = remainder, lsp.InsertTextFormat.PlainText
+            detail = _location_detail(entry.name, program, detail, doc_text)
             items.append(lsp.CompletionItem(
                 label=remainder,
                 kind=_symbol_kind_to_lsp(entry.kind),
@@ -1346,27 +1509,6 @@ def _import_completions() -> List[lsp.CompletionItem]:
         for name in sorted(names)
     ]
 
-
-# ---------------------------------------------------------------------------
-# Function snippet helper
-# ---------------------------------------------------------------------------
-
-def _func_snippet(label: str, program: Program, mangled_name: str = "") -> tuple:
-    """Build a snippet insert text for a function call, e.g. 'print(${1:msg})'.
-    Returns (insert_text, insert_text_format).
-    Falls back to plain label if no FunctionDef is found.
-    """
-    bare = label.split('::')[-1]
-    func_def = _find_function_def(program, bare, mangled_name)
-    if func_def is None or not func_def.parameters:
-        return f"{label}($0)", lsp.InsertTextFormat.Snippet
-    params = []
-    for idx, p in enumerate(func_def.parameters, 1):
-        pname = p.name or f"arg{idx}"
-        params.append(f"${{{idx}:{pname}}}")
-    return f"{label}({', '.join(params)})", lsp.InsertTextFormat.Snippet
-
-
 # ---------------------------------------------------------------------------
 # Workspace symbols
 # ---------------------------------------------------------------------------
@@ -1449,10 +1591,12 @@ def references(ls: LanguageServer, params):
     word = _word_at_position(text, params.position)
     if not word:
         return []
-    return [
-        lsp.Location(uri=uri, range=r)
-        for r in _find_references_in_text(text, word)
-    ]
+
+    locations = []
+    for doc_uri, doc_text in _doc_store.items():
+        for r in _find_references_in_text(doc_text, word):
+            locations.append(lsp.Location(uri=doc_uri, range=r))
+    return locations
 
 
 # ---------------------------------------------------------------------------

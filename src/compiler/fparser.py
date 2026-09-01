@@ -530,7 +530,7 @@ class FluxParser:
         Create a parser by preprocessing and lexing a source file.
         """
         # Step 1: Preprocess
-        preprocessor = FXPreprocessor(source_file, compiler_constants=compiler_macros or {}, verbose=verbose)
+        preprocessor = FXPreprocessor(source_file, compiler_constants=compiler_macros or {})
         preprocessed_source = preprocessor.process()
 
         # Step 2: Lex
@@ -8264,6 +8264,13 @@ class FluxParser:
                 # Array access or array slice [start:end] or range assignment [start..end] = {fill}
                 tok = self.current_token
                 self.advance()
+                # Check for bit-index: [`index]
+                if self.expect(TokenType.BACKTICK):
+                    self.advance()  # consume `
+                    bit_index = self.expression()
+                    self.consume(TokenType.RIGHT_BRACKET)
+                    expr = BitIndexAccess(expr, bit_index).set_location(tok.line, tok.column)
+                    continue
                 start_index = self.expression()
                 # Check if this is a bit-slice operation [start``end]
                 if self.expect(TokenType.BITSLICE):

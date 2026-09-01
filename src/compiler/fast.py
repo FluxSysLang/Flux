@@ -429,6 +429,21 @@ class BitSlice(Expression):
 
 
 @dataclass
+class BitIndexAccess(Expression):
+    """Single-bit index expression: value[`index]
+
+    Reads one bit from an integer value using MSB-first addressing
+    (bit 0 = MSB, bit N-1 = LSB for an N-bit integer).
+    Returns 0 or 1 as i8.
+    """
+    value: Expression
+    index: Expression
+
+    def __repr__(self) -> str:
+        return f"{self.value}[`{self.index}]"
+
+
+@dataclass
 class PointerDeref(Expression):
     pointer: Expression
 
