@@ -45,6 +45,7 @@ from fast import (
     ExpressionStatement,
     Block,
     ArrayAccess,
+    BitSlice, BitIndexAccess,
     SwitchStatement, Case,
     FunctionDef, FunctionDefStatement,
     FunctionPointerDeclaration,
@@ -1461,6 +1462,8 @@ class FVMCodegen:
         elif t is FunctionCall:        return self._visit_function_call(node)
         elif t is MethodCall:          return self._visit_method_call(node)
         elif t is ArrayAccess:         return self._visit_array_access(node)
+        elif t is BitSlice:            return self._visit_bit_slice(node)
+        elif t is BitIndexAccess:      return self._visit_bit_index_access(node)
         elif t is macroCall:           return self._visit_macro_call(node)
         elif t is TypeFuncCall:        return self._visit_type_func_call(node)
         elif t is StructFieldAccess:   return self._visit_struct_field_access(node)
@@ -2779,6 +2782,197 @@ class FVMCodegen:
         self._visit_expr(node.array)
         self._visit_expr(node.index)
         self._emit(_instr(Op.ARRAY_LOAD))
+        return True
+
+    def _visit_bit_slice(self, node: BitSlice) -> bool:
+        """
+        value[start``end] -- MSB-first bit slice, mirrors fcodegen.visit_BitSlice.
+
+        For an N-bit integer stored BE (default): bit 0 = MSB, bit N-1 = LSB.
+        The byte layout in the staging buffer has byte 0 = MSB byte.
+
+        For LE integers (data{W::0}): byte 0 = LSB byte, so we reverse the
+        byte order before applying the same MSB-first extraction.
+
+        The FVM works with Python integers, so we implement the extraction
+        arithmetically:
+          1. Determine total bit-width W and endianness from the value's typespec.
+          2. If LE, byte-swap the value to put it in BE order (byte 0 = MSB).
+          3. Extract bits [start, end] from the BE-ordered integer:
+               byte_idx   = start // 8
+               bit_in_byte_start = start % 8
+               bit_in_byte_end   = end   % 8
+               byte_val  = (be_value >> ((W//8 - 1 - byte_idx) * 8)) & 0xFF
+               shift_amt = 7 - bit_in_byte_end
+               masked    = (byte_val >> shift_amt) & ((1 << (end-start+1)) - 1)
+
+        For compile-time constant indices (the common case) we emit everything
+        as PUSH + SHR + BAND which the FVM can fold immediately.
+        """
+        from ftypesys import EndianSwapHandler
+
+        # Resolve the typespec of the value operand for endianness and width
+        val_ts = None
+        if isinstance(node.value, Identifier):
+            val_ts = self._local_typespecs.get(node.value.name)
+
+        is_le = (EndianSwapHandler.get_endianness(val_ts) == 0) if val_ts is not None else False
+        total_bits = self._type_bit_width(val_ts) if val_ts is not None else None
+
+        # Evaluate start / end as Python ints (must be compile-time constants)
+        def _const_int(expr):
+            if isinstance(expr, Literal):
+                return int(expr.value)
+            return None
+
+        s_const = _const_int(node.start)
+        e_const = _const_int(node.end)
+
+        if s_const is not None and e_const is not None and total_bits is not None:
+            # --- Fully constant fast path ---
+            nbytes  = total_bits // 8
+            num_bits = e_const - s_const + 1
+            mask    = (1 << num_bits) - 1
+
+            # Emit value onto stack
+            self._visit_expr(node.value)
+            val_slot = self._alloc_local('__bs_val__')
+            self._emit(_instr(Op.LOCAL_SET, val_slot))
+
+            bit_in_byte_end = e_const % 8
+            inner_shift = 7 - bit_in_byte_end
+            if is_le:
+                # LE: Python int has LSB at bit 0. The staging buffer (per fcodegen)
+                # stores byte i at offset i (LSB-first). To isolate the byte at
+                # byte_idx = start // 8, shift right by byte_idx * 8.
+                byte_shift = (s_const // 8) * 8
+            else:
+                # BE: Python int has MSB at the top. The staging buffer stores
+                # byte 0 = MSB, so byte_idx from MSB = start // 8, and in the
+                # Python int that byte sits at shift (nbytes-1-byte_idx)*8.
+                byte_shift = (nbytes - 1 - (s_const // 8)) * 8
+            total_shift = byte_shift + inner_shift
+
+            # Emit: (val >> total_shift) & mask
+            self._emit(_instr(Op.LOCAL_GET, val_slot))
+            if total_shift > 0:
+                self._emit(_instr(Op.PUSH, Val(TTag.INT, total_shift)))
+                self._emit(_instr(Op.SHR))
+            self._emit(_instr(Op.PUSH, Val(TTag.LONG, mask)))
+            self._emit(_instr(Op.BAND))
+            return True
+
+        # --- Generic (non-constant) path ---
+        # Only handles single-byte-window BE slices at runtime.
+        # inner_shift = 7 - (end % 8)
+        # mask        = (1 << (end - start + 1)) - 1
+        # result      = (val >> inner_shift) & mask
+        self._visit_expr(node.value)
+        val_slot = self._alloc_local('__bs_val__')
+        self._emit(_instr(Op.LOCAL_SET, val_slot))
+
+        self._visit_expr(node.start)
+        start_slot = self._alloc_local('__bs_start__')
+        self._emit(_instr(Op.LOCAL_SET, start_slot))
+
+        self._visit_expr(node.end)
+        end_slot = self._alloc_local('__bs_end__')
+        self._emit(_instr(Op.LOCAL_SET, end_slot))
+
+        # inner_shift = 7 - (end % 8)
+        self._emit(_instr(Op.LOCAL_GET, end_slot))
+        self._emit(_instr(Op.PUSH, Val(TTag.INT, 8)))
+        self._emit(_instr(Op.MOD))
+        self._emit(_instr(Op.PUSH, Val(TTag.INT, 7)))
+        self._emit(_instr(Op.SWAP))
+        self._emit(_instr(Op.SUB))
+        inner_shift_slot = self._alloc_local('__bs_inner_shift__')
+        self._emit(_instr(Op.LOCAL_SET, inner_shift_slot))
+
+        # num_bits = end - start + 1
+        self._emit(_instr(Op.LOCAL_GET, end_slot))
+        self._emit(_instr(Op.LOCAL_GET, start_slot))
+        self._emit(_instr(Op.SUB))
+        self._emit(_instr(Op.PUSH, Val(TTag.INT, 1)))
+        self._emit(_instr(Op.ADD))
+        nb_slot = self._alloc_local('__bs_nb__')
+        self._emit(_instr(Op.LOCAL_SET, nb_slot))
+
+        # mask = (1 << num_bits) - 1
+        self._emit(_instr(Op.PUSH, Val(TTag.INT, 1)))
+        self._emit(_instr(Op.LOCAL_GET, nb_slot))
+        self._emit(_instr(Op.SHL))
+        self._emit(_instr(Op.PUSH, Val(TTag.INT, 1)))
+        self._emit(_instr(Op.SUB))
+        mask_slot = self._alloc_local('__bs_mask__')
+        self._emit(_instr(Op.LOCAL_SET, mask_slot))
+
+        # result = (val >> inner_shift) & mask
+        self._emit(_instr(Op.LOCAL_GET, val_slot))
+        self._emit(_instr(Op.LOCAL_GET, inner_shift_slot))
+        self._emit(_instr(Op.SHR))
+        self._emit(_instr(Op.LOCAL_GET, mask_slot))
+        self._emit(_instr(Op.BAND))
+        return True
+
+    def _visit_bit_index_access(self, node: BitIndexAccess) -> bool:
+        """
+        value[`index] -- MSB-first single bit read, mirrors fcodegen.visit_BitIndexAccess.
+
+        Bit 0 = MSB of the W-bit integer, bit W-1 = LSB.
+        shift_amt = W - 1 - index
+        result    = (val >> shift_amt) & 1
+        """
+        # Determine bit width of the operand.
+        total_bits = None
+        if isinstance(node.value, Identifier):
+            val_ts = self._local_typespecs.get(node.value.name)
+            if val_ts is not None:
+                total_bits = self._type_bit_width(val_ts)
+        elif isinstance(node.value, BitSlice):
+            # Chained: value[start``end][`idx] -- result of slice has width end-start+1
+            s = node.value.start
+            e = node.value.end
+            if isinstance(s, Literal) and isinstance(e, Literal):
+                total_bits = int(e.value) - int(s.value) + 1
+
+        def _const_int(expr):
+            if isinstance(expr, Literal):
+                return int(expr.value)
+            return None
+
+        idx_const = _const_int(node.index)
+
+        if idx_const is not None and total_bits is not None:
+            # Constant fast path: shift_amt = total_bits - 1 - idx_const
+            shift_amt = total_bits - 1 - idx_const
+            self._visit_expr(node.value)
+            if shift_amt > 0:
+                self._emit(_instr(Op.PUSH, Val(TTag.INT, shift_amt)))
+                self._emit(_instr(Op.SHR))
+            self._emit(_instr(Op.PUSH, Val(TTag.INT, 1)))
+            self._emit(_instr(Op.BAND))
+            return True
+
+        # Generic path: W unknown at codegen time -- fallback to 64-bit.
+        w = total_bits if total_bits is not None else 64
+        self._visit_expr(node.value)
+        val_slot = self._alloc_local('__bia_val__')
+        self._emit(_instr(Op.LOCAL_SET, val_slot))
+
+        self._visit_expr(node.index)
+        idx_slot = self._alloc_local('__bia_idx__')
+        self._emit(_instr(Op.LOCAL_SET, idx_slot))
+
+        # shift_amt = (w - 1) - index
+        self._emit(_instr(Op.PUSH, Val(TTag.INT, w - 1)))
+        self._emit(_instr(Op.LOCAL_GET, idx_slot))
+        self._emit(_instr(Op.SUB))
+        self._emit(_instr(Op.LOCAL_GET, val_slot))
+        self._emit(_instr(Op.SWAP))
+        self._emit(_instr(Op.SHR))
+        self._emit(_instr(Op.PUSH, Val(TTag.INT, 1)))
+        self._emit(_instr(Op.BAND))
         return True
 
     # ------------------------------------------------------------------

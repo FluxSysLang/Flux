@@ -1687,6 +1687,18 @@ class CodegenVisitor:
             if rhs_is_ptr_to_ptr and isinstance(rhs.type.pointee.pointee, ir.IntType) and not lhs_is_int_type:
                 rhs = builder.load(rhs, name="deref_ptr_for_arithmetic")
 
+        # Endianness normalization: bswap any LE integer operands to logical
+        # (native) value before arithmetic or comparison. The result carries no
+        # endianness tag; maybe_swap at store time handles the target's encoding.
+        def _to_logical(v, label):
+            ts = getattr(v, '_flux_type_spec', None)
+            if (isinstance(v.type, ir.IntType) and v.type.width >= 16
+                    and EndianSwapHandler.get_endianness(ts) == 0):
+                return EndianSwapHandler.emit_bswap(builder, module, v)
+            return v
+        lhs = _to_logical(lhs, "lhs")
+        rhs = _to_logical(rhs, "rhs")
+
         # Array concatenation
         if node.operator in (Operator.ADD, Operator.SUB):
             if (ArrayTypeHandler.is_array_or_array_pointer(lhs) and
@@ -2041,6 +2053,21 @@ class CodegenVisitor:
                 f"cannot cast void-literal to {target_llvm_type} ", node, module)
 
         source_val = self.visit(node.expression, builder, module)
+
+        # After visiting, if the target type has a different endianness from the
+        # source, bswap now so the value's wire format matches its tag. This mirrors
+        # what maybe_swap does at store time, ensuring cast results are consistent:
+        # an LE-tagged value always holds bswap(logical), a BE-tagged value holds
+        # the logical value directly.
+        def _cast_endian_fix(val, tgt_type_spec):
+            src_endian = EndianSwapHandler.get_endianness(getattr(val, '_flux_type_spec', None))
+            tgt_endian = EndianSwapHandler.get_endianness(tgt_type_spec)
+            if (src_endian != tgt_endian
+                    and isinstance(val.type, ir.IntType)
+                    and val.type.width >= 16):
+                return EndianSwapHandler.emit_bswap(builder, module, val)
+            return val
+
         if source_val.type == target_llvm_type:
             # Even though the LLVM types are identical (e.g. le32 and uint are
             # both i32), an explicit cast is a value-level reinterpretation: the
@@ -2051,6 +2078,7 @@ class CodegenVisitor:
             # We must stamp the target type spec onto the result so that the
             # endianness check in visit_FunctionCall sees a neutral (non-endian)
             # type rather than the source's endian annotation.
+            source_val = _cast_endian_fix(source_val, node.target_type)
             source_val._flux_type_spec = node.target_type
             return source_val
 
@@ -2113,6 +2141,7 @@ class CodegenVisitor:
                         result = builder.sext(source_val, target_llvm_type)
             else:
                 result = source_val
+            result = _cast_endian_fix(result, node.target_type)
             result._flux_type_spec = node.target_type
             return result
 
@@ -2614,8 +2643,15 @@ class CodegenVisitor:
             if val.type.width < 32:   wval = builder.zext(val, i32, name="bs_widen")
             elif val.type.width > 64: wval = builder.trunc(val, ir.IntType(64), name="bs_widen")
             wty = wval.type
+            _val_ts = getattr(val, '_flux_type_spec', None)
+            _val_is_le = (EndianSwapHandler.get_endianness(_val_ts) == 0) if _val_ts is not None else False
             for byte_i in range(nbytes):
-                shift = (nbytes - 1 - byte_i) * 8
+                # LE: byte 0 = LSB (shift=0), byte 1 = next byte up, etc.
+                # BE/default: byte 0 = MSB (shift=(nbytes-1)*8), etc.
+                if _val_is_le:
+                    shift = byte_i * 8
+                else:
+                    shift = (nbytes - 1 - byte_i) * 8
                 shifted = builder.lshr(wval, ir.Constant(wty, shift), name=f"bs_byteshift_{byte_i}")
                 bval = builder.trunc(shifted, i8, name=f"bs_byte_{byte_i}")
                 bptr = builder.gep(i8ptr, [ir.Constant(i32, byte_i)], inbounds=True, name=f"bs_bptr_{byte_i}")
