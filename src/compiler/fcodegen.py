@@ -2644,14 +2644,12 @@ class CodegenVisitor:
             elif val.type.width > 64: wval = builder.trunc(val, ir.IntType(64), name="bs_widen")
             wty = wval.type
             _val_ts = getattr(val, '_flux_type_spec', None)
-            _val_is_le = (EndianSwapHandler.get_endianness(_val_ts) == 0) if _val_ts is not None else False
             for byte_i in range(nbytes):
-                # LE: byte 0 = LSB (shift=0), byte 1 = next byte up, etc.
-                # BE/default: byte 0 = MSB (shift=(nbytes-1)*8), etc.
-                if _val_is_le:
-                    shift = byte_i * 8
-                else:
-                    shift = (nbytes - 1 - byte_i) * 8
+                # LE-declared variables are stored as bswap(logical) by maybe_swap at
+                # assignment time, so the loaded integer already has its bytes in
+                # big-endian (MSB-first) order in the register.  BE/default values
+                # are also MSB-first.  Always use BE staging: byte 0 = MSB.
+                shift = (nbytes - 1 - byte_i) * 8
                 shifted = builder.lshr(wval, ir.Constant(wty, shift), name=f"bs_byteshift_{byte_i}")
                 bval = builder.trunc(shifted, i8, name=f"bs_byte_{byte_i}")
                 bptr = builder.gep(i8ptr, [ir.Constant(i32, byte_i)], inbounds=True, name=f"bs_bptr_{byte_i}")
