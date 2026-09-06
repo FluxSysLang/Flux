@@ -46,9 +46,15 @@ from fast import (
     Block,
     ArrayAccess,
     BitSlice, BitIndexAccess,
+    ArraySlice, ArrayComprehension,
+    RangeExpression,
+    NullCoalesce, NotNull,
+    VariadicAccess,
+    TieExpression,
     SwitchStatement, Case,
-    FunctionDef, FunctionDefStatement,
+    ForInLoop, BreakSwitchStatement, TernaryAssign,
     FunctionPointerDeclaration,
+    FunctionPointerCall, FunctionPointerAssignment,
     TypeFuncDef, TypeFuncCall,
     NamespaceDef, NamespaceDefStatement,
     StructDef, StructDefStatement, StructMember, StructInstance, StructLiteral,
@@ -860,9 +866,11 @@ class FVMCodegen:
         elif t is Assignment:            self._visit_assignment(node)
         elif t is CompoundAssignment:    self._visit_compound_assign(node)
         elif t is RangeAssignment:       self._visit_range_assignment(node)
+        elif t is TernaryAssign:         self._visit_ternary_assign(node)
         elif t is ExpressionStatement:   self._visit_expr_stmt(node)
         elif t is IfStatement:           self._visit_if(node)
         elif t is ForLoop:               self._visit_for(node)
+        elif t is ForInLoop:             self._visit_for_in(node)
         elif t is WhileLoop:             self._visit_while(node)
         elif t is DoLoop:                self._visit_do(node)
         elif t is DoWhileLoop:           self._visit_do_while(node)
@@ -872,6 +880,7 @@ class FVMCodegen:
         elif t is ThrowStatement:        self._visit_throw(node)
         elif t is ReturnStatement:       self._visit_return(node)
         elif t is BreakStatement:        self._visit_break(node)
+        elif t is BreakSwitchStatement:  self._visit_break_switch(node)
         elif t is EscapeStatement:       self._visit_escape(node)
         elif t is ContinueStatement:     self._visit_continue(node)
         elif t is Block:                 self._visit_body(node.statements)
@@ -879,6 +888,7 @@ class FVMCodegen:
         elif t is FunctionDef:           self._visit_function_def(node)
         elif t is FunctionDefStatement:  self._visit_function_def(node.function_def)
         elif t is FunctionPointerDeclaration: self._visit_fp_decl(node)
+        elif t is FunctionPointerAssignment:  self._visit_fp_assignment(node)
         elif t is TypeFuncDef:           self._visit_type_func_def(node)
         elif t is NamespaceDef:          self._visit_namespace_def(node)
         elif t is NamespaceDefStatement: self._visit_namespace_def(node.namespace_def)
@@ -1460,10 +1470,18 @@ class FVMCodegen:
         elif t is BinaryOp:            return self._visit_binary_op(node)
         elif t is UnaryOp:             return self._visit_unary_op(node)
         elif t is FunctionCall:        return self._visit_function_call(node)
+        elif t is FunctionPointerCall: return self._visit_fp_call(node)
         elif t is MethodCall:          return self._visit_method_call(node)
         elif t is ArrayAccess:         return self._visit_array_access(node)
         elif t is BitSlice:            return self._visit_bit_slice(node)
         elif t is BitIndexAccess:      return self._visit_bit_index_access(node)
+        elif t is NullCoalesce:        return self._visit_null_coalesce(node)
+        elif t is NotNull:             return self._visit_not_null(node)
+        elif t is ArraySlice:          return self._visit_array_slice(node)
+        elif t is ArrayComprehension:  return self._visit_array_comprehension(node)
+        elif t is RangeExpression:     return self._visit_range_expression(node)
+        elif t is TieExpression:       return self._visit_tie_expression(node)
+        elif t is VariadicAccess:      return self._visit_variadic_access(node)
         elif t is macroCall:           return self._visit_macro_call(node)
         elif t is TypeFuncCall:        return self._visit_type_func_call(node)
         elif t is StructFieldAccess:   return self._visit_struct_field_access(node)
@@ -2975,6 +2993,330 @@ class FVMCodegen:
         self._emit(_instr(Op.BAND))
         return True
 
+    def _visit_array_slice(self, node: ArraySlice) -> bool:
+        """
+        arr[start:end] -- produce a sub-array.
+        Mirrors fcodegen.visit_ArraySlice.
+        Requires compile-time constant start/end to allocate result array.
+        """
+        s_const = int(node.start.value) if isinstance(node.start, Literal) else None
+        e_const = int(node.end.value)   if isinstance(node.end,   Literal) else None
+        if s_const is None or e_const is None:
+            raise FVMCodegenError(
+                'fvmcodegen: array slice [start:end] requires compile-time constant indices in comptime',
+                node
+            )
+        count = abs(e_const - s_const) + 1
+        step  = 1 if e_const >= s_const else -1
+
+        self._visit_expr(node.array)
+        arr_slot = self._alloc_local('__slice_arr__')
+        self._emit(_instr(Op.LOCAL_SET, arr_slot))
+
+        self._emit(_instr(Op.ARRAY_NEW, 'int', count))
+        result_slot = self._alloc_local('__slice_result__')
+        self._emit(_instr(Op.LOCAL_SET, result_slot))
+
+        for out_i, src_i in enumerate(range(s_const, e_const + step, step)):
+            self._emit(_instr(Op.LOCAL_GET, arr_slot))
+            self._emit(_instr(Op.PUSH, Val(TTag.INT, src_i)))
+            self._emit(_instr(Op.ARRAY_LOAD))
+            elem_slot = self._alloc_local(f'__slice_e{out_i}__')
+            self._emit(_instr(Op.LOCAL_SET, elem_slot))
+
+            self._emit(_instr(Op.LOCAL_GET, result_slot))
+            self._emit(_instr(Op.PUSH, Val(TTag.INT, out_i)))
+            self._emit(_instr(Op.LOCAL_GET, elem_slot))
+            self._emit(_instr(Op.ARRAY_STORE))
+            self._emit(_instr(Op.LOCAL_SET, result_slot))
+
+        self._emit(_instr(Op.LOCAL_GET, result_slot))
+        return True
+
+    def _visit_array_comprehension(self, node: ArrayComprehension) -> bool:
+        """
+        [expr for var in iterable] -- build an array at comptime.
+        Mirrors fcodegen.visit_ArrayComprehension.
+        Requires the iterable to be a compile-time known size.
+        """
+        if isinstance(node.iterable, RangeExpression):
+            s = node.iterable.start
+            e = node.iterable.end
+            if not (isinstance(s, Literal) and isinstance(e, Literal)):
+                raise FVMCodegenError(
+                    'fvmcodegen: array comprehension over range requires compile-time constant bounds',
+                    node
+                )
+            start_v = int(s.value)
+            end_v   = int(e.value)
+            count   = end_v - start_v + 1
+            if count <= 0:
+                raise FVMCodegenError(
+                    'fvmcodegen: array comprehension range must have positive count',
+                    node
+                )
+
+            self._emit(_instr(Op.ARRAY_NEW, 'int', count))
+            result_slot = self._alloc_local('__comp_result__')
+            self._emit(_instr(Op.LOCAL_SET, result_slot))
+
+            var_slot = self._alloc_local(node.variable)
+
+            for i, v in enumerate(range(start_v, end_v + 1)):
+                # Set loop variable
+                self._emit(_instr(Op.PUSH, Val(TTag.INT, v)))
+                self._emit(_instr(Op.LOCAL_SET, var_slot))
+
+                # Evaluate expression
+                self._visit_expr(node.expression)
+                elem_slot = self._alloc_local(f'__comp_e{i}__')
+                self._emit(_instr(Op.LOCAL_SET, elem_slot))
+
+                self._emit(_instr(Op.LOCAL_GET, result_slot))
+                self._emit(_instr(Op.PUSH, Val(TTag.INT, i)))
+                self._emit(_instr(Op.LOCAL_GET, elem_slot))
+                self._emit(_instr(Op.ARRAY_STORE))
+                self._emit(_instr(Op.LOCAL_SET, result_slot))
+
+            self._emit(_instr(Op.LOCAL_GET, result_slot))
+            return True
+
+        elif isinstance(node.iterable, ArrayLiteral):
+            count = len(node.iterable.elements)
+
+            self._emit(_instr(Op.ARRAY_NEW, 'int', count))
+            result_slot = self._alloc_local('__comp_result__')
+            self._emit(_instr(Op.LOCAL_SET, result_slot))
+
+            var_slot = self._alloc_local(node.variable)
+
+            for i, elem_expr in enumerate(node.iterable.elements):
+                self._visit_expr(elem_expr)
+                self._emit(_instr(Op.LOCAL_SET, var_slot))
+
+                self._visit_expr(node.expression)
+                elem_slot = self._alloc_local(f'__comp_e{i}__')
+                self._emit(_instr(Op.LOCAL_SET, elem_slot))
+
+                self._emit(_instr(Op.LOCAL_GET, result_slot))
+                self._emit(_instr(Op.PUSH, Val(TTag.INT, i)))
+                self._emit(_instr(Op.LOCAL_GET, elem_slot))
+                self._emit(_instr(Op.ARRAY_STORE))
+                self._emit(_instr(Op.LOCAL_SET, result_slot))
+
+            self._emit(_instr(Op.LOCAL_GET, result_slot))
+            return True
+
+        raise FVMCodegenError(
+            'fvmcodegen: array comprehension only supports range and array literal iterables',
+            node
+        )
+
+    def _visit_range_expression(self, node: RangeExpression) -> bool:
+        """
+        start..end -- range value.
+        Mirrors fcodegen.visit_RangeExpression which builds a {start,end} struct.
+        In the FVM, represent as a two-element ARRAY [start, end].
+        """
+        self._emit(_instr(Op.ARRAY_NEW, 'int', 2))
+        range_slot = self._alloc_local('__range__')
+        self._emit(_instr(Op.LOCAL_SET, range_slot))
+
+        self._visit_expr(node.start)
+        start_slot = self._alloc_local('__range_start__')
+        self._emit(_instr(Op.LOCAL_SET, start_slot))
+
+        self._visit_expr(node.end)
+        end_slot = self._alloc_local('__range_end__')
+        self._emit(_instr(Op.LOCAL_SET, end_slot))
+
+        self._emit(_instr(Op.LOCAL_GET, range_slot))
+        self._emit(_instr(Op.PUSH, Val(TTag.INT, 0)))
+        self._emit(_instr(Op.LOCAL_GET, start_slot))
+        self._emit(_instr(Op.ARRAY_STORE))
+        self._emit(_instr(Op.LOCAL_SET, range_slot))
+
+        self._emit(_instr(Op.LOCAL_GET, range_slot))
+        self._emit(_instr(Op.PUSH, Val(TTag.INT, 1)))
+        self._emit(_instr(Op.LOCAL_GET, end_slot))
+        self._emit(_instr(Op.ARRAY_STORE))
+        self._emit(_instr(Op.LOCAL_SET, range_slot))
+
+        self._emit(_instr(Op.LOCAL_GET, range_slot))
+        return True
+
+    def _visit_tie_expression(self, node: TieExpression) -> bool:
+        """
+        ~variable -- transfer ownership: read value, zero source slot.
+        Mirrors fcodegen.visit_TieExpression.
+        """
+        if not isinstance(node.operand, Identifier):
+            raise FVMCodegenError(
+                'fvmcodegen: tie operator ~ can only be applied to variables',
+                node
+            )
+        var_name = node.operand.name
+        if var_name not in self._locals:
+            raise FVMCodegenError(
+                f'fvmcodegen: tie: unknown variable {var_name!r}',
+                node
+            )
+        slot = self._locals[var_name]
+        self._emit(_instr(Op.LOCAL_GET, slot))
+        self._emit(_instr(Op.PUSH, Val(TTag.INT, 0)))
+        self._emit(_instr(Op.LOCAL_SET, slot))
+        return True
+
+    def _visit_variadic_access(self, node: VariadicAccess) -> bool:
+        """
+        ...[N] -- variadic argument access.
+        Not supported in comptime; mirrors fcodegen guard.
+        """
+        raise FVMCodegenError(
+            'fvmcodegen: variadic access ...[N] is not supported in comptime blocks',
+            node
+        )
+
+    def _visit_ternary_assign(self, node: TernaryAssign):
+        """
+        target ?= value -- assign value to target only if target == 0.
+        Mirrors fcodegen.visit_TernaryAssign.
+        """
+        if not isinstance(node.target, Identifier):
+            raise FVMCodegenError(
+                'fvmcodegen: TernaryAssign target must be an identifier',
+                node
+            )
+        var_name = node.target.name
+        if var_name not in self._locals:
+            raise FVMCodegenError(
+                f'fvmcodegen: TernaryAssign: unknown variable {var_name!r}',
+                node
+            )
+        slot = self._locals[var_name]
+        self._emit(_instr(Op.LOCAL_GET, slot))
+        self._emit(_instr(Op.PUSH, Val(TTag.INT, 0)))
+        self._emit(_instr(Op.CMP_EQ))
+        skip_patch = self._emit(_instr(Op.JNF, 0))
+        self._visit_expr(node.value)
+        self._emit(_instr(Op.LOCAL_SET, slot))
+        self._patch_at(skip_patch, Op.JNF, self._current_ip())
+
+    def _visit_break_switch(self, node: BreakSwitchStatement):
+        """
+        break switch; -- jump past the enclosing switch.
+        Mirrors fcodegen.visit_BreakSwitchStatement.
+        Uses _break_stack since _visit_switch pushes a break entry.
+        """
+        idx = self._emit(_instr(Op.JMP, 0))
+        if self._break_stack:
+            self._break_stack[-1].append(idx)
+
+    def _visit_for_in(self, node: ForInLoop):
+        """
+        for var in iterable { body } -- iterate over an array.
+        Mirrors fcodegen.visit_ForInLoop for the array case.
+        """
+        self._visit_expr(node.iterable)
+        iter_slot = self._alloc_local('__forin_iter__')
+        self._emit(_instr(Op.LOCAL_SET, iter_slot))
+
+        self._emit(_instr(Op.LOCAL_GET, iter_slot))
+        self._emit(_instr(Op.ARRAY_LEN))
+        len_slot = self._alloc_local('__forin_len__')
+        self._emit(_instr(Op.LOCAL_SET, len_slot))
+
+        self._emit(_instr(Op.PUSH, Val(TTag.INT, 0)))
+        idx_slot = self._alloc_local('__forin_idx__')
+        self._emit(_instr(Op.LOCAL_SET, idx_slot))
+
+        var_slots = [self._alloc_local(v) for v in node.variables]
+
+        loop_start = self._current_ip()
+        self._emit(_instr(Op.LOCAL_GET, idx_slot))
+        self._emit(_instr(Op.LOCAL_GET, len_slot))
+        self._emit(_instr(Op.CMP_LT))
+        exit_patch = self._emit(_instr(Op.JNF, 0))
+
+        self._break_stack.append([])
+        self._continue_stack.append([])
+
+        self._emit(_instr(Op.LOCAL_GET, iter_slot))
+        self._emit(_instr(Op.LOCAL_GET, idx_slot))
+        self._emit(_instr(Op.ARRAY_LOAD))
+        self._emit(_instr(Op.LOCAL_SET, var_slots[0]))
+
+        body_stmts = (
+            node.body.statements if isinstance(node.body, Block) else [node.body]
+        )
+        for stmt in body_stmts:
+            if stmt is None:
+                continue
+            self._visit_stmt(stmt)
+
+        update_ip = self._current_ip()
+        self._emit(_instr(Op.LOCAL_GET, idx_slot))
+        self._emit(_instr(Op.PUSH, Val(TTag.INT, 1)))
+        self._emit(_instr(Op.ADD))
+        self._emit(_instr(Op.LOCAL_SET, idx_slot))
+
+        self._emit(_instr(Op.JMP, loop_start))
+        after_loop = self._current_ip()
+        self._patch_at(exit_patch, Op.JNF, after_loop)
+
+        break_patches = self._break_stack.pop()
+        continue_patches = self._continue_stack.pop()
+        for p in break_patches:
+            self._patch_at(p, Op.JMP, after_loop)
+        for p in continue_patches:
+            self._patch_at(p, Op.JMP, update_ip)
+
+    def _visit_null_coalesce(self, node: NullCoalesce) -> bool:
+        """
+        left ?? right -- return left if non-zero, else right.
+        Mirrors fcodegen.visit_NullCoalesce: evaluate left, branch on zero.
+        """
+        self._visit_expr(node.left)
+        left_slot = self._alloc_local('__nc_left__')
+        self._emit(_instr(Op.LOCAL_SET, left_slot))
+
+        self._emit(_instr(Op.LOCAL_GET, left_slot))
+        jnf_idx = self._emit(_instr(Op.JNF, 0))
+
+        self._visit_expr(node.right)
+        right_slot = self._alloc_local('__nc_right__')
+        self._emit(_instr(Op.LOCAL_SET, right_slot))
+        merge_idx = self._emit(_instr(Op.JMP, 0))
+
+        after_right = self._current_ip()
+        self._patch_at(jnf_idx, Op.JNF, after_right)
+        self._emit(_instr(Op.LOCAL_GET, left_slot))
+        result_slot = self._alloc_local('__nc_result__')
+        self._emit(_instr(Op.LOCAL_SET, result_slot))
+        end_jmp = self._emit(_instr(Op.JMP, 0))
+
+        after_left = self._current_ip()
+        self._patch_at(merge_idx, Op.JMP, after_left)
+        self._emit(_instr(Op.LOCAL_GET, right_slot))
+        self._emit(_instr(Op.LOCAL_SET, result_slot))
+
+        after_all = self._current_ip()
+        self._patch_at(end_jmp, Op.JMP, after_all)
+
+        self._emit(_instr(Op.LOCAL_GET, result_slot))
+        return True
+
+    def _visit_not_null(self, node: NotNull) -> bool:
+        """
+        expr!? -- 1 if non-zero, 0 if zero/null.
+        Mirrors fcodegen.visit_NotNull: icmp ne operand, 0, zext to i8.
+        """
+        self._visit_expr(node.operand)
+        self._emit(_instr(Op.PUSH, Val(TTag.INT, 0)))
+        self._emit(_instr(Op.CMP_EQ))
+        self._emit(_instr(Op.NOT))
+        return True
+
     # ------------------------------------------------------------------
     # Control flow
     # ------------------------------------------------------------------
@@ -3123,7 +3465,35 @@ class FVMCodegen:
         self._emit(_instr(Op.LOCAL_SET, fp_slot))
         self._local_types[node.name] = '__funcptr__'
 
-    def _visit_function_def(self, node: FunctionDef):
+    def _visit_fp_call(self, node: FunctionPointerCall) -> bool:
+        """
+        Call through a function pointer expression: pb(args).
+        Mirrors fcodegen.visit_FunctionPointerCall.
+        The pointer expression evaluates to a PTR(slot); LOCAL_DEREF
+        gives BYTES(func_name); CALL_PTR dispatches by name.
+        """
+        for arg in node.arguments:
+            self._visit_expr(arg)
+        self._visit_expr(node.pointer)
+        # If the pointer is a plain identifier typed as __funcptr__, deref it
+        if (isinstance(node.pointer, Identifier) and
+                self._local_types.get(node.pointer.name) == '__funcptr__'):
+            self._emit(_instr(Op.LOCAL_DEREF))
+        self._emit(_instr(Op.CALL_PTR, len(node.arguments)))
+        return True
+
+    def _visit_fp_assignment(self, node: FunctionPointerAssignment):
+        """
+        Assign a function address to a pointer variable: pb = @bar;
+        Mirrors fcodegen.visit_FunctionPointerAssignment (the one at line 4350).
+        """
+        if node.pointer_name not in self._locals:
+            raise FVMCodegenError(
+                f'fvmcodegen: function pointer {node.pointer_name!r} not declared',
+                node
+            )
+        self._visit_expr(node.function_expr)
+        self._emit(_instr(Op.LOCAL_SET, self._locals[node.pointer_name]))
         """
         Compile a comptime function definition and store its bytecode in
         self.compiled_functions so the caller (visit_ComptimeBlock in fcodegen.py)
@@ -3663,29 +4033,28 @@ class FVMCodegen:
         Strategy: evaluate the subject once into a temp slot, then for each
         non-default case emit CMP_EQ + JNF to skip the body.  The default
         case (Case.value is None) is emitted last and always falls through.
-        break inside a case body jumps past the entire switch.
+        break / break switch inside a case body jumps past the entire switch.
         """
-        # Evaluate subject expression and store in a temp local
         self._visit_expr(node.expression)
         subject_slot = self._alloc_local('__switch_subject__')
         self._emit(_instr(Op.LOCAL_SET, subject_slot))
 
-        break_patches: List[int] = []
+        # Push a break scope so BreakStatement and BreakSwitchStatement
+        # inside case bodies resolve to after-switch, matching fcodegen's
+        # switch_break_block mechanism.
+        self._break_stack.append([])
         default_case: Optional[Case] = None
 
         for case in node.cases:
             if case.value is None:
-                # defer default to end
                 default_case = case
                 continue
 
-            # Push subject and case value, compare
             self._emit(_instr(Op.LOCAL_GET, subject_slot))
             self._visit_expr(case.value)
             self._emit(_instr(Op.CMP_EQ))
             skip_patch = self._emit(_instr(Op.JNF, 0))
 
-            # Emit case body
             body_stmts = (
                 case.body.statements if isinstance(case.body, Block) else [case.body]
             )
@@ -3694,11 +4063,10 @@ class FVMCodegen:
                     continue
                 self._visit_stmt(stmt)
 
-            # Jump past the switch after a matched (non-breaking) case body
-            break_patches.append(self._emit(_instr(Op.JMP, 0)))
+            # Implicit fall-through break: jump past the switch after body
+            self._break_stack[-1].append(self._emit(_instr(Op.JMP, 0)))
             self._patch_at(skip_patch, Op.JNF, self._current_ip())
 
-        # Emit default case body if present
         if default_case is not None:
             body_stmts = (
                 default_case.body.statements
@@ -3711,7 +4079,7 @@ class FVMCodegen:
                 self._visit_stmt(stmt)
 
         after_switch = self._current_ip()
-        for idx in break_patches:
+        for idx in self._break_stack.pop():
             self._patch_at(idx, Op.JMP, after_switch)
 
     def _visit_for(self, node: ForLoop):
