@@ -179,6 +179,7 @@ class DataType(Enum):
     VOID = "void"
     THIS = "this"
     FUNC_PTR = "def{}*"
+    DICT = "dict"
 
     def __str__(self) -> str:
         return self.value
@@ -1199,6 +1200,9 @@ class TypeSystem:
     custom_typename: Optional[str] = None
     storage_class: Optional[StorageClass] = None
     no_functions: bool = False  # True when declared with data!{N} -- type cannot have type functions
+    dict_key_type: Optional['TypeSystem'] = None    # For DICT types: key type
+    dict_value_type: Optional['TypeSystem'] = None  # For DICT types: value type
+    dict_capacity: Optional[int] = None             # For DICT types: compiler-inferred capacity
     
     def __repr__(self) -> str:
         if self.custom_typename is not None:
@@ -1336,6 +1340,15 @@ class TypeSystem:
             if type_spec.bit_width is None:
                 raise ValueError(f"TypeSystem.get_llvm_type: DATA type missing bit_width for {type_spec}")
             base_type = ir.IntType(type_spec.bit_width)
+        elif type_spec.base_type == DataType.DICT:
+            capacity = type_spec.dict_capacity or 0
+            key_llvm = TypeSystem.get_llvm_type(type_spec.dict_key_type, module) if type_spec.dict_key_type else ir.IntType(8)
+            val_llvm = TypeSystem.get_llvm_type(type_spec.dict_value_type, module) if type_spec.dict_value_type else ir.IntType(8)
+            base_type = ir.LiteralStructType([
+                ir.ArrayType(key_llvm, capacity),
+                ir.ArrayType(val_llvm, capacity),
+                ir.IntType(32)
+            ])
         elif type_spec.base_type == DataType.THIS:
             # 'this' return type — resolve to a pointer to the enclosing object's struct type.
             # create_method_signature handles the authoritative THIS->struct* conversion;
@@ -1776,7 +1789,48 @@ class VariableTypeHandler:
     def create_global_initializer(initial_value, llvm_type: ir.Type, module: ir.Module) -> Optional[ir.Constant]:
         """Create compile-time constant initializer for global variable."""
         # Import here to avoid circular dependency
-        from fast import (Literal, Identifier, BinaryOp, UnaryOp, StringLiteral, ArrayLiteral, ArrayAccess, StructLiteral, DataType as FastDataType)
+        from fast import (Literal, Identifier, BinaryOp, UnaryOp, StringLiteral, ArrayLiteral, ArrayAccess, StructLiteral, DictLiteral, DictLiteralExpr, DataType as FastDataType)
+
+        # Dict merge: BinaryOp(+) on two dict identifiers -- build merged constant struct
+        if isinstance(initial_value, BinaryOp) and initial_value.operator.value == '+':
+            lhs_ts = None
+            rhs_ts = None
+            lhs_lit = None
+            rhs_lit = None
+            if isinstance(initial_value.left, Identifier) and hasattr(module, '_dict_types'):
+                lhs_info = module._dict_types.get(initial_value.left.name)
+                if lhs_info and initial_value.left.name in module.globals:
+                    lhs_ts = lhs_info
+                    lhs_gv = module.globals[initial_value.left.name]
+                    lhs_lit = lhs_gv.initializer
+            if isinstance(initial_value.right, Identifier) and hasattr(module, '_dict_types'):
+                rhs_info = module._dict_types.get(initial_value.right.name)
+                if rhs_info and initial_value.right.name in module.globals:
+                    rhs_ts = rhs_info
+                    rhs_gv = module.globals[initial_value.right.name]
+                    rhs_lit = rhs_gv.initializer
+            if lhs_ts is not None and rhs_ts is not None and lhs_lit is not None and rhs_lit is not None:
+                lhs_cap = lhs_ts['capacity']
+                rhs_cap = rhs_ts['capacity']
+                new_cap  = lhs_cap + rhs_cap
+                key_llvm   = lhs_ts['key_llvm']
+                value_llvm = lhs_ts['value_llvm']
+                keys_arr   = ir.ArrayType(key_llvm,   new_cap)
+                vals_arr   = ir.ArrayType(value_llvm, new_cap)
+                count_type = ir.IntType(32)
+                new_struct = ir.LiteralStructType([keys_arr, vals_arr, count_type])
+                # lhs_lit and rhs_lit are constant structs {keys[N], vals[N], i32}
+                lhs_keys = list(lhs_lit.constant[0].constant)
+                lhs_vals = list(lhs_lit.constant[1].constant)
+                rhs_keys = list(rhs_lit.constant[0].constant)
+                rhs_vals = list(rhs_lit.constant[1].constant)
+                all_keys = lhs_keys + rhs_keys
+                all_vals = lhs_vals + rhs_vals
+                keys_const = ir.Constant(keys_arr, all_keys)
+                vals_const = ir.Constant(vals_arr,  all_vals)
+                count_const = ir.Constant(count_type, new_cap)
+                merged = ir.Constant(new_struct, [keys_const, vals_const, count_const])
+                return merged
         
         # Handle different expression types
         if isinstance(initial_value, Literal):
@@ -1807,7 +1861,28 @@ class VariableTypeHandler:
         
         elif isinstance(initial_value, StructLiteral):
             return VariableTypeHandler._struct_literal_to_constant(initial_value, llvm_type, module)
-        
+
+        elif isinstance(initial_value, DictLiteral):
+            return VariableTypeHandler._dict_literal_to_constant(initial_value, llvm_type, module)
+
+        elif isinstance(initial_value, DictLiteralExpr):
+            # d{k:v, ...} assigned directly -- find the first key that evaluates true
+            for k_expr, v_expr in zip(initial_value.keys, initial_value.values):
+                k_const = VariableTypeHandler._eval_const_expr(k_expr, module)
+                if k_const is None:
+                    return None
+                k_val = k_const.constant if hasattr(k_const, 'constant') else None
+                if k_val is None:
+                    return None
+                if isinstance(k_const.type, ir.IntType):
+                    k_val = k_val & ((1 << k_const.type.width) - 1)
+                if k_val:
+                    if isinstance(v_expr, StringLiteral):
+                        return ArrayTypeHandler.create_global_string_initializer(
+                            v_expr.value, llvm_type, module)
+                    return VariableTypeHandler._eval_const_expr(v_expr, module)
+            return None
+
         return None
     
     @staticmethod
@@ -1859,9 +1934,39 @@ class VariableTypeHandler:
     @staticmethod
     def _eval_array_access_const(array_access, module: ir.Module) -> Optional[ir.Constant]:
         """Evaluate array indexing at compile time for global initialization."""
-        from fast import Identifier, Literal, DataType as FastDataType
-        
-        # Get the array being indexed
+        from fast import Identifier, Literal, DictLiteralExpr, StringLiteral, DataType as FastDataType
+
+        # d{k:v, ...}[key] -- inline dict literal keyed lookup
+        if isinstance(array_access.array, DictLiteralExpr):
+            node = array_access.array
+            lookup = VariableTypeHandler._eval_const_expr(array_access.index, module)
+            if lookup is None:
+                return None
+            for k_expr, v_expr in zip(node.keys, node.values):
+                k_const = VariableTypeHandler._eval_const_expr(k_expr, module)
+                if k_const is None:
+                    return None
+                # compare constants by their integer value
+                k_val = k_const.constant if hasattr(k_const, 'constant') else None
+                l_val = lookup.constant if hasattr(lookup, 'constant') else None
+                if k_val is None or l_val is None:
+                    return None
+                # normalise bool width difference
+                if isinstance(k_const.type, ir.IntType) and isinstance(lookup.type, ir.IntType):
+                    k_val = k_val & ((1 << k_const.type.width) - 1)
+                    l_val = l_val & ((1 << lookup.type.width) - 1)
+                    # compare at the narrower width
+                    min_width = min(k_const.type.width, lookup.type.width)
+                    k_val = k_val & ((1 << min_width) - 1)
+                    l_val = l_val & ((1 << min_width) - 1)
+                if k_val == l_val:
+                    if isinstance(v_expr, StringLiteral):
+                        return ArrayTypeHandler.create_global_string_initializer(
+                            v_expr.value, ir.PointerType(ir.IntType(8)), module)
+                    return VariableTypeHandler._eval_const_expr(v_expr, module)
+            return None
+
+        # Get the array being indexed -- must be a named global
         if not isinstance(array_access.array, Identifier):
             return None  # Can only index into named globals at compile time
         
@@ -1940,7 +2045,49 @@ class VariableTypeHandler:
             )
         
         return ir.Constant(target_type, packed_value)
-    
+
+    @staticmethod
+    def _dict_literal_to_constant(dict_lit, llvm_type: ir.Type, module: ir.Module) -> Optional[ir.Constant]:
+        """Convert a DictLiteral to a compile-time constant struct for global dict initialization.
+        Layout: { K[N], V[N], i32 count }
+        """
+        from fast import StringLiteral, Literal
+        if not isinstance(llvm_type, ir.LiteralStructType) or len(llvm_type.elements) != 3:
+            return None
+
+        keys_arr_type   = llvm_type.elements[0]  # K[N]
+        values_arr_type = llvm_type.elements[1]   # V[N]
+        count_type      = llvm_type.elements[2]   # i32
+
+        entries  = dict_lit.entries
+        n_pairs  = len(entries) // 2
+        capacity = keys_arr_type.count
+
+        key_consts = []
+        val_consts = []
+        for i in range(n_pairs):
+            k_expr = entries[i * 2]
+            v_expr = entries[i * 2 + 1]
+            k_const = VariableTypeHandler.create_global_initializer(k_expr, keys_arr_type.element, module)
+            v_const = VariableTypeHandler.create_global_initializer(v_expr, values_arr_type.element, module)
+            if k_const is None or v_const is None:
+                return None
+            key_consts.append(k_const)
+            val_consts.append(v_const)
+
+        # Pad remaining slots with zero/null
+        zero_k = ir.Constant(keys_arr_type.element, None) if isinstance(keys_arr_type.element, ir.PointerType) else ir.Constant(keys_arr_type.element, 0)
+        zero_v = ir.Constant(values_arr_type.element, None) if isinstance(values_arr_type.element, ir.PointerType) else ir.Constant(values_arr_type.element, 0)
+        while len(key_consts) < capacity:
+            key_consts.append(zero_k)
+            val_consts.append(zero_v)
+
+        keys_const   = ir.Constant(keys_arr_type,   key_consts)
+        values_const = ir.Constant(values_arr_type, val_consts)
+        count_const  = ir.Constant(count_type, n_pairs)
+
+        return ir.Constant(llvm_type, [keys_const, values_const, count_const])
+
     @staticmethod
     def _literal_to_constant(lit, llvm_type: ir.Type) -> ir.Constant:
         """Convert literal to LLVM constant."""
@@ -2009,8 +2156,30 @@ class VariableTypeHandler:
     @staticmethod
     def _eval_const_expr(expr, module: ir.Module) -> Optional[ir.Constant]:
         """Recursively evaluate constant expressions at compile time."""
-        from fast import Literal, Identifier, BinaryOp, UnaryOp, DataType as FastDataType
-        
+        from fast import Literal, Identifier, BinaryOp, UnaryOp, MemberAccess, DataType as FastDataType
+
+        if isinstance(expr, MemberAccess):
+            if not isinstance(expr.object, Identifier):
+                return None
+            gv = module.globals.get(expr.object.name)
+            if gv is None or not hasattr(gv, 'initializer') or gv.initializer is None:
+                return None
+            struct_type = gv.type.pointee if isinstance(gv.type, ir.PointerType) else gv.type
+            if not hasattr(struct_type, 'names'):
+                return None
+            try:
+                idx = struct_type.names.index(expr.member)
+            except ValueError:
+                return None
+            init = gv.initializer
+            # zeroinitializer: constant is None, return zero for the member type
+            if not hasattr(init, 'constant') or init.constant is None:
+                member_type = struct_type.elements[idx]
+                return TypeSystem.get_default_initializer(member_type)
+            if not isinstance(init.constant, (list, tuple)):
+                return None
+            return init.constant[idx]
+
         if isinstance(expr, Literal):
             if expr.type == FastDataType.SINT:
                 return ir.Constant(ir.IntType(32), expr.value)
@@ -4162,6 +4331,14 @@ class FunctionTypeHandler:
     
     @staticmethod
     def convert_type_spec_to_llvm(type_spec, module: ir.Module) -> ir.Type:
+        if type_spec is not None and getattr(type_spec, 'base_type', None) == DataType.DICT:
+            # Dicts are passed and returned by pointer in function signatures.
+            # If the type is already explicitly a pointer (dict{K:V}*), get_llvm_type
+            # already incorporates the pointer depth -- don't add another layer.
+            base = TypeSystem.get_llvm_type(type_spec, module, include_array=True)
+            if getattr(type_spec, 'is_pointer', False):
+                return base  # already a pointer type from get_llvm_type
+            return ir.PointerType(base)
         return TypeSystem.get_llvm_type(type_spec, module, include_array=True)
     
     @staticmethod
@@ -4280,6 +4457,24 @@ class FunctionTypeHandler:
                         if converted_val.type == expected_type:
                             return converted_val
         
+        # Dict pointer coercion: {[N x K], [N x V], i32}* -> {[M x K], [M x V], i32}*
+        # Template instantiation may produce capacity mismatch -- bitcast the pointer.
+        def _is_dict_struct(t):
+            return (isinstance(t, ir.LiteralStructType) and
+                    len(t.elements) == 3 and
+                    isinstance(t.elements[0], ir.ArrayType) and
+                    isinstance(t.elements[1], ir.ArrayType) and
+                    t.elements[2] == ir.IntType(32))
+        if (isinstance(arg_val.type, ir.PointerType) and
+                _is_dict_struct(arg_val.type.pointee) and
+                isinstance(expected_type, ir.PointerType) and
+                _is_dict_struct(expected_type.pointee) and
+                arg_val.type.pointee.elements[0].element == expected_type.pointee.elements[0].element and
+                arg_val.type.pointee.elements[1].element == expected_type.pointee.elements[1].element):
+            if arg_val.type == expected_type:
+                return arg_val
+            return builder.bitcast(arg_val, expected_type, name=f"arg{arg_index}_dict_ptr_cast")
+
         # Struct pointer to struct value: auto-load when passing a struct member by value.
         # e.g. a.position yields Vec3* but the parameter expects Vec3 — load it.
         if (isinstance(arg_val.type, ir.PointerType) and

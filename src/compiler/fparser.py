@@ -1145,6 +1145,9 @@ class FluxParser:
             return self.function_def()
         elif self.expect(TokenType.ENUM):
             return self.enum_def()
+        elif self.peek() and self.peek().type == TokenType.ENUM:
+            # Typed enum: TYPE enum NAME { ... }
+            return self.enum_def()
         elif self.expect(TokenType.UNION):
             return self.union_def()
         elif self.expect(TokenType.STRUCT):
@@ -1217,7 +1220,7 @@ class FluxParser:
             return self.variable_declaration_statement()
         elif self.expect(TokenType.SINT, TokenType.UINT, TokenType.DATA, TokenType.CHAR, TokenType.BYTE, 
                          TokenType.FLOAT_KW, TokenType.DOUBLE_KW, TokenType.BOOL_KW, TokenType.VOID,
-                         TokenType.SLONG, TokenType.ULONG):
+                         TokenType.SLONG, TokenType.ULONG, TokenType.DICT):
             return self.variable_declaration_statement()
         elif self.expect(TokenType.DITTO):
             import copy
@@ -2689,10 +2692,14 @@ class FluxParser:
 
     def enum_def(self) -> Union[EnumDefStatement, List[EnumDefStatement]]:
         """
-        enum_def -> 'enum' IDENTIFIER (',' IDENTIFIER)* (';' | '{' enum_item (',' enum_item)* '}' ';')
+        enum_def -> ('enum' | type_spec 'enum') IDENTIFIER (',' IDENTIFIER)* (';' | '{' enum_item (',' enum_item)* '}' ';')
         enum_item -> IDENTIFIER ('=' INTEGER)?
         """
         tok = self.current_token
+        # Parse optional underlying type before the 'enum' keyword
+        underlying_type = None
+        if not self.expect(TokenType.ENUM):
+            underlying_type = self.type_spec()
         self.consume(TokenType.ENUM)
         name = self.consume(TokenType.IDENTIFIER, f"Expected: enumurated list name after enum keyword at Line {self.current_token.line:,.0f}:{self.current_token.column} in build\\tmp.fx").value
         
@@ -2707,8 +2714,8 @@ class FluxParser:
             self.advance()
             # Return multiple prototypes if comma-separated
             if len(names) > 1:
-                return [EnumDefStatement(EnumDef(n, {})).set_location(tok.line, tok.column) for n in names]
-            return EnumDefStatement(EnumDef(name, {})).set_location(tok.line, tok.column)
+                return [EnumDefStatement(EnumDef(n, {}, underlying_type)).set_location(tok.line, tok.column) for n in names]
+            return EnumDefStatement(EnumDef(name, {}, underlying_type)).set_location(tok.line, tok.column)
         
         # Full definition - only allowed for single name
         if len(names) > 1:
@@ -2740,7 +2747,7 @@ class FluxParser:
         
         self.consume(TokenType.RIGHT_BRACE)
         self.consume(TokenType.SEMICOLON)
-        return EnumDefStatement(EnumDef(name, values)).set_location(tok.line, tok.column)
+        return EnumDefStatement(EnumDef(name, values, underlying_type)).set_location(tok.line, tok.column)
 
 
     def macro_def(self) -> macroDefStatement:
@@ -3827,7 +3834,7 @@ class FluxParser:
                     objects.extend(obj_result)
                 else:
                     objects.append(obj_result)
-            elif self.expect(TokenType.ENUM):
+            elif self.expect(TokenType.ENUM) or (self.peek() and self.peek().type == TokenType.ENUM):
                 enum_result = self.enum_def()
                 # Handle both single enum and list of enums (comma-separated prototypes)
                 if isinstance(enum_result, list):
@@ -3998,6 +4005,25 @@ class FluxParser:
         # Handle custom type names
         if isinstance(base_type_result, list):
             base_type = base_type_result[0]
+            if base_type == DataType.DICT:
+                # Don't early-return -- fall through so pointer suffix (*) is parsed
+                _dict_key_ts = base_type_result[1]
+                _dict_val_ts = base_type_result[2]
+                # Parse pointer suffix then build the TypeSystem
+                _dict_ptr_depth = 0
+                while self.expect(TokenType.MULTIPLY):
+                    _dict_ptr_depth += 1
+                    self.advance()
+                return TypeSystem(
+                    base_type=DataType.DICT,
+                    dict_key_type=_dict_key_ts,
+                    dict_value_type=_dict_val_ts,
+                    storage_class=storage_class,
+                    is_const=is_const,
+                    is_volatile=is_volatile,
+                    is_pointer=_dict_ptr_depth > 0,
+                    pointer_depth=_dict_ptr_depth,
+                )
             custom_typename = base_type_result[1]
         else:
             base_type = base_type_result
@@ -4294,6 +4320,15 @@ class FluxParser:
         elif self.expect(TokenType.DATA):
             self.advance()
             return DataType.DATA
+        elif self.expect(TokenType.DICT):
+            # dict{K:V} -- consume 'dict', then parse {KeyType:ValueType}
+            self.advance()
+            self.consume(TokenType.LEFT_BRACE)
+            key_ts = self.type_spec()
+            self.consume(TokenType.COLON)
+            val_ts = self.type_spec()
+            self.consume(TokenType.RIGHT_BRACE)
+            return [DataType.DICT, key_ts, val_ts]
         elif self.expect(TokenType.VOID):
             self.advance()
             return DataType.VOID
@@ -4363,7 +4398,7 @@ class FluxParser:
             if not self.expect(TokenType.SINT, TokenType.UINT, TokenType.FLOAT_KW, TokenType.DOUBLE_KW,
                              TokenType.CHAR,  TokenType.BOOL_KW, TokenType.BYTE, TokenType.DATA, TokenType.VOID, 
                              TokenType.SLONG, TokenType.ULONG,
-                             TokenType.STRUCT, TokenType.OBJECT, TokenType.IDENTIFIER):
+                             TokenType.STRUCT, TokenType.OBJECT, TokenType.IDENTIFIER, TokenType.DICT):
                 return False
             
             self.advance()
@@ -5124,7 +5159,61 @@ class FluxParser:
                 self.advance()
                 init_expr = self.expression()
 
-                # Sugar: if the type is a known object with exactly one __init param,
+                if type_spec.base_type == DataType.DICT:
+                    def _dict_ts_key(ts):
+                        if ts is None:
+                            return 'unknown'
+                        base = ts.custom_typename if ts.custom_typename else str(ts.base_type)
+                        return base + ('*' * ts.pointer_depth if ts.pointer_depth else '')
+                    # Collect all dict operand type_specs from the RHS expression tree
+                    operand_types = []
+                    stack = [init_expr]
+                    while stack:
+                        expr = stack.pop()
+                        if hasattr(expr, 'operator') and hasattr(expr, 'left') and hasattr(expr, 'right'):
+                            stack.append(expr.left)
+                            stack.append(expr.right)
+                        elif hasattr(expr, 'name'):
+                            entry = self.symbol_table.lookup_variable(expr.name)
+                            if (entry and entry.type_spec and
+                                    getattr(entry.type_spec, 'base_type', None) == DataType.DICT):
+                                operand_types.append(entry.type_spec)
+                    # 1. Check operands are compatible with each other
+                    if len(operand_types) > 1:
+                        ref = operand_types[0]
+                        for ots in operand_types[1:]:
+                            if (_dict_ts_key(ots.dict_key_type)   != _dict_ts_key(ref.dict_key_type) or
+                                    _dict_ts_key(ots.dict_value_type) != _dict_ts_key(ref.dict_value_type)):
+                                self.error(
+                                    f"Dict operands are incompatible: "
+                                    f"dict{{{_dict_ts_key(ref.dict_key_type)}:{_dict_ts_key(ref.dict_value_type)}}} "
+                                    f"cannot be combined with "
+                                    f"dict{{{_dict_ts_key(ots.dict_key_type)}:{_dict_ts_key(ots.dict_value_type)}}}"
+                                )
+                    # 2. Check RHS result type matches declared type
+                    rhs_ts = operand_types[0] if operand_types else None
+                    if rhs_ts is not None:
+                        dk = _dict_ts_key(type_spec.dict_key_type)
+                        dv = _dict_ts_key(type_spec.dict_value_type)
+                        rk = _dict_ts_key(rhs_ts.dict_key_type)
+                        rv = _dict_ts_key(rhs_ts.dict_value_type)
+                        if dk != rk or dv != rv:
+                            self.error(
+                                f"Dict type mismatch: declared dict{{{dk}:{dv}}} "
+                                f"is incompatible with dict{{{rk}:{rv}}}"
+                            )
+
+                    # Propagate _known_keys: union of all operand known keys
+                    if operand_types:
+                        all_known = set()
+                        all_have_keys = True
+                        for ots in operand_types:
+                            if hasattr(ots, '_known_keys') and ots._known_keys is not None:
+                                all_known |= ots._known_keys
+                            else:
+                                all_have_keys = False
+                        if all_have_keys:
+                            type_spec._known_keys = all_known
                 # rewrite `ObjType name = expr` as a constructor call `ObjType name(expr)`
                 # Skip the sugar when the RHS is itself a custom operator call or any
                 # FunctionCall whose name is registered as returning this object type -
@@ -5150,10 +5239,30 @@ class FluxParser:
                         type_spec.is_pointer and type_spec.base_type == DataType.BYTE):
                     self._comptime_strings[name] = init_expr.value
             elif self.expect(TokenType.LEFT_BRACE):
-                self.error(
-                    f"Expected {TokenType.ASSIGN.name}, got {TokenType.LEFT_BRACE.name}",
-                    expected_type=TokenType.ASSIGN,
-                )
+                if type_spec.base_type == DataType.DICT:
+                    # dict{K:V} Name { k1: v1, k2: v2, ... };
+                    self.advance()  # consume '{'
+                    entries = []
+                    while not self.expect(TokenType.RIGHT_BRACE):
+                        key_expr = self.expression()
+                        self.consume(TokenType.COLON)
+                        val_expr = self.expression()
+                        entries.append(key_expr)
+                        entries.append(val_expr)
+                        if self.expect(TokenType.COMMA):
+                            self.advance()
+                    self.consume(TokenType.RIGHT_BRACE)
+                    capacity = len(entries) // 2
+                    type_spec.dict_capacity = capacity
+                    # Store known string keys for compile-time lookup validation
+                    if all(isinstance(entries[i * 2], StringLiteral) for i in range(capacity)):
+                        type_spec._known_keys = {entries[i * 2].value for i in range(capacity)}
+                    initializers.append(DictLiteral(entries).set_location(tok.line, tok.column))
+                else:
+                    self.error(
+                        f"Expected {TokenType.ASSIGN.name}, got {TokenType.LEFT_BRACE.name}",
+                        expected_type=TokenType.ASSIGN,
+                    )
             else:
                 initializers.append(None)
             
@@ -5789,6 +5898,21 @@ class FluxParser:
         
         self.consume(TokenType.RIGHT_BRACE)
         self.consume(TokenType.SEMICOLON)
+
+        # Tagged union switch (v.#) is exhaustively checked at codegen -- no default required.
+        # All other switches must have a default case.
+        is_tagged_union_switch = (
+            isinstance(expression, MemberAccess) and
+            expression.member == '#'
+        )
+        if not is_tagged_union_switch:
+            has_default = any(c.value is None for c in cases)
+            if not has_default:
+                saved = self.current_token
+                self.current_token = tok
+                self.error("Switch statement requires a default case", TokenType.DEFAULT)
+                self.current_token = saved
+
         return SwitchStatement(expression, cases).set_location(tok.line, tok.column)
     
     def switch_case(self) -> Case:
@@ -7033,12 +7157,30 @@ class FluxParser:
             if param_ts is None:
                 continue
 
+            # Dict param: dict{T:U} -- infer T and U from the argument's dict type spec
+            if param_ts.base_type == DataType.DICT:
+                arg = args[i]
+                arg_entry = self.symbol_table.lookup_variable(arg.name) if isinstance(arg, Identifier) else None
+                arg_ts = arg_entry.type_spec if arg_entry else None
+                if arg_ts is None and isinstance(arg, Identifier):
+                    arg_ts = self.symbol_table.get_type_spec(arg.name)
+                if arg_ts is not None and getattr(arg_ts, 'base_type', None) == DataType.DICT:
+                    key_param = getattr(param_ts.dict_key_type, 'custom_typename', None) or (
+                        param_ts.dict_key_type.base_type if isinstance(getattr(param_ts.dict_key_type, 'base_type', None), str) else None)
+                    val_param = getattr(param_ts.dict_value_type, 'custom_typename', None) or (
+                        param_ts.dict_value_type.base_type if isinstance(getattr(param_ts.dict_value_type, 'base_type', None), str) else None)
+                    if key_param and key_param in template_param_names and key_param not in inferred:
+                        inferred[key_param] = arg_ts.dict_key_type
+                    if val_param and val_param in template_param_names and val_param not in inferred:
+                        inferred[val_param] = arg_ts.dict_value_type
+                    # Store the full arg dict TypeSystem keyed by param index for capacity patching
+                    inferred[f'__dict_arg_ts_{i}__'] = arg_ts
+                continue
+
             param_tname = (
                 param_ts.custom_typename if param_ts.custom_typename
                 else (param_ts.base_type if isinstance(param_ts.base_type, str) else None)
             )
-
-            # Deferred struct param: "Tensor<T>" – build struct_param_map then clear param_tname
             struct_param_map = {}  # template_param_name -> inner arg index
             if param_tname and '<' in param_tname and '>' in param_tname:
                 bracket = param_tname.index('<')
@@ -7188,6 +7330,16 @@ class FluxParser:
         import copy
         if not isinstance(ts, TypeSystem):
             return ts
+        # Dict type: substitute T and U in dict_key_type and dict_value_type
+        if ts.base_type == DataType.DICT:
+            new_key = self._substitute_type(ts.dict_key_type, mapping) if ts.dict_key_type else ts.dict_key_type
+            new_val = self._substitute_type(ts.dict_value_type, mapping) if ts.dict_value_type else ts.dict_value_type
+            if new_key is not ts.dict_key_type or new_val is not ts.dict_value_type:
+                result = copy.copy(ts)
+                result.dict_key_type = new_key
+                result.dict_value_type = new_val
+                return result
+            return copy.copy(ts)
         name = ts.custom_typename if ts.custom_typename else (
             ts.base_type if isinstance(ts.base_type, str) else None)
         if name and name in mapping:
@@ -7680,6 +7832,26 @@ class FluxParser:
 
             # Deep-copy + substitute
             concrete_func = self._substitute_template(template_func, mapping)
+
+            # Patch dict parameter capacities: after substitution, dict params have
+            # capacity 0 because the template declared dict{T:U} with no literal.
+            # Fill in the actual capacity from the call-site arg type specs.
+            _dict_arg_ts_map = getattr(self, '_pending_dict_arg_ts', {})
+            for p_idx, param in enumerate(concrete_func.parameters):
+                if (param.type_spec is not None and
+                        getattr(param.type_spec, 'base_type', None) == DataType.DICT and
+                        (param.type_spec.dict_capacity is None or param.type_spec.dict_capacity == 0)):
+                    arg_ts = _dict_arg_ts_map.get(f'__dict_arg_ts_{p_idx}__')
+                    if arg_ts is not None and arg_ts.dict_capacity:
+                        param.type_spec.dict_capacity = arg_ts.dict_capacity
+            # Also patch return type if it's a dict with capacity 0
+            if (concrete_func.return_type is not None and
+                    getattr(concrete_func.return_type, 'base_type', None) == DataType.DICT and
+                    (concrete_func.return_type.dict_capacity is None or concrete_func.return_type.dict_capacity == 0)):
+                for arg_ts in _dict_arg_ts_map.values():
+                    if arg_ts is not None and arg_ts.dict_capacity:
+                        concrete_func.return_type.dict_capacity = arg_ts.dict_capacity
+                        break
             concrete_func.name = func_name  # Keep original name; normal mangling handles uniqueness
             if getattr(template_func, '_is_comptime_only', False):
                 concrete_func._is_comptime_only = True
@@ -8219,7 +8391,7 @@ class FluxParser:
                         f"and could not be inferred - it must be supplied explicitly"
                     )
                     self.current_token = _saved_tok3
-            if len(inferred) == len(template_param_names):
+            if sum(1 for k in inferred if not k.startswith('__dict_arg_ts_')) == len(template_param_names):
                 type_names = [self._type_system_to_mangle_str(inferred[p]) for p in template_param_names]
                 type_specs = [inferred[p] for p in template_param_names]
                 # Reject self-referential inferences: if any mangle string equals a template
@@ -8233,8 +8405,12 @@ class FluxParser:
                         _arg_pos.get(p, (None, None))
                         for p in template_param_names
                     ]
+                    # Collect concrete dict arg TypeSystems for capacity patching
+                    _dict_arg_ts_map = {k: v for k, v in inferred.items() if k.startswith('__dict_arg_ts_')}
+                    self._pending_dict_arg_ts = _dict_arg_ts_map
                     mangled = self._resolve_template_call(expr.name, type_names, type_specs,
                                                           arg_positions=_positions)
+                    self._pending_dict_arg_ts = {}
                     self.current_token = _saved_tok
                     expr = FunctionCall(mangled, args).set_location(tok.line, tok.column)
             else:
@@ -8298,6 +8474,16 @@ class FluxParser:
                         expr = RangeAssignment(expr, start_index.start, start_index.end, fill).set_location(tok.line, tok.column)
                         # RangeAssignment is a statement; break out of postfix loop
                         break
+                    # Dict key validation: if expr is a known dict and key is a string literal,
+                    # verify the key exists at compile time.
+                    if isinstance(expr, Identifier):
+                        _dict_entry = self.symbol_table.lookup_variable(expr.name)
+                        if (_dict_entry and _dict_entry.type_spec and
+                                getattr(_dict_entry.type_spec, 'base_type', None) == DataType.DICT and
+                                isinstance(start_index, StringLiteral)):
+                            _known_keys = getattr(_dict_entry.type_spec, '_known_keys', None)
+                            if _known_keys is not None and start_index.value not in _known_keys:
+                                self.error(f"Key \"{start_index.value}\" does not exist in dict '{expr.name}'")
                     expr = ArrayAccess(expr, start_index).set_location(tok.line, tok.column)
             elif self.expect(TokenType.LEFT_PAREN):
                 # Function call
@@ -8842,6 +9028,21 @@ class FluxParser:
             self.advance()
             self.consume(TokenType.RIGHT_PAREN)
             return AcceptorPlaceholder(index).set_location(tok.line, tok.column)
+        elif self.expect(TokenType.DICT_LITERAL):
+            tok = self.current_token
+            self.advance()  # consume 'd{'
+            keys = []
+            values = []
+            while not self.expect(TokenType.RIGHT_BRACE):
+                k = self.expression()
+                self.consume(TokenType.COLON)
+                v = self.expression()
+                keys.append(k)
+                values.append(v)
+                if self.expect(TokenType.COMMA):
+                    self.advance()
+            self.consume(TokenType.RIGHT_BRACE)
+            return DictLiteralExpr(keys=keys, values=values).set_location(tok.line, tok.column)
         elif self.expect(TokenType.LEFT_BRACE):
             return self.struct_literal()
         elif self.expect(TokenType.SIZEOF):

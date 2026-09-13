@@ -509,6 +509,18 @@ struct BMP : Header, InfoHeader
 } : ExtraData;
 ```
 
+## Block assignment
+Below is an example snippet from the standard library in `runtime\allocators.fx` around line 415. If the object[at this index] is a struct, you can do block assignment instead of writing `new_tbl[rm_hole]` 4 times.
+```
+new_tbl[rm_hole]
+{
+    .key  = new_tbl[rm_next].key;
+    .size = new_tbl[rm_next].size;
+    .kind = new_tbl[rm_next].kind;
+    .slab = new_tbl[rm_next].slab;
+};
+```
+
 ---
 
 <a id="struct-recast-with-from"></a>
@@ -1515,6 +1527,23 @@ techniques" - `hash[0..3] = (byte[4])(be32)ctx.state[0];` relies on exactly this
 element-0-is-high-bits ordering to place the most significant byte of `ctx.state[0]` at
 `hash[0]`.
 
+## Block initialization with `{}`
+```
+noopstr[3] test =
+[
+    "String 1", // this is a list of items, not assignment statements
+    "string 2",
+    "string 3!"
+];
+
+test
+{
+    [0] = "New string!";    // these desugar to individual assignments
+    [1] = "Another one!";   // like test[0] = "New string!"; <- would be required here, so sugar requires it
+    [2] = "Changed again?"; //
+};
+```
+
 ---
 
 <a id="loops"></a>
@@ -1783,7 +1812,39 @@ Definition: `enum myEnum {val1, val2, val3, val4, ...};`
 Instance: `myEnum newEnum;`
 Member access: `newEnum.val1;`
 
-Enumerated lists are type `int`, this will be updated to support `type enum Ident {};` syntax.
+Enumerated lists are type `int` by default. Each item in an enumerated list has an associated ordinality if no value is set. Imagine we want to name index values so we don't have to remember the indexes themselves.
+
+```
+enum Skills
+{
+    FIREBOLT,    // 0
+    ICE_SHARD,   // 1
+    THUNDERSTORM // 2
+    //...
+    // 999
+};
+```
+
+Now say we need something more specific, like named pointers. We can't use `int` on a 64 bit system to store a 64 bit address, so we use a typed enum by putting a type before the `enum` keyword:
+```
+u64 enum PointerMap
+{
+    DedupSchedule   = 0xDEADBEEFCAFEFOOD,
+    ReallocEntities = 0xFFFF00000037EADC,
+    _Function3      = 0xF000000000000001,
+    //...
+    //
+};
+```
+
+Then we can create a function pointer to that function:
+```
+PointerMap pm;
+
+def foo() -> void = @pm.DedupSchedule;
+
+foo();
+```
 
 ---
 
@@ -1897,6 +1958,67 @@ def main() -> int
     return 0;
 };
 ```
+
+---
+
+<a id="dict"></a>
+## **Dictionaries**
+
+Definition: `dict{KeyType:ValueType} myDict`  
+Instance with initializer:
+```
+dict{"":""} myDict
+{
+    "Hello": "World!",
+    "hey": "you"
+};
+```
+
+Access: `myDict["Hello"]`  
+Merge: `dict{"":""} merged = myDict + myDict2;`
+
+Dictionaries are key-value stores with a homogeneous key type and homogeneous value type declared in the `dict{K:V}` type specifier.
+```
+dict{"":""} greetings
+{
+    "en": "Hello",
+    "es": "Hola",
+    "jp": "Konnichiwa"
+};
+
+println(greetings["en"]); // Hello
+```
+
+Dictionaries can be passed to and returned from functions using the templated `dict{T:U}` type:
+```
+def foo<T,U>(dict{T:U} d) -> dict{T:U}
+{
+   -> d;
+};
+```
+
+Dictionaries can be merged with `+`:
+```
+dict{"":""} a { "x": "1" };
+dict{"":""} b { "y": "2" };
+dict{"":""} c = a + b;
+```
+
+
+### Inline dict literals with `d{}`
+
+A `d{}` expression creates an anonymous dict inline without declaring a named variable. The result can be immediately accessed with `[key]`:
+
+byte* status = d{(a.logged_in):"Logged In", (!a.logged_in):"Guest"}[true];
+
+
+When all keys and values are compile-time constants, the entire expression folds at compile time and is baked directly into the binary with no runtime cost.
+
+// Compile-time constant -- no runtime dict lookup
+byte* msg = d{true:"yes", false:"no"}[true];
+
+
+The `[key]` access on a `d{}` expression is handled by the existing array access postfix, so the inline dict participates naturally in any expression context.
 
 ---
 

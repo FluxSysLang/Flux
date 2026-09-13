@@ -240,6 +240,33 @@ def _member_access_get_ptr(node, builder: ir.IRBuilder, module: ir.Module) -> ir
     from fast import Identifier
     if isinstance(node.object, Identifier):
         var_name = node.object.name
+
+        # Check: is node.object an enum type name (MyE2.A)?
+        if MemberAccessTypeHandler.is_enum_type(var_name, module):
+            enum_entry = module.symbol_table.lookup_any(var_name) if hasattr(module, 'symbol_table') else None
+            enum_llvm_type = enum_entry.llvm_type if enum_entry is not None else None
+            if isinstance(enum_llvm_type, (ir.LiteralStructType, ir.IdentifiedStructType)):
+                global_name = f"{var_name}.{node.member}"
+                global_var = module.globals.get(global_name)
+                if global_var is not None:
+                    return global_var
+                raise ValueError(f"_member_access_get_ptr: Enum member '{node.member}' not found in enum '{var_name}'")
+
+        # Check: is node.object a variable whose declared type is an enum (E2.A)?
+        if hasattr(module, 'symbol_table'):
+            var_entry = module.symbol_table.lookup_variable(var_name)
+            if var_entry is not None and var_entry.type_spec is not None:
+                enum_type_name = getattr(var_entry.type_spec, 'custom_typename', None)
+                if enum_type_name and MemberAccessTypeHandler.is_enum_type(enum_type_name, module):
+                    enum_entry = module.symbol_table.lookup_any(enum_type_name)
+                    enum_llvm_type = enum_entry.llvm_type if enum_entry is not None else None
+                    if isinstance(enum_llvm_type, (ir.LiteralStructType, ir.IdentifiedStructType)):
+                        global_name = f"{enum_type_name}.{node.member}"
+                        global_var = module.globals.get(global_name)
+                        if global_var is not None:
+                            return global_var
+                        raise ValueError(f"_member_access_get_ptr: Enum member '{node.member}' not found in enum '{enum_type_name}'")
+
         if var_name == "this":
             obj_val = node.object.codegen(builder, module)
             if MemberAccessTypeHandler.is_this_double_pointer(obj_val):
@@ -1586,6 +1613,28 @@ class CodegenVisitor:
         lhs = self.visit(node.left, builder, module)
         rhs = self.visit(node.right, builder, module)
 
+        # Dict + Dict: type-check and produce merged dict
+        from fast import Identifier as _Ident
+        _lhs_name = node.left.name  if isinstance(node.left,  _Ident) else None
+        _rhs_name = node.right.name if isinstance(node.right, _Ident) else None
+        _lhs_dict = (module._dict_types.get(_lhs_name) if hasattr(module, '_dict_types') and _lhs_name else None)
+        _rhs_dict = (module._dict_types.get(_rhs_name) if hasattr(module, '_dict_types') and _rhs_name else None)
+        if _lhs_dict is not None or _rhs_dict is not None:
+            if _lhs_dict is None or _rhs_dict is None:
+                raise FluxCodegenError("Dict operator '+' requires both operands to be dicts", node, module)
+            if node.operator is not Operator.ADD:
+                raise FluxCodegenError(f"Unsupported operator '{node.operator.value}' for dict types", node, module)
+            # Type check: key and value types must match
+            def _ts_str(ts):
+                return repr(ts) if ts is not None else 'unknown'
+            lk, lv = _ts_str(_lhs_dict['key_type']), _ts_str(_lhs_dict['value_type'])
+            rk, rv = _ts_str(_rhs_dict['key_type']), _ts_str(_rhs_dict['value_type'])
+            if lk != rk or lv != rv:
+                raise FluxCodegenError(
+                    f"Dict type mismatch: cannot combine dict{{{lk}:{lv}}} with dict{{{rk}:{rv}}}",
+                    node, module)
+            return self._dict_merge(node, builder, module, _lhs_name, _rhs_name, lhs, rhs, _lhs_dict, _rhs_dict)
+
         # Built-in operator overload check
         if hasattr(module, '_function_overloads'):
             op_func_name = f"operator__{_mangle_builtin_op(node.operator.value)}"
@@ -2904,6 +2953,36 @@ class CodegenVisitor:
                     builder.store(val, out_ptr)
         return asm_result
 
+    def visit_DictLiteralExpr(self, node, builder, module):
+        from fast import DictLiteralExpr as _DLE
+        capacity = len(node.keys)
+        i32 = ir.IntType(32)
+
+        key_vals = [self.visit(k, builder, module) for k in node.keys]
+        val_vals = [self.visit(v, builder, module) for v in node.values]
+
+        key_llvm = key_vals[0].type if key_vals else i32
+        val_llvm = val_vals[0].type if val_vals else i32
+
+        keys_arr_ty = ir.ArrayType(key_llvm, capacity)
+        vals_arr_ty = ir.ArrayType(val_llvm, capacity)
+        struct_ty   = ir.LiteralStructType([keys_arr_ty, vals_arr_ty, i32])
+
+        dict_ptr = builder.alloca(struct_ty, name="dictlit")
+        builder.store(ir.Constant(struct_ty, ir.Undefined), dict_ptr)
+
+        zero = ir.Constant(i32, 0)
+        for i, kv in enumerate(key_vals):
+            kptr = builder.gep(dict_ptr, [zero, zero, ir.Constant(i32, i)], inbounds=True)
+            builder.store(kv, kptr)
+        for i, vv in enumerate(val_vals):
+            vptr = builder.gep(dict_ptr, [zero, ir.Constant(i32, 1), ir.Constant(i32, i)], inbounds=True)
+            builder.store(vv, vptr)
+        cnt_ptr = builder.gep(dict_ptr, [zero, ir.Constant(i32, 2)], inbounds=True)
+        builder.store(ir.Constant(i32, capacity), cnt_ptr)
+
+        return dict_ptr
+
     def visit_ArrayLiteral(self, node, builder, module):
         if node.is_string:
             return self._array_literal_string(node, builder, module)
@@ -3744,15 +3823,55 @@ class CodegenVisitor:
         if isinstance(node.object, Identifier):
             type_name = node.object.name
             if MemberAccessTypeHandler.is_enum_type(type_name, module):
-                return ir.Constant(ir.IntType(32), MemberAccessTypeHandler.get_enum_value(type_name, node.member, module))
+                enum_entry = module.symbol_table.lookup_any(type_name) if hasattr(module, 'symbol_table') else None
+                enum_llvm_type = enum_entry.llvm_type if enum_entry is not None else ir.IntType(32)
+                if isinstance(enum_llvm_type, (ir.LiteralStructType, ir.IdentifiedStructType)):
+                    # Struct-typed enum: return the global variable (pointer to struct) for member access
+                    global_name = f"{type_name}.{node.member}"
+                    global_var = module.globals.get(global_name)
+                    if global_var is not None:
+                        return global_var
+                    raise FluxCodegenError(f"Enum member '{node.member}' not found in enum '{type_name}'", node, module)
+                return ir.Constant(enum_llvm_type, MemberAccessTypeHandler.get_enum_value(type_name, node.member, module))
             mangled_type_name = IdentifierTypeHandler.resolve_namespace_mangled_name(type_name, module)
             if mangled_type_name and MemberAccessTypeHandler.is_enum_type(mangled_type_name, module):
-                return ir.Constant(ir.IntType(32), MemberAccessTypeHandler.get_enum_value(mangled_type_name, node.member, module))
+                enum_entry = module.symbol_table.lookup_any(mangled_type_name) if hasattr(module, 'symbol_table') else None
+                enum_llvm_type = enum_entry.llvm_type if enum_entry is not None else ir.IntType(32)
+                if isinstance(enum_llvm_type, (ir.LiteralStructType, ir.IdentifiedStructType)):
+                    global_name = f"{mangled_type_name}.{node.member}"
+                    global_var = module.globals.get(global_name)
+                    if global_var is not None:
+                        return global_var
+                    raise FluxCodegenError(f"Enum member '{node.member}' not found in enum '{mangled_type_name}'", node, module)
+                return ir.Constant(enum_llvm_type, MemberAccessTypeHandler.get_enum_value(mangled_type_name, node.member, module))
             if not mangled_type_name and hasattr(module, '_enum_types'):
                 suffix = f"__{type_name}"
                 for key in module._enum_types:
                     if key == type_name or key.endswith(suffix):
-                        return ir.Constant(ir.IntType(32), MemberAccessTypeHandler.get_enum_value(key, node.member, module))
+                        enum_entry = module.symbol_table.lookup_any(key) if hasattr(module, 'symbol_table') else None
+                        enum_llvm_type = enum_entry.llvm_type if enum_entry is not None else ir.IntType(32)
+                        if isinstance(enum_llvm_type, (ir.LiteralStructType, ir.IdentifiedStructType)):
+                            global_name = f"{key}.{node.member}"
+                            global_var = module.globals.get(global_name)
+                            if global_var is not None:
+                                return global_var
+                            raise FluxCodegenError(f"Enum member '{node.member}' not found in enum '{key}'", node, module)
+                        return ir.Constant(enum_llvm_type, MemberAccessTypeHandler.get_enum_value(key, node.member, module))
+            # Variable whose declared type is an enum: var.MEMBER -> EnumType.MEMBER
+            if hasattr(module, 'symbol_table'):
+                var_entry = module.symbol_table.lookup_variable(type_name)
+                if var_entry is not None and var_entry.type_spec is not None:
+                    enum_type_name = getattr(var_entry.type_spec, 'custom_typename', None)
+                    if enum_type_name and MemberAccessTypeHandler.is_enum_type(enum_type_name, module):
+                        enum_entry = module.symbol_table.lookup_any(enum_type_name)
+                        enum_llvm_type = enum_entry.llvm_type if enum_entry is not None else ir.IntType(32)
+                        if isinstance(enum_llvm_type, (ir.LiteralStructType, ir.IdentifiedStructType)):
+                            global_name = f"{enum_type_name}.{node.member}"
+                            global_var = module.globals.get(global_name)
+                            if global_var is not None:
+                                return global_var
+                            raise FluxCodegenError(f"Enum member '{node.member}' not found in enum '{enum_type_name}'", node, module)
+                        return ir.Constant(enum_llvm_type, MemberAccessTypeHandler.get_enum_value(enum_type_name, node.member, module))
         # Suppress __expr promotion: visiting the LHS of a member access must yield
         # the raw struct pointer, not the promoted expression value.
         prev_in_member_access = getattr(self, '_in_member_access', False)
@@ -4356,9 +4475,233 @@ class CodegenVisitor:
         builder.store(func_value, ptr_storage)
         return func_value
 
+    def _dict_merge(self, node, builder, module, lhs_name, rhs_name, lhs_ptr, rhs_ptr, lhs_info, rhs_info):
+        """Produce a new merged dict from two same-typed dicts. Result is unnamed/temporary."""
+        from fast import Identifier
+        lhs_cap = lhs_info['capacity']
+        rhs_cap = rhs_info['capacity']
+        new_cap  = lhs_cap + rhs_cap
+
+        key_llvm   = lhs_info['key_llvm']
+        value_llvm = lhs_info['value_llvm']
+        keys_arr   = ir.ArrayType(key_llvm,   new_cap)
+        vals_arr   = ir.ArrayType(value_llvm, new_cap)
+        count_type = ir.IntType(32)
+        new_struct = ir.LiteralStructType([keys_arr, vals_arr, count_type])
+
+        alloca = builder.alloca(new_struct, name="dict_merged")
+        builder.store(ir.Constant(new_struct, None), alloca)
+        i32  = ir.IntType(32)
+        zero = ir.Constant(i32, 0)
+
+        def _copy_entries(src_ptr, src_cap, dst_offset):
+            for i in range(src_cap):
+                sk = builder.gep(src_ptr, [zero, zero,           ir.Constant(i32, i)], inbounds=True)
+                sv = builder.gep(src_ptr, [zero, ir.Constant(i32, 1), ir.Constant(i32, i)], inbounds=True)
+                dk = builder.gep(alloca,  [zero, zero,           ir.Constant(i32, dst_offset + i)], inbounds=True)
+                dv = builder.gep(alloca,  [zero, ir.Constant(i32, 1), ir.Constant(i32, dst_offset + i)], inbounds=True)
+                builder.store(builder.load(sk, name=f"mk{i}"), dk)
+                builder.store(builder.load(sv, name=f"mv{i}"), dv)
+
+        _copy_entries(lhs_ptr, lhs_cap, 0)
+        _copy_entries(rhs_ptr, rhs_cap, lhs_cap)
+
+        count_ptr = builder.gep(alloca, [zero, ir.Constant(i32, 2)], inbounds=True)
+        builder.store(ir.Constant(count_type, new_cap), count_ptr)
+
+        return alloca
+
+    def _dict_access_from_ptr(self, dict_ptr, struct_type, index_node, builder, module):
+        """Dict key lookup given a direct pointer to the dict struct."""
+        capacity   = struct_type.elements[0].count
+        key_llvm   = struct_type.elements[0].element
+        value_llvm = struct_type.elements[1].element
+
+        lookup_key = self.visit(index_node, builder, module)
+
+        i32  = ir.IntType(32)
+        zero = ir.Constant(i32, 0)
+        func = builder.function
+
+        tmp_name = f"dictexpr_{id(dict_ptr)}"
+        merge_bb = func.append_basic_block(f"dict_merge_{tmp_name}")
+        result_ptr_alloca = builder.alloca(value_llvm.as_pointer(), name=f"{tmp_name}_result_ptr")
+        builder.store(ir.Constant(value_llvm.as_pointer(), None), result_ptr_alloca)
+
+        check_bbs = [func.append_basic_block(f"dict_check_{tmp_name}_{i}") for i in range(capacity)]
+        found_bbs = [func.append_basic_block(f"dict_found_{tmp_name}_{i}") for i in range(capacity)]
+
+        builder.branch(check_bbs[0]) if capacity else builder.branch(merge_bb)
+
+        for i in range(capacity):
+            builder.position_at_end(check_bbs[i])
+            key_ptr = builder.gep(dict_ptr, [zero, zero, ir.Constant(i32, i)], inbounds=True)
+            stored_key = builder.load(key_ptr, name=f"key_{i}")
+            if isinstance(key_llvm, ir.PointerType) and isinstance(key_llvm.pointee, ir.IntType) and key_llvm.pointee.width == 8:
+                i8ptr = ir.PointerType(ir.IntType(8))
+                lk = lookup_key
+                if isinstance(lk.type, ir.PointerType) and isinstance(lk.type.pointee, ir.ArrayType):
+                    lk = builder.gep(lk, [zero, zero], inbounds=True, name=f"lk_decay_{i}")
+                strcmp_ty = ir.FunctionType(ir.IntType(32), [i8ptr, i8ptr])
+                strcmp_fn = module.globals.get('strcmp') or ir.Function(module, strcmp_ty, name='strcmp')
+                if not isinstance(strcmp_fn, ir.Function):
+                    strcmp_fn = ir.Function(module, strcmp_ty, name='strcmp')
+                strcmp_fn.linkage = 'external'
+                cmp_result = builder.call(strcmp_fn, [stored_key, lk], name=f"strcmp_{i}")
+                cmp = builder.icmp_signed('==', cmp_result, ir.Constant(ir.IntType(32), 0), name=f"keycmp_{i}")
+            elif isinstance(key_llvm, ir.PointerType):
+                cmp = builder.icmp_unsigned('==', stored_key, lookup_key, name=f"keycmp_{i}")
+            else:
+                lk = lookup_key
+                if lk.type != stored_key.type:
+                    if isinstance(lk.type, ir.IntType) and isinstance(stored_key.type, ir.IntType):
+                        if lk.type.width > stored_key.type.width:
+                            lk = builder.trunc(lk, stored_key.type, name=f"key_trunc_{i}")
+                        else:
+                            lk = builder.zext(lk, stored_key.type, name=f"key_ext_{i}")
+                cmp = builder.icmp_signed('==', stored_key, lk, name=f"keycmp_{i}")
+            next_bb = check_bbs[i + 1] if i + 1 < capacity else merge_bb
+            builder.cbranch(cmp, found_bbs[i], next_bb)
+
+            builder.position_at_end(found_bbs[i])
+            val_ptr = builder.gep(dict_ptr, [zero, ir.Constant(i32, 1), ir.Constant(i32, i)], inbounds=True)
+            builder.store(val_ptr, result_ptr_alloca)
+            builder.branch(merge_bb)
+
+        builder.position_at_end(merge_bb)
+        result_ptr = builder.load(result_ptr_alloca, name=f"{tmp_name}_valptr")
+        if isinstance(value_llvm, (ir.LiteralStructType, ir.IdentifiedStructType, ir.ArrayType)):
+            return result_ptr
+        return builder.load(result_ptr, name=f"{tmp_name}_val")
+
+    def _dict_access(self, node, builder, module):
+        """Linear-scan key lookup for dict[key]. Returns a pointer to the matched value slot."""
+        from fast import Identifier
+        dict_name = node.array.name
+        info = module._dict_types[dict_name]
+
+        dict_ptr = module.symbol_table.get_llvm_value(dict_name)
+        if dict_ptr is None and dict_name in module.globals:
+            dict_ptr = module.globals[dict_name]
+
+        # If dict_ptr is dict_struct** (pointer to dict pointer, from pass-by-pointer param),
+        # load once to get dict_struct*
+        if (dict_ptr is not None and
+                isinstance(dict_ptr.type, ir.PointerType) and
+                isinstance(dict_ptr.type.pointee, ir.PointerType) and
+                isinstance(dict_ptr.type.pointee.pointee, ir.LiteralStructType) and
+                len(dict_ptr.type.pointee.pointee.elements) == 3):
+            dict_ptr = builder.load(dict_ptr, name=f"{dict_name}_deref")
+
+        # Derive capacity and element types from the actual alloca/global type,
+        # not from _dict_types, so template-instantiated dicts with stale capacity work.
+        actual_struct = None
+        if dict_ptr is not None and isinstance(dict_ptr.type, ir.PointerType):
+            pointee = dict_ptr.type.pointee
+            if (isinstance(pointee, ir.LiteralStructType) and
+                    len(pointee.elements) == 3 and
+                    isinstance(pointee.elements[0], ir.ArrayType)):
+                actual_struct = pointee
+        if actual_struct is not None:
+            capacity   = actual_struct.elements[0].count
+            key_llvm   = actual_struct.elements[0].element
+            value_llvm = actual_struct.elements[1].element
+        else:
+            capacity   = info['capacity']
+            key_llvm   = info['key_llvm']
+            value_llvm = info['value_llvm']
+
+        lookup_key = self.visit(node.index, builder, module)
+
+        i32 = ir.IntType(32)
+        zero = ir.Constant(i32, 0)
+
+        # Build linear scan: for i in 0..capacity, compare keys[i] == lookup_key
+        func      = builder.function
+        merge_bb  = func.append_basic_block(f"dict_merge_{dict_name}")
+        # Allocate a result pointer (pointer to value slot), default null
+        result_ptr_alloca = builder.alloca(value_llvm.as_pointer(), name=f"{dict_name}_result_ptr")
+        builder.store(ir.Constant(value_llvm.as_pointer(), None), result_ptr_alloca)
+
+        current_bb = builder.block
+        check_bbs  = []
+        found_bbs  = []
+        for i in range(capacity):
+            check_bb = func.append_basic_block(f"dict_check_{dict_name}_{i}")
+            found_bb = func.append_basic_block(f"dict_found_{dict_name}_{i}")
+            check_bbs.append(check_bb)
+            found_bbs.append(found_bb)
+
+        # Entry: jump to first check
+        builder.branch(check_bbs[0])
+
+        for i in range(capacity):
+            builder.position_at_end(check_bbs[i])
+            key_ptr = builder.gep(dict_ptr,
+                [zero, zero, ir.Constant(i32, i)],
+                inbounds=True, name=f"kptr_{i}")
+            stored_key = builder.load(key_ptr, name=f"key_{i}")
+            # Compare keys: use strcmp for byte* (string) keys, icmp eq for scalars
+            if isinstance(key_llvm, ir.PointerType) and isinstance(key_llvm.pointee, ir.IntType) and key_llvm.pointee.width == 8:
+                i8ptr = ir.PointerType(ir.IntType(8))
+                # Decay lookup_key from [N x i8]* to i8* if needed
+                lk = lookup_key
+                if isinstance(lk.type, ir.PointerType) and isinstance(lk.type.pointee, ir.ArrayType):
+                    zero = ir.Constant(ir.IntType(32), 0)
+                    lk = builder.gep(lk, [zero, zero], inbounds=True, name=f"lk_decay_{i}")
+                # Ensure strcmp is declared
+                strcmp_ty = ir.FunctionType(ir.IntType(32), [i8ptr, i8ptr])
+                if 'strcmp' not in module.globals:
+                    strcmp_fn = ir.Function(module, strcmp_ty, name='strcmp')
+                    strcmp_fn.linkage = 'external'
+                else:
+                    strcmp_fn = module.globals['strcmp']
+                cmp_result = builder.call(strcmp_fn, [stored_key, lk], name=f"strcmp_{i}")
+                cmp = builder.icmp_signed('==', cmp_result, ir.Constant(ir.IntType(32), 0), name=f"keycmp_{i}")
+            elif isinstance(key_llvm, ir.PointerType):
+                cmp = builder.icmp_unsigned('==', stored_key, lookup_key, name=f"keycmp_{i}")
+            else:
+                cmp = builder.icmp_signed('==', stored_key, lookup_key, name=f"keycmp_{i}")
+            next_bb = check_bbs[i + 1] if i + 1 < capacity else merge_bb
+            builder.cbranch(cmp, found_bbs[i], next_bb)
+
+            builder.position_at_end(found_bbs[i])
+            val_ptr = builder.gep(dict_ptr,
+                [zero, ir.Constant(i32, 1), ir.Constant(i32, i)],
+                inbounds=True, name=f"vptr_{i}")
+            builder.store(val_ptr, result_ptr_alloca)
+            builder.branch(merge_bb)
+
+        builder.position_at_end(merge_bb)
+        result_ptr = builder.load(result_ptr_alloca, name=f"{dict_name}_valptr")
+        # Load the value through the pointer
+        if isinstance(value_llvm, (ir.LiteralStructType, ir.IdentifiedStructType, ir.ArrayType)):
+            return result_ptr
+        return builder.load(result_ptr, name=f"{dict_name}_val")
+
     def visit_ArrayAccess(self, node, builder, module):
-        from fast import RangeExpression
+        from fast import RangeExpression, Identifier
+        # Dict key lookup: dict{K:V} name[key]
+        if (isinstance(node.array, Identifier) and
+                hasattr(module, '_dict_types') and
+                node.array.name in module._dict_types):
+            return self._dict_access(node, builder, module)
+
         array_val = self.visit(node.array, builder, module)
+        # spill to alloca and do key lookup
+        def _is_dict_struct(t):
+            return (isinstance(t, ir.LiteralStructType) and
+                    len(t.elements) == 3 and
+                    isinstance(t.elements[0], ir.ArrayType) and
+                    isinstance(t.elements[1], ir.ArrayType) and
+                    t.elements[2] == ir.IntType(32))
+        if _is_dict_struct(array_val.type):
+            tmp = builder.alloca(array_val.type, name="dict_tmp")
+            builder.store(array_val, tmp)
+            return self._dict_access_from_ptr(tmp, array_val.type, node.index, builder, module)
+        if (isinstance(array_val.type, ir.PointerType) and
+                _is_dict_struct(array_val.type.pointee)):
+            return self._dict_access_from_ptr(array_val, array_val.type.pointee, node.index, builder, module)
         _ts    = getattr(array_val, '_flux_type_spec', None)
         _depth = getattr(_ts, 'pointer_depth', 1) if _ts else 1
         _is_arr = getattr(_ts, 'is_array', False) if _ts else False
@@ -6315,12 +6658,43 @@ class CodegenVisitor:
         return None
 
     def visit_SwitchStatement(self, node, builder, module):
-        from fast import Literal, Identifier, TypeOf
+        from fast import Literal, Identifier, TypeOf, MemberAccess
         # typeof() returns a deduplicated global pointer, not an integer.
         # LLVM switch requires an integer discriminant, so lower
         # switch(typeof(x)) as a pointer-equality if/else-if chain instead.
         if isinstance(node.expression, TypeOf):
             return self._visit_switch_typeof(node, builder, module)
+
+        # Exhaustiveness check: if switching on a tagged union tag (v.#),
+        # verify all enum members are covered unless a default case is present.
+        if (isinstance(node.expression, MemberAccess) and
+                node.expression.member == '#' and
+                isinstance(node.expression.object, Identifier)):
+            var_name = node.expression.object.name
+            has_default = any(c.value is None for c in node.cases)
+            if not has_default and hasattr(module, 'symbol_table') and hasattr(module, '_union_member_info'):
+                var_entry = module.symbol_table.lookup_variable(var_name)
+                union_name = None
+                if var_entry is not None and var_entry.type_spec is not None:
+                    union_name = getattr(var_entry.type_spec, 'custom_typename', None)
+                if union_name and union_name in module._union_member_info:
+                    union_info = module._union_member_info[union_name]
+                    if union_info.get('is_tagged'):
+                        tag_enum_name = union_info['tag_name']
+                        if hasattr(module, '_enum_types') and tag_enum_name in module._enum_types:
+                            all_members = set(module._enum_types[tag_enum_name].keys())
+                            # Collect covered members from case expressions
+                            covered = set()
+                            for c in node.cases:
+                                if c.value is not None and isinstance(c.value, MemberAccess):
+                                    covered.add(c.value.member)
+                            missing = all_members - covered
+                            if missing:
+                                missing_str = ', '.join(f"{tag_enum_name}.{m}" for m in sorted(missing))
+                                raise FluxCodegenError(
+                                    f"'{union_name}' is tagged and thereby a sum type. Missing case(s): {missing_str}",
+                                    node, module)
+
         switch_val = self.visit(node.expression, builder, module)
 
         func = builder.block.function
@@ -6731,6 +7105,28 @@ class CodegenVisitor:
                 param_with_metadata._is_typefunc_string = True
                 alloca._is_typefunc_string = True
             builder.store(param_with_metadata, alloca)
+            # Register dict parameters in _dict_types so _dict_access can find them
+            if (param_type_spec is not None and
+                    getattr(param_type_spec, 'base_type', None) == DataType.DICT):
+                if not hasattr(module, '_dict_types'):
+                    module._dict_types = {}
+                key_ts  = param_type_spec.dict_key_type
+                val_ts  = param_type_spec.dict_value_type
+                cap     = param_type_spec.dict_capacity or 0
+                key_llvm = TypeSystem.get_llvm_type(key_ts, module) if key_ts else ir.IntType(8)
+                val_llvm = TypeSystem.get_llvm_type(val_ts, module) if val_ts else ir.IntType(8)
+                module._dict_types[param_name] = {
+                    'key_type':    key_ts,
+                    'value_type':  val_ts,
+                    'key_llvm':    key_llvm,
+                    'value_llvm':  val_llvm,
+                    'capacity':    cap,
+                    'struct_type': ir.LiteralStructType([
+                        ir.ArrayType(key_llvm, cap),
+                        ir.ArrayType(val_llvm, cap),
+                        ir.IntType(32)
+                    ]),
+                }
             module.symbol_table.define(
                 param_name,
                 SymbolKind.VARIABLE,
@@ -6902,30 +7298,41 @@ class CodegenVisitor:
 
         module._enum_types[node.name] = node.values
 
+        # Resolve the underlying LLVM type (default i32 if no explicit type)
+        if node.underlying_type is not None:
+            enum_llvm_type = TypeSystem.get_llvm_type(node.underlying_type, module)
+        else:
+            enum_llvm_type = ir.IntType(32)
+
         if not node.values:
             if hasattr(module, 'symbol_table'):
                 module.symbol_table.define(
                     node.name, SymbolKind.ENUM,
-                    type_spec=None, llvm_type=ir.IntType(32), llvm_value=None)
+                    type_spec=node.underlying_type, llvm_type=enum_llvm_type, llvm_value=None)
             return
 
         if hasattr(module, 'symbol_table'):
-            #print(f"[ENUM] Registering enum '{node.name}' in symbol table", file=sys.stdout)
             module.symbol_table.define(
                 node.name, SymbolKind.ENUM,
-                type_spec=None, llvm_type=ir.IntType(32), llvm_value=None)
+                type_spec=node.underlying_type, llvm_type=enum_llvm_type, llvm_value=None)
 
         for name, value in node.values.items():
             const_name = f"{node.name}.{name}"
-            const_value = ir.Constant(ir.IntType(32), value)
-            global_const = ir.GlobalVariable(module, ir.IntType(32), name=const_name)
+            # For aggregate types (structs), use zeroinitializer; for scalars use the ordinal value
+            if isinstance(enum_llvm_type, (ir.LiteralStructType, ir.IdentifiedStructType)):
+                const_value = ir.Constant(enum_llvm_type, None)
+            else:
+                const_value = ir.Constant(enum_llvm_type, value)
+            global_const = ir.GlobalVariable(module, enum_llvm_type, name=const_name)
             global_const.initializer = const_value
-            global_const.global_constant = True
+            # Scalar enum members are read-only constants; struct-typed members are mutable globals
+            if not isinstance(enum_llvm_type, (ir.LiteralStructType, ir.IdentifiedStructType)):
+                global_const.global_constant = True
             if hasattr(module, 'symbol_table'):
                 full_name = f"{node.name}.{name}"
                 module.symbol_table.define(
                     full_name, SymbolKind.VARIABLE,
-                    type_spec=None, llvm_type=ir.IntType(32), llvm_value=global_const)
+                    type_spec=node.underlying_type, llvm_type=enum_llvm_type, llvm_value=global_const)
 
     def visit_UnionDef(self, node, builder, module):
         if getattr(node, '_is_comptime_only', False):
@@ -8203,7 +8610,101 @@ class CodegenVisitor:
 
         raise FluxCodegenError(f"Unknown identifier: {node.name}", node, module)
 
+    def _vardecl_dict(self, node, builder, module):
+        """Generate a dict{K:V} variable -- stack-allocated locally, constant global at global scope."""
+        from fast import DictLiteral
+        ts = node.type_spec
+        capacity = ts.dict_capacity if ts.dict_capacity is not None else 0
+
+        key_llvm   = TypeSystem.get_llvm_type(ts.dict_key_type,   module)
+        value_llvm = TypeSystem.get_llvm_type(ts.dict_value_type, module)
+
+        keys_arr_type    = ir.ArrayType(key_llvm,   capacity)
+        values_arr_type  = ir.ArrayType(value_llvm, capacity)
+        count_type       = ir.IntType(32)
+        dict_struct_type = ir.LiteralStructType([keys_arr_type, values_arr_type, count_type])
+
+        if not hasattr(module, '_dict_types'):
+            module._dict_types = {}
+        module._dict_types[node.name] = {
+            'key_type':    ts.dict_key_type,
+            'value_type':  ts.dict_value_type,
+            'key_llvm':    key_llvm,
+            'value_llvm':  value_llvm,
+            'capacity':    capacity,
+            'struct_type': dict_struct_type,
+        }
+
+        is_global_scope = (
+            builder is None or
+            node.is_global or
+            module.symbol_table.is_global_scope()
+        )
+
+        if is_global_scope:
+            from fast import DictLiteral as _DL, BinaryOp as _BOP
+            # For expression initializers at global scope, pre-compute the merged type
+            # so the global variable is sized correctly before _vardecl_global creates it
+            if node.initial_value is not None and not isinstance(node.initial_value, _DL):
+                # Evaluate the constant initializer to get the actual struct type
+                pre_const = VariableTypeHandler.create_global_initializer(node.initial_value, dict_struct_type, module)
+                if pre_const is not None and isinstance(pre_const.type, ir.LiteralStructType):
+                    dict_struct_type = pre_const.type
+                    new_cap = dict_struct_type.elements[0].count
+                    module._dict_types[node.name]['capacity'] = new_cap
+                    module._dict_types[node.name]['struct_type'] = dict_struct_type
+            return self._vardecl_global(node, module, dict_struct_type, ts)
+
+        if isinstance(node.initial_value, DictLiteral) and node.initial_value.entries:
+            alloca = builder.alloca(dict_struct_type, name=node.name)
+            builder.store(ir.Constant(dict_struct_type, None), alloca)
+            entries = node.initial_value.entries
+            n_pairs = len(entries) // 2
+            for i in range(n_pairs):
+                k_val = self.visit(entries[i * 2],     builder, module)
+                v_val = self.visit(entries[i * 2 + 1], builder, module)
+                key_ptr = builder.gep(alloca,
+                    [ir.Constant(ir.IntType(32), 0),
+                     ir.Constant(ir.IntType(32), 0),
+                     ir.Constant(ir.IntType(32), i)],
+                    inbounds=True, name=f"{node.name}_k{i}")
+                builder.store(k_val, key_ptr)
+                val_ptr = builder.gep(alloca,
+                    [ir.Constant(ir.IntType(32), 0),
+                     ir.Constant(ir.IntType(32), 1),
+                     ir.Constant(ir.IntType(32), i)],
+                    inbounds=True, name=f"{node.name}_v{i}")
+                builder.store(v_val, val_ptr)
+            count_ptr = builder.gep(alloca,
+                [ir.Constant(ir.IntType(32), 0),
+                 ir.Constant(ir.IntType(32), 2)],
+                inbounds=True, name=f"{node.name}_count")
+            builder.store(ir.Constant(count_type, n_pairs), count_ptr)
+        elif node.initial_value is not None:
+            # Expression initializer (e.g. dict + dict): visit first to get actual type/size
+            src = self.visit(node.initial_value, builder, module)
+            src_struct_type = dict_struct_type
+            if isinstance(src, (ir.AllocaInstr, ir.GlobalVariable)):
+                if isinstance(src.type.pointee, ir.LiteralStructType):
+                    src_struct_type = src.type.pointee
+                    new_cap = src_struct_type.elements[0].count
+                    module._dict_types[node.name]['capacity'] = new_cap
+                    module._dict_types[node.name]['struct_type'] = src_struct_type
+            alloca = builder.alloca(src_struct_type, name=node.name)
+            builder.store(builder.load(src, name="dict_init_load"), alloca)
+        else:
+            alloca = builder.alloca(dict_struct_type, name=node.name)
+            builder.store(ir.Constant(dict_struct_type, None), alloca)
+
+        module.symbol_table.define(node.name, SymbolKind.VARIABLE,
+                                   type_spec=ts, llvm_type=dict_struct_type, llvm_value=alloca)
+        return alloca
+
     def visit_VariableDeclaration(self, node, builder, module):
+        # Handle dict types
+        if node.type_spec is not None and node.type_spec.base_type == DataType.DICT:
+            return self._vardecl_dict(node, builder, module)
+
         # Handle auto type inference (storage_class=AUTO sentinel from parser)
         from ftypesys import StorageClass as _SC
         #print(f"[AUTO DEBUG] name={node.name} type_spec={node.type_spec!r} storage_class={getattr(node.type_spec, 'storage_class', 'NO_ATTR')!r} SC.AUTO={_SC.AUTO!r}", file=__import__('sys').stderr)
@@ -9011,7 +9512,7 @@ class CodegenVisitor:
     def visit_Program(self, node, builder, module):
         from fast import (UsingStatement, NotUsingStatement, NamespaceDef,
                           StructDef, StructDefStatement, ObjectDef, ObjectDefStatement,
-                          ExternBlock, ExportBlock, NamespaceDefStatement)
+                          ExternBlock, ExportBlock, NamespaceDefStatement, VariableDeclaration)
         print("[AST] Begining codegen for Flux program ...")
         print(f"[AST] Total statements in AST: {len(node.statements)}", file=sys.stdout)
         namespace_count = sum(1 for s in node.statements if isinstance(s, NamespaceDef))
@@ -9064,7 +9565,9 @@ class CodegenVisitor:
         # are registered, rather than eagerly before them.
         print("[AST] Pre-pass: Registering all object types and extern blocks...")
         pending_toplevel = [stmt for stmt in node.statements
-                            if isinstance(stmt, (StructDef, StructDefStatement, ObjectDef, ObjectDefStatement))]
+                            if isinstance(stmt, (StructDef, StructDefStatement, ObjectDef, ObjectDefStatement))
+                            or (isinstance(stmt, VariableDeclaration) and
+                                getattr(getattr(stmt, 'type_spec', None), 'base_type', None) == DataType.DICT)]
         pending_ns = []
         for stmt in node.statements:
             ns = None
@@ -9134,6 +9637,13 @@ class CodegenVisitor:
         from fast import ContractDef as _ContractDef, FunctionDef as _FunctionDef
         _skip_types = (UsingStatement, NotUsingStatement, ExternBlock, StructDef,
                        StructDefStatement, ObjectDef, ObjectDefStatement, _ContractDef)
+        def _should_skip(stmt):
+            if isinstance(stmt, _skip_types):
+                return True
+            if (isinstance(stmt, VariableDeclaration) and
+                    getattr(getattr(stmt, 'type_spec', None), 'base_type', None) == DataType.DICT):
+                return True
+            return False
         _tmpl_instances = [s for s in node.statements
                            if isinstance(s, _FunctionDef) and hasattr(s, '_source_namespace')]
         #import sys as _sys
@@ -9149,7 +9659,7 @@ class CodegenVisitor:
                 _last_ns_idx = _i
         _namespaces_done = (_last_ns_idx == -1)
         for _stmt_idx, stmt in enumerate(node.statements):
-            if isinstance(stmt, _skip_types):
+            if _should_skip(stmt):
                 continue
             if isinstance(stmt, _FunctionDef) and hasattr(stmt, '_source_namespace'):
                 continue  # template instantiation - emitted after last namespace

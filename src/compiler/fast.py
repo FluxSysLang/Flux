@@ -1002,6 +1002,7 @@ class DestructuringAssignment(Statement):
 class EnumDef(ASTNode):
     name: str
     values: dict
+    underlying_type: Optional['TypeSystem'] = None
 
 @dataclass
 class EnumDefStatement(Statement):
@@ -1568,6 +1569,27 @@ class ComptimeBlock(ASTNode):
     def __repr__(self) -> str:
         tag = f' {self.name}' if self.name else ''
         return f'ComptimeBlock{tag}({len(self.body)} statements)'
+
+
+@dataclass
+class DictLiteralExpr(Expression):
+    """Inline dict literal: d{k1:v1, k2:v2, ...}[key]"""
+    keys: List[Expression]
+    values: List[Expression]
+
+    def __repr__(self):
+        pairs = ', '.join(f"{k}:{v}" for k, v in zip(self.keys, self.values))
+        return f"d{{{pairs}}}"
+
+
+@dataclass
+class DictLiteral(Expression):
+    """A dict literal: { k1, v1, k2, v2, ... } used in dict variable initialization."""
+    entries: List[Expression] = field(default_factory=list)  # flat list: key, val, key, val, ...
+
+    def __repr__(self) -> str:
+        pairs = [f"{self.entries[i]}: {self.entries[i+1]}" for i in range(0, len(self.entries), 2)]
+        return '{' + ', '.join(pairs) + '}'
 
 
 @dataclass

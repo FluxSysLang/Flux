@@ -68,6 +68,7 @@ from fast import (
     AssertStatement,
     EnumDef, EnumDefStatement,
     macroDefStatement, macroCall,
+    FunctionDef, FunctionDefStatement,
     ExternBlock,
     FluxVMBlock,
     UsingStatement, NotUsingStatement,
@@ -3494,6 +3495,8 @@ class FVMCodegen:
             )
         self._visit_expr(node.function_expr)
         self._emit(_instr(Op.LOCAL_SET, self._locals[node.pointer_name]))
+
+    def _visit_function_def(self, node: FunctionDef):
         """
         Compile a comptime function definition and store its bytecode in
         self.compiled_functions so the caller (visit_ComptimeBlock in fcodegen.py)
@@ -3510,10 +3513,8 @@ class FVMCodegen:
         fn_cg._macros_compiling = set(self._macros_compiling)
         fn_cg._local_types = dict(self._local_types)
         fn_cg._local_typespecs = dict(self._local_typespecs)
-        # Allocate a slot for each parameter so LOCAL_GET/SET work by name
         for param in node.parameters:
             fn_cg._alloc_local(param.name)
-            # print(f"[PARAM DEBUG] {node.name} param={param.name!r} type_spec={param.type_spec} ctn={getattr(param.type_spec, chr(99)+chr(117)+chr(115)+chr(116)+chr(111)+chr(109)+chr(95)+chr(116)+chr(121)+chr(112)+chr(101)+chr(110)+chr(97)+chr(109)+chr(101), None) if param.type_spec else None}", flush=True)
             if param.type_spec is not None:
                 fn_cg._local_typespecs[param.name] = param.type_spec
                 _ctn = getattr(param.type_spec, 'custom_typename', None)
@@ -3522,42 +3523,30 @@ class FVMCodegen:
                 elif param.type_spec.base_type is not None:
                     _bt = param.type_spec.base_type
                     fn_cg._local_types[param.name] = str(_bt.value) if hasattr(_bt, 'value') else str(_bt)
-        # <~ strict recursion: self-calls and returns in this body emit TAIL_SELF
         if node.is_recursive:
             fn_cg._tail_call_self = node.name
             fn_cg._tail_call_argc = len(node.parameters)
-        # Skip forward declarations (prototypes only -- no body).
         if node.is_prototype or node.body is None:
             return
-        # Compile the body
         body_stmts = (
             node.body.statements if isinstance(node.body, Block) else [node.body]
         )
         fn_cg._visit_body(body_stmts)
         if node.is_recursive:
-            # <~ function: _visit_return already emits TAIL_SELF inline.
-            # If the body did not explicitly terminate, append the implicit
-            # self tail-call (mirrors the runtime musttail insertion).
             argc = len(node.parameters)
             last = fn_cg._instructions[-1].op if fn_cg._instructions else None
             if last not in (Op.TAIL_SELF, Op.RET):
                 fn_cg._emit(_instr(Op.TAIL_SELF, argc))
         else:
-            # Normal function: ensure every path ends with RET.
             if not fn_cg._instructions or fn_cg._instructions[-1].op != Op.RET:
                 from fvm import TTag as _TTag
                 fn_cg._emit(_instr(Op.PUSH, Val(_TTag.VOID, 0)))
                 fn_cg._emit(_instr(Op.RET))
-        # Mark the original node so the LLVM codegen skips any template
-        # instantiation that deep-copies it (fparser propagates this flag).
         node._is_comptime_only = True
-        # Propagate nested function definitions upward without overwriting existing entries
         for _k, _v in fn_cg.compiled_functions.items():
             if _k not in self.compiled_functions:
                 self.compiled_functions[_k] = _v
         self.compiled_functions[node.name] = fn_cg._instructions
-        # Mark the original node so the LLVM codegen skips it unconditionally,
-        # regardless of when _comptime_functions is populated.
         node._is_comptime_only = True
 
     def _visit_type_func_def(self, node: TypeFuncDef):

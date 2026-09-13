@@ -56,10 +56,10 @@ class TokenType(Enum):
     
     # Keywords
     ALIGNOF = auto()      # builtin: alignof()
-    ASSERT = auto()       # builtin: assert()
-    ENDIANOF = auto()     # builtin: endianof()
-    SIZEOF = auto()       # builtin: sizeof()
-    TYPEOF = auto()       # builtin: typeof()
+    ASSERT = auto()       # ": assert()
+    ENDIANOF = auto()     # ": endianof()
+    SIZEOF = auto()       # ": sizeof()
+    TYPEOF = auto()       # ": typeof()
     AND = auto()          # keyword: and
     AS = auto()           # "        as
     ASM = auto()          # "        asm
@@ -80,6 +80,7 @@ class TokenType(Enum):
     DEFER = auto()        # "        defer
     DEFAULT = auto()      # "        default
     DEPRECATE = auto()    # "        deprecate
+    DICT = auto()         # "        dict
     DO = auto()           # "        do
     DOUBLE_KW = auto()    # "        double
     ELIF = auto()         # "        elif | else if
@@ -243,6 +244,7 @@ class TokenType(Enum):
     CODIFY = auto()           # ~$
     BITSLICE = auto()         # ``
     DITTO = auto()            # #"
+    DICT_LITERAL = auto()     # d{
     
     # Delimiters
     LEFT_PAREN = auto()     # (
@@ -340,7 +342,8 @@ double_char_tokens = {
     '@=': TokenType.ADDRESS_ASSIGN,
     '``': TokenType.BITSLICE,
     '~$': TokenType.CODIFY,
-    "#\"": TokenType.DITTO
+    "#\"": TokenType.DITTO,
+    "d{": TokenType.DICT_LITERAL
 } | double_binary_tokens
 
 # Single-character tokens dictionary
@@ -409,6 +412,7 @@ _TOKEN_TYPE_TO_STR: dict = {
     TokenType.DEFER:      'defer',
     TokenType.DEFAULT:    'default',
     TokenType.DEPRECATE:  'deprecate',
+    TokenType.DICT:       'dict',
     TokenType.DO:         'do',
     TokenType.DOUBLE_KW:  'double',
     TokenType.ELIF:       'elif',
@@ -554,6 +558,7 @@ class FluxLexer:
             'defer': TokenType.DEFER,
             'default': TokenType.DEFAULT,
             'deprecate': TokenType.DEPRECATE,
+            'dict': TokenType.DICT,
             'do': TokenType.DO,
             'double': TokenType.DOUBLE_KW,
             'elif': TokenType.ELIF,
@@ -1163,6 +1168,11 @@ class FluxLexer:
                 tokens.append(self.read_asm_block())
                 continue
             
+            if char == 'd' and self.peek_char() == '{':
+                self.advance(count=2)  # consume 'd' and '{'
+                tokens.append(Token(TokenType.DICT_LITERAL, 'd{', start_pos[0], start_pos[1]))
+                continue
+
             # Numbers
             if char.isdigit():
                 tokens.append(self.read_number())

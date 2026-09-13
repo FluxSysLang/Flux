@@ -227,6 +227,28 @@ class _RefCollector:
             self._walk(getattr(node, 'args', None))
             return
 
+        # ── FStringLiteral ────────────────────────────────────────────────
+        # fstr_append overloads are chosen by fcodegen at IR emission time
+        # based on the runtime type of each interpolated value. DCE cannot
+        # know which overloads will be needed, so seed them all whenever any
+        # f-string appears in the AST.
+        if cls == 'FStringLiteral':
+            _FSTR_OVERLOADS = (
+                "standard__strings__fstr_append__3__floatE1__byteE1_ptr1__intE1_ptr1__ret_intE1",
+                "standard__strings__fstr_append__3__doubleE1__byteE1_ptr1__intE1_ptr1__ret_intE1",
+                "standard__strings__fstr_append__3__byteE1_ptr1__byteE1_ptr1__intE1_ptr1__ret_intE1",
+                "standard__strings__fstr_append__3__dataE1_ubits16__byteE1_ptr1__intE1_ptr1__ret_intE1",
+                "standard__strings__fstr_append__3__dataE1_ubits32__byteE1_ptr1__intE1_ptr1__ret_intE1",
+                "standard__strings__fstr_append__3__dataE1_ubits64__byteE1_ptr1__intE1_ptr1__ret_intE1",
+                "standard__strings__fstr_append__3__dataE1_sbits16__byteE1_ptr1__intE1_ptr1__ret_intE1",
+                "standard__strings__fstr_append__3__dataE1_sbits32__byteE1_ptr1__intE1_ptr1__ret_intE1",
+                "standard__strings__fstr_append__3__dataE1_sbits64__byteE1_ptr1__intE1_ptr1__ret_intE1",
+            )
+            for _fn in _FSTR_OVERLOADS:
+                self._add(_fn)
+            self._walk(getattr(node, 'parts', None))
+            return
+
         # ── MemberAccess / StructFieldAccess ──────────────────────────────
         if cls in ('MemberAccess', 'StructFieldAccess'):
             self._walk(getattr(node, 'obj', None))
@@ -405,6 +427,32 @@ def _compute_live_functions(program, ns_func_index: Dict[str, List[Any]],
     for variant in _all_suffixes(entry.replace('::', '__')):
         if variant:
             seed.add(variant)
+
+    # fstr_append overloads are selected by codegen at IR emit time based on
+    # value types -- DCE cannot see these references. Always keep them live.
+    # Seed both the bare name and all param-qualified variants so _prune_namespace
+    # keeps them regardless of which suffix variant it checks liveness against.
+    _FSTR_BASE = "standard__strings__fstr_append"
+    for _v in _all_suffixes(_FSTR_BASE):
+        if _v:
+            seed.add(_v)
+    # Also add the arity key so overload narrowing keeps all 3-param variants.
+    seed.add("fstr_append__3")
+    _FSTR_OVERLOADS = (
+        "standard__strings__fstr_append__3__floatE1__byteE1_ptr1__intE1_ptr1__ret_intE1",
+        "standard__strings__fstr_append__3__doubleE1__byteE1_ptr1__intE1_ptr1__ret_intE1",
+        "standard__strings__fstr_append__3__byteE1_ptr1__byteE1_ptr1__intE1_ptr1__ret_intE1",
+        "standard__strings__fstr_append__3__dataE1_ubits16__byteE1_ptr1__intE1_ptr1__ret_intE1",
+        "standard__strings__fstr_append__3__dataE1_ubits32__byteE1_ptr1__intE1_ptr1__ret_intE1",
+        "standard__strings__fstr_append__3__dataE1_ubits64__byteE1_ptr1__intE1_ptr1__ret_intE1",
+        "standard__strings__fstr_append__3__dataE1_sbits16__byteE1_ptr1__intE1_ptr1__ret_intE1",
+        "standard__strings__fstr_append__3__dataE1_sbits32__byteE1_ptr1__intE1_ptr1__ret_intE1",
+        "standard__strings__fstr_append__3__dataE1_sbits64__byteE1_ptr1__intE1_ptr1__ret_intE1",
+    )
+    for _fn in _FSTR_OVERLOADS:
+        for _v in _all_suffixes(_fn):
+            if _v:
+                seed.add(_v)
 
     # Step 1b: Seed from non-namespace, non-using top-level statements.
     # Global variable initializers and top-level expressions can reference
