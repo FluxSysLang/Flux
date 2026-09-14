@@ -746,6 +746,11 @@ class CodegenVisitor:
             module.symbol_table._interface_registry[node.name] = node
         return None
 
+    def visit_EffectDef(self, node, builder, module):
+        # Effect declarations are compile-time only -- no IR emitted.
+        # The effect registry (feffects.py) consumes these during the effect pass.
+        return None
+
     def visit_DeprecateStatement(self, node, builder, module):
         from fast import Identifier, FunctionCall, ASTNode
         mangled = node.namespace_path.replace("::", "__")

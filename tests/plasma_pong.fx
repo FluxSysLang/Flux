@@ -179,26 +179,27 @@ global float g_ball_x  = -1.0,  // -1 = needs reset on first gameplay frame
 global int g_lives = 3;
 global int g_level = 1;
 
-def btn_hit_test(int mx, int my, int cx, int cy) -> bool,
-    btn_hit_test_ex(int, int, int, int, int, int) -> bool,
-    draw_parallelogram_btn(int, int, int, int, int, float, float) -> void,
-    text_width(byte*, int) -> int,
-    draw_text(byte*, int, int, int, float, float) -> void,
-    draw_quit_dialog(int, int) -> void,
-    paddle_update() -> void,
-    cpu_paddle_update() -> void,
-    draw_paddle(int, int, int, int) -> void,
-    ball_reset(int, int) -> void,
-    ball_update(int, int) -> void,
-    draw_ball(int, int) -> void,
-    draw_hud(int, int) -> void,
-    inject_vorticity() -> void,
-    vorticity_confinement(double*, double*) -> void;
+def btn_hit_test(int mx, int my, int cx, int cy) -> bool # effect {Pure},
+    btn_hit_test_ex(int, int, int, int, int, int) -> bool # effect {Pure},
+    draw_parallelogram_btn(int, int, int, int, int, float, float) -> void # effect {*IO.GPU},
+    text_width(byte*, int) -> int # effect {Pure},
+    draw_text(byte*, int, int, int, float, float) -> void # effect {*IO.GPU},
+    draw_quit_dialog(int, int) -> void # effect {*IO.GPU},
+    paddle_update() -> void # effect {*Mem.Write},
+    cpu_paddle_update() -> void # effect {*Mem.Write},
+    draw_paddle(int, int, int, int) -> void # effect {*IO.GPU},
+    ball_reset(int, int) -> void # effect {*Mem.Write},
+    ball_update(int, int) -> void # effect {*Mem.Write},
+    draw_ball(int, int) -> void # effect {*IO.GPU},
+    draw_hud(int, int) -> void # effect {*IO.GPU},
+    inject_vorticity() -> void # effect {*Mem.Write},
+    vorticity_confinement(double*, double*) -> void # effect {*Mem.Write};
 
 // ============================================================================
 // WINDOW PROCEDURE
 // ============================================================================
 
+def FluidWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) -> LRESULT # effect {*IO & *Mem.Write};
 def FluidWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) -> LRESULT
 {
     int nx, ny,
@@ -327,6 +328,7 @@ def FluidWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) -> LRESUL
 // HELPER: flat index - manually expanded in hot loops to avoid call overhead
 // ============================================================================
 
+def IX(int x, int y) -> int # effect {Pure};
 def IX(int x, int y) -> int
 {
     return y * SIM_W + x;
@@ -336,6 +338,7 @@ def IX(int x, int y) -> int
 // BOUNDARY CONDITIONS
 // ============================================================================
 
+def set_bnd(int b, double* x) -> void # effect {*Mem.Write};
 def set_bnd(int b, double* x) -> void
 {
     int i;
@@ -381,6 +384,8 @@ def set_bnd(int b, double* x) -> void
 // ============================================================================
 
 def linsolve_band(int row_start, int row_end, int color,
+                  double* x, double* x0, double a, double c_inv) -> void # effect {*Mem.Write};
+def linsolve_band(int row_start, int row_end, int color,
                   double* x, double* x0, double a, double c_inv) -> void
 {
     int jstart,
@@ -409,6 +414,8 @@ def linsolve_band(int row_start, int row_end, int color,
     return;
 };
 
+def advect_band(int row_start, int row_end,
+                double* d, double* d0, double* u, double* v) -> void # effect {*Mem.Write};
 def advect_band(int row_start, int row_end,
                 double* d, double* d0, double* u, double* v) -> void
 {
@@ -474,6 +481,9 @@ def advect_band(int row_start, int row_end,
 // Compute divergence and zero pressure - parallel
 def project_div_band(int row_start, int row_end,
                      double* u, double* v, double* p, double* div,
+                     double hx, double hy) -> void # effect {*Mem.Write};
+def project_div_band(int row_start, int row_end,
+                     double* u, double* v, double* p, double* div,
                      double hx, double hy) -> void
 {
     int jstart, jend,
@@ -501,6 +511,9 @@ def project_div_band(int row_start, int row_end,
 // Subtract pressure gradient - parallel, division replaced with multiply
 def project_grad_band(int row_start, int row_end,
                       double* u, double* v, double* p,
+                      double hx_inv, double hy_inv) -> void # effect {*Mem.Write};
+def project_grad_band(int row_start, int row_end,
+                      double* u, double* v, double* p,
                       double hx_inv, double hy_inv) -> void
 {
     int jstart, jend,
@@ -525,6 +538,7 @@ def project_grad_band(int row_start, int row_end,
 };
 
 // Decay only - shader does color mapping on GPU
+def decay_band(int row_start, int row_end, double* dens) -> void # effect {*Mem.Write};
 def decay_band(int row_start, int row_end, double* dens) -> void
 {
     int i, j, base;
@@ -548,12 +562,14 @@ def decay_band(int row_start, int row_end, double* dens) -> void
 // PARTICLE SYSTEM - update only, rendering done by GPU point sprites
 // ============================================================================
 
+def fast_rand() -> int # effect {*Mem.Write};
 def fast_rand() -> int
 {
     g_rand_seed = g_rand_seed * 1664525 + 1013904223;
     return g_rand_seed & 0x7FFFFFFF;
 };
 
+def particles_init() -> void # effect {*Mem.Write};
 def particles_init() -> void
 {
     int i;
@@ -567,6 +583,7 @@ def particles_init() -> void
     return;
 };
 
+def particles_update() -> void # effect {*Mem.Write};
 def particles_update() -> void
 {
     int   i, pi, pj;
@@ -614,6 +631,7 @@ def particles_update() -> void
 // PERSISTENT WORKER
 // ============================================================================
 
+def worker(void* arg) -> void* # effect {*Sync.Wait & *Sync.Signal & *Mem.Write};
 def worker(void* arg) -> void*
 {
     WorkSlice* sl;
@@ -659,6 +677,7 @@ def worker(void* arg) -> void*
     return (void*)0;
 };
 
+def worker2(void* arg) -> void* # effect {*Sync.Wait & *Sync.Signal & *Mem.Write};
 def worker2(void* arg) -> void*
 {
     WorkSlice* sl;
@@ -704,6 +723,7 @@ def worker2(void* arg) -> void*
     return (void*)0;
 };
 
+def dispatch_linsolve2(int color, double* x, double* x0, double a, double c_inv) -> void # effect {*Sync.Signal & *Mem.Write};
 def dispatch_linsolve2(int color, double* x, double* x0, double a, double c_inv) -> void
 {
     int t;
@@ -722,6 +742,7 @@ def dispatch_linsolve2(int color, double* x, double* x0, double a, double c_inv)
     return;
 };
 
+def collect2() -> void # effect {*Sync.Wait};
 def collect2() -> void
 {
     int t;
@@ -729,6 +750,7 @@ def collect2() -> void
     return;
 };
 
+def dispatch_linsolve_post(int color, double* x, double* x0, double a, double c_inv) -> void # effect {*Sync.Signal & *Mem.Write};
 def dispatch_linsolve_post(int color, double* x, double* x0, double a, double c_inv) -> void
 {
     int t;
@@ -747,6 +769,7 @@ def dispatch_linsolve_post(int color, double* x, double* x0, double a, double c_
     return;
 };
 
+def collect1() -> void # effect {*Sync.Wait};
 def collect1() -> void
 {
     int t;
@@ -754,6 +777,7 @@ def collect1() -> void
     return;
 };
 
+def dispatch_linsolve(int color, double* x, double* x0, double a, double c_inv) -> void # effect {*Sync.Signal & *Sync.Wait & *Mem.Write};
 def dispatch_linsolve(int color, double* x, double* x0, double a, double c_inv) -> void
 {
     int t;
@@ -773,6 +797,7 @@ def dispatch_linsolve(int color, double* x, double* x0, double a, double c_inv) 
     return;
 };
 
+def dispatch_advect(double* dst, double* src, double* u, double* v) -> void # effect {*Sync.Signal & *Sync.Wait & *Mem.Write};
 def dispatch_advect(double* dst, double* src, double* u, double* v) -> void
 {
     int t;
@@ -791,6 +816,8 @@ def dispatch_advect(double* dst, double* src, double* u, double* v) -> void
     return;
 };
 
+def dispatch_project_div(double* u, double* v, double* p, double* div,
+                          double hx, double hy) -> void # effect {*Sync.Signal & *Sync.Wait & *Mem.Write};
 def dispatch_project_div(double* u, double* v, double* p, double* div,
                           double hx, double hy) -> void
 {
@@ -813,6 +840,8 @@ def dispatch_project_div(double* u, double* v, double* p, double* div,
 };
 
 def dispatch_project_grad(double* u, double* v, double* p,
+                           double hx_inv, double hy_inv) -> void # effect {*Sync.Signal & *Sync.Wait & *Mem.Write};
+def dispatch_project_grad(double* u, double* v, double* p,
                            double hx_inv, double hy_inv) -> void
 {
     int t;
@@ -832,6 +861,7 @@ def dispatch_project_grad(double* u, double* v, double* p,
     return;
 };
 
+def dispatch_decay() -> void # effect {*Sync.Signal & *Sync.Wait & *Mem.Write};
 def dispatch_decay() -> void
 {
     int t;
@@ -848,6 +878,7 @@ def dispatch_decay() -> void
 };
 
 // Convert double fields to float upload buffers - single-threaded, cheap
+def upload_textures() -> void # effect {*Mem.Write};
 def upload_textures() -> void
 {
     int   i, n, vidx;
@@ -873,6 +904,7 @@ def upload_textures() -> void
 // RED-BLACK LIN_SOLVE - set_bnd deferred to end of all iterations
 // ============================================================================
 
+def lin_solve_parallel(int b, double* x, double* x0, double a, double c) -> void # effect {*Sync.Signal & *Sync.Wait & *Mem.Write};
 def lin_solve_parallel(int b, double* x, double* x0, double a, double c) -> void
 {
     double c_inv;
@@ -895,6 +927,7 @@ def lin_solve_parallel(int b, double* x, double* x0, double a, double c) -> void
 // DIFFUSE
 // ============================================================================
 
+def diffuse(int b, double* x, double* x0, double diff) -> void # effect {*Sync.Signal & *Sync.Wait & *Mem.Write};
 def diffuse(int b, double* x, double* x0, double diff) -> void
 {
     double a;
@@ -907,6 +940,7 @@ def diffuse(int b, double* x, double* x0, double diff) -> void
 // PROJECT - divergence and gradient passes both threaded
 // ============================================================================
 
+def project(double* u, double* v, double* p, double* div) -> void # effect {*Sync.Signal & *Sync.Wait & *Mem.Write};
 def project(double* u, double* v, double* p, double* div) -> void
 {
     double hx, hy, hx_inv, hy_inv;
@@ -930,6 +964,7 @@ def project(double* u, double* v, double* p, double* div) -> void
 // LIN_SOLVE ON POOL2
 // ============================================================================
 
+def lin_solve_parallel2(int b, double* x, double* x0, double a, double c) -> void # effect {*Sync.Signal & *Sync.Wait & *Mem.Write};
 def lin_solve_parallel2(int b, double* x, double* x0, double a, double c) -> void
 {
     double c_inv;
@@ -952,6 +987,8 @@ def lin_solve_parallel2(int b, double* x, double* x0, double a, double c) -> voi
 // CONCURRENT DIFFUSE - runs two independent fields across both pools at once
 // ============================================================================
 
+def diffuse_concurrent(int b1, double* x1, double* x10, double diff1,
+                        int b2, double* x2, double* x20, double diff2) -> void # effect {*Sync.Signal & *Sync.Wait & *Mem.Write};
 def diffuse_concurrent(int b1, double* x1, double* x10, double diff1,
                         int b2, double* x2, double* x20, double diff2) -> void
 {
@@ -996,6 +1033,7 @@ def diffuse_concurrent(int b1, double* x1, double* x10, double diff1,
 // VORTICITY INJECTION - scatter random curl eddies into velocity field
 // ============================================================================
 
+def inject_vorticity() -> void # effect {*Mem.Write};
 def inject_vorticity() -> void
 {
     int    k, cx, cy, sign, r;
@@ -1040,6 +1078,7 @@ def inject_vorticity() -> void
     return;
 };
 
+def vorticity_confinement(double* vx, double* vy) -> void # effect {*Mem.Write};
 def vorticity_confinement(double* vx, double* vy) -> void
 {
     int    i, j, base, idx;
@@ -1088,6 +1127,7 @@ def vorticity_confinement(double* vx, double* vy) -> void
     return;
 };
 
+def vel_step() -> void # effect {*Sync.Signal & *Sync.Wait & *Mem.Write};
 def vel_step() -> void
 {
     // Diffuse vx (pool1) and vy (pool2) concurrently - independent fields
@@ -1112,6 +1152,7 @@ def vel_step() -> void
 // DENSITY STEP
 // ============================================================================
 
+def dens_step() -> void # effect {*Sync.Signal & *Sync.Wait & *Mem.Write};
 def dens_step() -> void
 {
     int    i, j, base, pass;
@@ -1151,6 +1192,7 @@ def dens_step() -> void
 // ADD SOURCE AT MOUSE
 // ============================================================================
 
+def add_source() -> void # effect {*Mem.Write};
 def add_source() -> void
 {
     int    gx, gy, r, i, j;
@@ -1220,6 +1262,7 @@ def add_source() -> void
 // PADDLE
 // ============================================================================
 
+def paddle_update() -> void # effect {*Mem.Write};
 def paddle_update() -> void
 {
     int    gy, jet_center, j, jstart, jend, jet_x, jitter;
@@ -1303,6 +1346,7 @@ def paddle_update() -> void
     return;
 };
 
+def cpu_paddle_update() -> void # effect {*Mem.Write};
 def cpu_paddle_update() -> void
 {
     int    gy, ball_gy, diff, jet_center, j, jstart, jend, jet_x, jitter;
@@ -1350,6 +1394,7 @@ def cpu_paddle_update() -> void
 
 // Draw a paddle given its grid x-left edge and grid center y
 // jet_side: 1 = jet face on right, -1 = jet face on left
+def draw_paddle(int w, int h, int grid_x, int center_gy) -> void # effect {*IO.GPU};
 def draw_paddle(int w, int h, int grid_x, int center_gy) -> void
 {
     int   cols, rows,
@@ -1435,6 +1480,7 @@ def draw_paddle(int w, int h, int grid_x, int center_gy) -> void
 // BALL
 // ============================================================================
 
+def ball_reset(int w, int h) -> void # effect {*Mem.Write};
 def ball_reset(int w, int h) -> void
 {
     g_ball_x        = (float)w * 0.5;
@@ -1449,6 +1495,7 @@ def ball_reset(int w, int h) -> void
     return;
 };
 
+def ball_update(int w, int h) -> void # effect {*Mem.Write};
 def ball_update(int w, int h) -> void
 {
     int   gx, gy, gx_l, gx_r;
@@ -1576,6 +1623,7 @@ def ball_update(int w, int h) -> void
     return;
 };
 
+def draw_ball(int w, int h) -> void # effect {*IO.GPU};
 def draw_ball(int w, int h) -> void
 {
     int   seg, num_seg;
@@ -1650,6 +1698,7 @@ def draw_ball(int w, int h) -> void
 // ============================================================================
 
 // Write decimal integer into buf, returns character count, null terminates
+def int_to_str(int val, byte* buf) -> int # effect {Pure};
 def int_to_str(int val, byte* buf) -> int
 {
     int  tmp, count, i, j, len;
@@ -1695,6 +1744,7 @@ def int_to_str(int val, byte* buf) -> int
     return len;
 };
 
+def draw_hud(int w, int h) -> void # effect {*IO.GPU};
 def draw_hud(int w, int h) -> void
 {
     int   scale, tx, ty, tw, lv, li,
@@ -1935,6 +1985,7 @@ struct SYSTEM_INFO_PARTIAL
 // ============================================================================
 
 // All buttons use the same half-width/half-height as the main button for hit testing
+def btn_hit_test(int mx, int my, int cx, int cy) -> bool # effect {Pure};
 def btn_hit_test(int mx, int my, int cx, int cy) -> bool
 {
     int   half_w, half_h, local_y, x_offset, local_x;
@@ -1956,6 +2007,7 @@ def btn_hit_test(int mx, int my, int cx, int cy) -> bool
 };
 
 // Parametric hit test for buttons with custom half-extents and slant
+def btn_hit_test_ex(int mx, int my, int cx, int cy, int half_w, int half_h) -> bool # effect {Pure};
 def btn_hit_test_ex(int mx, int my, int cx, int cy, int half_w, int half_h) -> bool
 {
     int   local_y, x_offset, local_x, slant;
@@ -2040,6 +2092,7 @@ u32[5] FONT_Z       = [0x61, 0x51, 0x49, 0x45, 0x43];
 
 // Lookup: map ASCII code to font data pointer
 // Returns pointer to 5-u32 column array for a given character
+def font_glyph(int c) -> u32* # effect {Pure};
 def font_glyph(int c) -> u32*
 {
     if (c == 32)  { return @FONT_SPACE[0];  };
@@ -2107,6 +2160,7 @@ def font_glyph(int c) -> u32*
 // Draw a null-terminated uppercase ASCII string as pixel quads
 // px, py = top-left pixel origin of text; scale = pixel size of each font dot
 // inv_w, inv_h = 2.0/screen_w and 2.0/screen_h for NDC conversion
+def draw_text(byte* str, int px, int py, int scale, float inv_w, float inv_h) -> void # effect {*IO.GPU};
 def draw_text(byte* str, int px, int py, int scale, float inv_w, float inv_h) -> void
 {
     int   ci,       // character index in string
@@ -2173,6 +2227,7 @@ def draw_text(byte* str, int px, int py, int scale, float inv_w, float inv_h) ->
 };
 
 // Measure text width in pixels for centering
+def text_width(byte* str, int scale) -> int # effect {Pure};
 def text_width(byte* str, int scale) -> int
 {
     int ci, c, count;
@@ -2192,6 +2247,7 @@ def text_width(byte* str, int scale) -> int
 
 // Draw a parallelogram button at pixel center (cx, cy) with given half-width and half-height
 // highlight = 1 draws with a lighter fill (hover/active feel for dialog boxes)
+def draw_parallelogram_btn(int cx, int cy, int half_w, int half_h, int slant, float inv_w, float inv_h) -> void # effect {*IO.GPU};
 def draw_parallelogram_btn(int cx, int cy, int half_w, int half_h, int slant, float inv_w, float inv_h) -> void
 {
     int   bx0, bx1, tx0, tx1, by0, ty0;
@@ -2256,6 +2312,7 @@ def draw_parallelogram_btn(int cx, int cy, int half_w, int half_h, int slant, fl
     return;
 };
 
+def draw_gui(int w, int h) -> void # effect {*IO.GPU};
 def draw_gui(int w, int h) -> void
 {
     int   cx, cy, tw, tx, ty, scale;
@@ -2291,6 +2348,7 @@ def draw_gui(int w, int h) -> void
     return;
 };
 
+def draw_quit_dialog(int w, int h) -> void # effect {*IO.GPU};
 def draw_quit_dialog(int w, int h) -> void
 {
     int   cx, cy,

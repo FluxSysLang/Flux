@@ -86,6 +86,7 @@ class TokenType(Enum):
     ELIF = auto()         # "        elif | else if
     ELSE = auto()         # "        else
     ENUM = auto()         # "        enum
+    EFFECT = auto()       # "        effect
     ESCAPE_KW = auto()    # "        escape
     EXPORT = auto()       # "        export
     EXTERN = auto()       # "        extern
@@ -566,6 +567,7 @@ class FluxLexer:
             'macro': TokenType.MACRO,
             'endianof': TokenType.ENDIANOF,
             'enum': TokenType.ENUM,
+            'effect': TokenType.EFFECT,
             'escape': TokenType.ESCAPE_KW,
             'export': TokenType.EXPORT,
             'extern': TokenType.EXTERN,

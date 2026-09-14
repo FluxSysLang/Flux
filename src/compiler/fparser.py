@@ -1137,6 +1137,8 @@ class FluxParser:
             return self.contract_def()
         elif self.expect(TokenType.CONSTRAINT):
             return self.constra_def()
+        elif self.expect(TokenType.EFFECT):
+            return self.effect_def()
         elif self.expect(TokenType.INLINE):
             return self.function_def()
         elif self.expect(TokenType.DEF):
@@ -2260,124 +2262,171 @@ class FluxParser:
         # NOTE: _active_template_params intentionally stays set through the body parse
         # so that template struct usages inside the body (e.g. myStru<T> x;) are also
         # deferred correctly.  It is restored after the entire function is parsed.
-        # Pattern: def foo() -> int, foo() -> bool, foo(int) -> void;
-        if self.expect(TokenType.COMMA):
-            # This is a multi-function prototype declaration
-            prototypes = []
 
-            # Detect variadic sentinel in first prototype's parameters
-            _is_var = any(getattr(p, '_is_variadic_sentinel', False) for p in parameters)
-            _real_params = [p for p in parameters if not getattr(p, '_is_variadic_sentinel', False)]
-            
-            # Add the first prototype
-            prototypes.append(FunctionDef(name, _real_params, return_type, Block([]),
-                                        is_const, is_volatile, True, no_mangle, _is_var, calling_conv,
-                                        False, is_inline))
-            
-            # Parse additional prototypes
-            while self.expect(TokenType.COMMA):
-                self.advance()  # consume comma
-                
-                # Each additional prototype has its own name (can also be string literal, f-string, or i-string)
-                if self.expect(TokenType.STRING_LITERAL):
-                    proto_name = self.consume(TokenType.STRING_LITERAL).value
-                elif self.expect(TokenType.F_STRING):
-                    tok = self.current_token
-                    proto_name = self.parse_f_string(self.consume(TokenType.F_STRING).value).set_location(tok.line, tok.column)
-                elif self.expect(TokenType.I_STRING):
-                    tok = self.current_token
-                    proto_name = self.parse_i_string(self.consume(TokenType.I_STRING).value).set_location(tok.line, tok.column)
-                elif self.expect(TokenType.STRINGIFY):
-                    tok = self.current_token
+        # Tag annotation variables -- always initialized here so they are defined
+        # regardless of which branch below is taken.
+        is_deprecated = False
+        effect_ann = None
+        attenuate_ann = None
+
+        # Pattern: def foo() -> int, foo() -> bool, foo(int) -> void;
+        if self.expect(TokenType.TAG) or self.expect(TokenType.COMMA):
+            # Check if this is a multi-function prototype declaration or just tags on a single prototype
+            # Parse any tags that appear before the comma
+            _first_effect_ann = None
+            _first_attenuate_ann = None
+            _first_deprecated = False
+            while self.expect(TokenType.TAG):
+                self.advance()
+                if self.expect(TokenType.DEPRECATE):
                     self.advance()
-                    if self.expect(TokenType.CODIFY):
-                        resolved = self._consume_codify()
-                        proto_name = StringLiteral(resolved).set_location(tok.line, tok.column)
-                    else:
-                        if not self.expect(TokenType.IDENTIFIER):
-                            self.error("Expected identifier after '$' in function name", TokenType.IDENTIFIER)
-                        _sn = self.current_token.value
+                    _first_deprecated = True
+                elif self.expect(TokenType.EFFECT):
+                    self.advance()
+                    self.consume(TokenType.LEFT_BRACE)
+                    _first_effect_ann = EffectAnnotation(self._parse_effect_expr())
+                    self.consume(TokenType.RIGHT_BRACE)
+                elif self.expect(TokenType.IDENTIFIER) and self.current_token.value == 'attenuate':
+                    self.advance()
+                    self.consume(TokenType.LEFT_BRACE)
+                    _first_attenuate_ann = AttenuateAnnotation(self._parse_effect_expr())
+                    self.consume(TokenType.RIGHT_BRACE)
+                else:
+                    self.error("Expected 'deprecate', 'effect', or 'attenuate' after '#'")
+
+            if self.expect(TokenType.COMMA):
+                # This is a multi-function prototype declaration
+                prototypes = []
+
+                # Detect variadic sentinel in first prototype's parameters
+                _is_var = any(getattr(p, '_is_variadic_sentinel', False) for p in parameters)
+                _real_params = [p for p in parameters if not getattr(p, '_is_variadic_sentinel', False)]
+                
+                # Add the first prototype with its tags
+                _first_fd = FunctionDef(name, _real_params, return_type, Block([]),
+                                        is_const, is_volatile, True, no_mangle, _is_var, calling_conv,
+                                        False, is_inline, _first_deprecated, _first_effect_ann, _first_attenuate_ann)
+                prototypes.append(_first_fd)
+                
+                # Parse additional prototypes
+                while self.expect(TokenType.COMMA):
+                    self.advance()  # consume comma
+                    
+                    # Each additional prototype has its own name (can also be string literal, f-string, or i-string)
+                    if self.expect(TokenType.STRING_LITERAL):
+                        proto_name = self.consume(TokenType.STRING_LITERAL).value
+                    elif self.expect(TokenType.F_STRING):
+                        tok = self.current_token
+                        proto_name = self.parse_f_string(self.consume(TokenType.F_STRING).value).set_location(tok.line, tok.column)
+                    elif self.expect(TokenType.I_STRING):
+                        tok = self.current_token
+                        proto_name = self.parse_i_string(self.consume(TokenType.I_STRING).value).set_location(tok.line, tok.column)
+                    elif self.expect(TokenType.STRINGIFY):
+                        tok = self.current_token
                         self.advance()
-                        _sm = None
-                        if self.expect(TokenType.DOT):
+                        if self.expect(TokenType.CODIFY):
+                            resolved = self._consume_codify()
+                            proto_name = StringLiteral(resolved).set_location(tok.line, tok.column)
+                        else:
+                            if not self.expect(TokenType.IDENTIFIER):
+                                self.error("Expected identifier after '$' in function name", TokenType.IDENTIFIER)
+                            _sn = self.current_token.value
+                            self.advance()
+                            _sm = None
+                            if self.expect(TokenType.DOT):
+                                self.advance()
+                                if self.expect(TokenType.IDENTIFIER):
+                                    _sm = self.current_token.value
+                                    self.advance()
+                                elif self.expect(TokenType.TAG):
+                                    self.advance()
+                                    _sm = "#"
+                                else:
+                                    self.error("Expected member name after '.' in stringify function name", TokenType.IDENTIFIER)
+                            proto_name = Stringify(_sn, _sm).set_location(tok.line, tok.column)
+                    elif self.expect(TokenType.IDENTIFIER):
+                        proto_name = self.consume(TokenType.IDENTIFIER).value
+                    else:
+                        self.error("Expected function name (identifier or string literal)", TokenType.IDENTIFIER)
+
+                    # Optional template params for this prototype: name<T, U>(...)
+                    proto_template_params = []
+                    if self.expect(TokenType.LESS_THAN):
+                        with self._lookahead():
+                            _is_tmpl = False
                             self.advance()
                             if self.expect(TokenType.IDENTIFIER):
-                                _sm = self.current_token.value
                                 self.advance()
-                            elif self.expect(TokenType.TAG):
-                                self.advance()
-                                _sm = "#"
-                            else:
-                                self.error("Expected member name after '.' in stringify function name", TokenType.IDENTIFIER)
-                        proto_name = Stringify(_sn, _sm).set_location(tok.line, tok.column)
-                elif self.expect(TokenType.IDENTIFIER):
-                    proto_name = self.consume(TokenType.IDENTIFIER).value
-                else:
-                    self.error("Expected function name (identifier or string literal)", TokenType.IDENTIFIER)
-
-                # Optional template params for this prototype: name<T, U>(...)
-                proto_template_params = []
-                if self.expect(TokenType.LESS_THAN):
-                    with self._lookahead():
-                        _is_tmpl = False
-                        self.advance()
-                        if self.expect(TokenType.IDENTIFIER):
-                            self.advance()
+                                while self.expect(TokenType.COMMA):
+                                    self.advance()
+                                    if not self.expect(TokenType.IDENTIFIER):
+                                        break
+                                    self.advance()
+                                if self.expect(TokenType.GREATER_THAN):
+                                    _is_tmpl = True
+                        if _is_tmpl:
+                            self.advance()  # consume '<'
+                            proto_template_params.append(self.consume(TokenType.IDENTIFIER).value)
                             while self.expect(TokenType.COMMA):
                                 self.advance()
-                                if not self.expect(TokenType.IDENTIFIER):
-                                    break
-                                self.advance()
-                            if self.expect(TokenType.GREATER_THAN):
-                                _is_tmpl = True
-                    if _is_tmpl:
-                        self.advance()  # consume '<'
-                        proto_template_params.append(self.consume(TokenType.IDENTIFIER).value)
-                        while self.expect(TokenType.COMMA):
+                                proto_template_params.append(self.consume(TokenType.IDENTIFIER).value)
+                            self.consume(TokenType.GREATER_THAN)
+                    with self._template_scope(proto_template_params if proto_template_params else []):
+                    
+                        self.consume(TokenType.LEFT_PAREN)
+                        proto_parameters = []
+                        if not self.expect(TokenType.RIGHT_PAREN):
+                            proto_parameters = self.parameter_list()
+                        self.consume(TokenType.RIGHT_PAREN)
+                    
+                        self.consume(TokenType.RETURN_ARROW)
+                        proto_return_type = self.type_spec()
+
+                    # Parse tags for this prototype entry
+                    _proto_effect_ann = None
+                    _proto_attenuate_ann = None
+                    _proto_deprecated = False
+                    while self.expect(TokenType.TAG):
+                        self.advance()
+                        if self.expect(TokenType.DEPRECATE):
                             self.advance()
-                            proto_template_params.append(self.consume(TokenType.IDENTIFIER).value)
-                        self.consume(TokenType.GREATER_THAN)
-                with self._template_scope(proto_template_params if proto_template_params else []):
+                            _proto_deprecated = True
+                        elif self.expect(TokenType.EFFECT):
+                            self.advance()
+                            self.consume(TokenType.LEFT_BRACE)
+                            _proto_effect_ann = EffectAnnotation(self._parse_effect_expr())
+                            self.consume(TokenType.RIGHT_BRACE)
+                        elif self.expect(TokenType.IDENTIFIER) and self.current_token.value == 'attenuate':
+                            self.advance()
+                            self.consume(TokenType.LEFT_BRACE)
+                            _proto_attenuate_ann = AttenuateAnnotation(self._parse_effect_expr())
+                            self.consume(TokenType.RIGHT_BRACE)
+                        else:
+                            self.error("Expected 'deprecate', 'effect', or 'attenuate' after '#'")
+
+                    _proto_is_var = any(getattr(p, '_is_variadic_sentinel', False) for p in proto_parameters)
+                    _proto_real = [p for p in proto_parameters if not getattr(p, '_is_variadic_sentinel', False)]
+
+                    # no_mangle applies to ALL functions in this comma-separated list
+                    _proto_fd = FunctionDef(proto_name, _proto_real, proto_return_type,
+                                            Block([]), is_const, is_volatile, True, no_mangle, _proto_is_var, calling_conv,
+                                            False, is_inline, _proto_deprecated, _proto_effect_ann, _proto_attenuate_ann)
+                    if proto_template_params:
+                        _proto_fd._is_trait_template_proto = True
+                    prototypes.append(_proto_fd)
                 
-                    self.consume(TokenType.LEFT_PAREN)
-                    proto_parameters = []
-                    if not self.expect(TokenType.RIGHT_PAREN):
-                        proto_parameters = self.parameter_list()
-                    self.consume(TokenType.RIGHT_PAREN)
+                self.consume(TokenType.SEMICOLON)
                 
-                    self.consume(TokenType.RETURN_ARROW)
-                    proto_return_type = self.type_spec()
+                # Restore active template params - this early return bypasses the normal restore at end of function_def.
+                _tmpl_scope_ctx.__exit__(None, None, None)
+                # Return the list of prototypes
+                return [fd.set_location(tok.line, tok.column) for fd in prototypes]
 
-                _proto_is_var = any(getattr(p, '_is_variadic_sentinel', False) for p in proto_parameters)
-                _proto_real = [p for p in proto_parameters if not getattr(p, '_is_variadic_sentinel', False)]
-
-                # no_mangle applies to ALL functions in this comma-separated list
-                _proto_fd = FunctionDef(proto_name, _proto_real, proto_return_type,
-                                        Block([]), is_const, is_volatile, True, no_mangle, _proto_is_var, calling_conv,
-                                        False, is_inline)
-                if proto_template_params:
-                    _proto_fd._is_trait_template_proto = True
-                prototypes.append(_proto_fd)
-            
-            self.consume(TokenType.SEMICOLON)
-            
-            # Restore active template params - this early return bypasses the normal restore at end of function_def.
-            _tmpl_scope_ctx.__exit__(None, None, None)
-            # Return the list of prototypes
-            return [fd.set_location(tok.line, tok.column) for fd in prototypes]
-        # Parse optional # deprecate annotation on the signature.
-        # Syntax: def foo() -> void # deprecate;
-        #         def foo() -> void # deprecate { ... };
-        #         def foo() -> void # deprecate : ContractName { ... };
-        is_deprecated = False
-        if self.expect(TokenType.TAG):
-            self.advance()
-            if not self.expect(TokenType.DEPRECATE):
-                self.error("Expected 'deprecate' after '#' in function signature")
-            else:
-                self.advance()
-                is_deprecated = True
-
+            # Single prototype with tags -- fall through to normal prototype/definition path
+            # carrying the parsed tags into the tag variables below
+            is_deprecated = _first_deprecated
+            effect_ann = _first_effect_ann
+            attenuate_ann = _first_attenuate_ann
         # Resolve contract(s): def foo(int x) -> int : NonZero, LessThan(y,x) { ... }
         contract_stmts = []
         if self.expect(TokenType.COLON):
@@ -2417,11 +2466,32 @@ class FluxParser:
                     self.error(f"Recursive function '{name}': return type must match parameter type")
                 else:
                     self.error(f"Recursive function '{name}' declared with '<~' must have exactly one parameter, or no parameters with void return")
-        
-        if self.expect(TokenType.SEMICOLON):
-            is_prototype = True
-            self.advance()
-            body = Block([])
+
+        if self.expect(TokenType.TAG) or self.expect(TokenType.SEMICOLON):
+            # Prototype path: parse any # tags then consume the semicolon.
+            while self.expect(TokenType.TAG):
+                self.advance()
+                if self.expect(TokenType.DEPRECATE):
+                    self.advance()
+                    is_deprecated = True
+                elif self.expect(TokenType.EFFECT):
+                    self.advance()
+                    self.consume(TokenType.LEFT_BRACE)
+                    effect_expr = self._parse_effect_expr()
+                    self.consume(TokenType.RIGHT_BRACE)
+                    effect_ann = EffectAnnotation(effect_expr)
+                elif self.expect(TokenType.IDENTIFIER) and self.current_token.value == 'attenuate':
+                    self.advance()
+                    self.consume(TokenType.LEFT_BRACE)
+                    att_expr = self._parse_effect_expr()
+                    self.consume(TokenType.RIGHT_BRACE)
+                    attenuate_ann = AttenuateAnnotation(att_expr)
+                else:
+                    self.error("Expected 'deprecate', 'effect', or 'attenuate' after '#'")
+            if self.expect(TokenType.SEMICOLON):
+                is_prototype = True
+                self.advance()
+                body = Block([])
         else:
             # Inside a trait body only prototypes are allowed - a missing ';' would
             # otherwise fall through to block() and emit a confusing LEFT_BRACE error.
@@ -2470,6 +2540,27 @@ class FluxParser:
                     post_contract_stmts.extend(self._resolve_contract(post_name, parameters, post_call_args))
             if post_contract_stmts:
                 body = self._apply_post_contracts(body, return_type, post_contract_stmts)
+            # Parse optional # qualifier tags after the closing brace -- any order, any count.
+            # Syntax: def foo() -> void { ... } # effect { expr } # attenuate { expr };
+            while self.expect(TokenType.TAG):
+                self.advance()
+                if self.expect(TokenType.DEPRECATE):
+                    self.advance()
+                    is_deprecated = True
+                elif self.expect(TokenType.EFFECT):
+                    self.advance()
+                    self.consume(TokenType.LEFT_BRACE)
+                    effect_expr = self._parse_effect_expr()
+                    self.consume(TokenType.RIGHT_BRACE)
+                    effect_ann = EffectAnnotation(effect_expr)
+                elif self.expect(TokenType.IDENTIFIER) and self.current_token.value == 'attenuate':
+                    self.advance()
+                    self.consume(TokenType.LEFT_BRACE)
+                    att_expr = self._parse_effect_expr()
+                    self.consume(TokenType.RIGHT_BRACE)
+                    attenuate_ann = AttenuateAnnotation(att_expr)
+                else:
+                    self.error("Expected 'deprecate', 'effect', or 'attenuate' after '#'")
             self.consume(TokenType.SEMICOLON)
         
         # Restore the previous active template param set now that the entire function
@@ -2480,7 +2571,7 @@ class FluxParser:
         if template_params:
             func_def = FunctionDef(name, real_parameters, return_type, body, is_const,
                                    is_volatile, is_prototype, no_mangle, is_variadic, calling_conv,
-                                   is_recursive, is_inline, is_deprecated)
+                                   is_recursive, is_inline, is_deprecated, effect_ann, attenuate_ann)
             if self._in_comptime > 0:
                 func_def._is_comptime_only = True
             self._register_template_function(name, template_params, func_def,
@@ -2494,7 +2585,7 @@ class FluxParser:
 
         return FunctionDef(name, real_parameters, return_type, body, is_const,
                           is_volatile, is_prototype, no_mangle, is_variadic, calling_conv,
-                          is_recursive, is_inline, is_deprecated).set_location(tok.line, tok.column)
+                          is_recursive, is_inline, is_deprecated, effect_ann, attenuate_ann).set_location(tok.line, tok.column)
 
     def _is_function_pointer_declaration(self) -> bool:
         """
@@ -3165,6 +3256,196 @@ class FluxParser:
         self._parsed_traits[name] = trait
         return trait
 
+    def effect_def(self) -> 'EffectDef':
+        """
+        effect_def -> 'effect' IDENTIFIER '{' effect_expr '}' ';'
+                    | 'effect' IDENTIFIER '.' IDENTIFIER '{' effect_expr '}' ';'
+
+        Parses a user-defined effect declaration and returns an EffectDef node.
+        The name may be a simple identifier or a dot-separated namespaced name.
+        """
+        tok = self.current_token
+        self.consume(TokenType.EFFECT)
+        name = self.consume(TokenType.IDENTIFIER).value
+        # Support namespaced effect names: effect Hook.Detour { ... }
+        while self.expect(TokenType.DOT):
+            self.advance()
+            sub = self.consume(TokenType.IDENTIFIER).value
+            name = name + '.' + sub
+        self.consume(TokenType.LEFT_BRACE)
+        body = self._parse_effect_expr()
+        self.consume(TokenType.RIGHT_BRACE)
+        self.consume(TokenType.SEMICOLON)
+        return EffectDef(name, body).set_location(tok.line, tok.column)
+
+    def _parse_effect_expr(self) -> 'Expression':
+        """
+        Parse an effect algebra expression inside { }.
+        Precedence (lowest to highest):
+            | (or)
+            & (and)
+            > (priority)
+            -> (implication)
+            ^ (xor / exactly-one)
+            <-> (mutual implication)
+            unary: * ~ ! ? @ !@ .. ... ^(suppress) <*
+            primary: IDENTIFIER (possibly dotted), ( expr ), [ expr ]
+        """
+        return self._effect_or()
+
+    def _effect_or(self) -> 'Expression':
+        left = self._effect_and()
+        while self.expect(TokenType.LOGICAL_OR):
+            self.advance()
+            right = self._effect_and()
+            left = EffectExpr('|', left, right)
+        return left
+
+    def _effect_and(self) -> 'Expression':
+        left = self._effect_priority()
+        while self.expect(TokenType.LOGICAL_AND):
+            self.advance()
+            right = self._effect_priority()
+            left = EffectExpr('&', left, right)
+        return left
+
+    def _effect_priority(self) -> 'Expression':
+        left = self._effect_implies()
+        while self.expect(TokenType.GREATER_THAN):
+            self.advance()
+            right = self._effect_implies()
+            left = EffectExpr('>', left, right)
+        return left
+
+    def _effect_implies(self) -> 'Expression':
+        left = self._effect_xor()
+        while self.expect(TokenType.RETURN_ARROW):
+            self.advance()
+            right = self._effect_xor()
+            left = EffectExpr('->', left, right)
+        return left
+
+    def _effect_xor(self) -> 'Expression':
+        left = self._effect_mutual()
+        while self.expect(TokenType.XOR_OP):
+            self.advance()
+            right = self._effect_mutual()
+            left = EffectExpr('^|', left, right)
+        return left
+
+    def _effect_mutual(self) -> 'Expression':
+        # <-> mutual implication -- lexes as CHAIN_ARROW (<-) + GREATER_THAN (>)
+        left = self._effect_unary()
+        while (self.expect(TokenType.CHAIN_ARROW) and self.peek()
+               and self.peek().type == TokenType.GREATER_THAN):
+            self.advance()  # consume '<-'
+            self.advance()  # consume '>'
+            right = self._effect_unary()
+            left = EffectExpr('<->', left, right)
+        return left
+
+    def _effect_unary(self) -> 'Expression':
+        tok = self.current_token
+
+        # !@ (permanent non-attenuatable) -- must check before ! alone
+        if (self.expect(TokenType.NOT) and self.peek()
+                and self.peek().type == TokenType.ADDRESS_OF):
+            self.advance()  # consume '!'
+            self.advance()  # consume '@'
+            operand = self._effect_unary()
+            return EffectExpr('!@', operand)
+
+        # ! (excludes)
+        if self.expect(TokenType.NOT):
+            self.advance()
+            operand = self._effect_unary()
+            return EffectExpr('!', operand)
+
+        # * (implies/propagates)
+        if self.expect(TokenType.MULTIPLY):
+            self.advance()
+            operand = self._effect_unary()
+            return EffectExpr('*', operand)
+
+        # ~ (requires)
+        if self.expect(TokenType.TIE):
+            self.advance()
+            operand = self._effect_unary()
+            return EffectExpr('~', operand)
+
+        # ? (weak)
+        if self.expect(TokenType.QUESTION):
+            self.advance()
+            operand = self._effect_unary()
+            return EffectExpr('?', operand)
+
+        # @ (attenuatable)
+        if self.expect(TokenType.ADDRESS_OF):
+            self.advance()
+            operand = self._effect_unary()
+            return EffectExpr('@', operand)
+
+        # ... (propagates indefinitely) -- must check before ..
+        if self.expect(TokenType.ELLIPSIS):
+            self.advance()
+            operand = self._effect_unary()
+            return EffectExpr('...', operand)
+
+        # .. (one-level propagation)
+        if self.expect(TokenType.RANGE):
+            self.advance()
+            operand = self._effect_unary()
+            return EffectExpr('..', operand)
+
+        # ^X (suppress) -- bare ^ not followed by | is the suppress operator
+        if (self.expect(TokenType.EXPONENT) and self.peek()
+                and self.peek().type != TokenType.LOGICAL_OR):
+            self.advance()
+            operand = self._effect_unary()
+            return EffectExpr('^suppress', operand)
+
+        # <* (caller propagation) -- < followed by *
+        if (self.expect(TokenType.LESS_THAN) and self.peek()
+                and self.peek().type == TokenType.MULTIPLY):
+            self.advance()  # consume '<'
+            self.advance()  # consume '*'
+            operand = self._effect_unary()
+            return EffectExpr('<*', operand)
+
+        return self._effect_primary()
+
+    def _effect_primary(self) -> 'Expression':
+        tok = self.current_token
+
+        # Parenthesised group
+        if self.expect(TokenType.LEFT_PAREN):
+            self.advance()
+            expr = self._parse_effect_expr()
+            self.consume(TokenType.RIGHT_PAREN)
+            return expr
+
+        # Bracketed group (alternative grouping syntax from the spec: [expr])
+        if self.expect(TokenType.LEFT_BRACKET):
+            self.advance()
+            expr = self._parse_effect_expr()
+            self.consume(TokenType.RIGHT_BRACKET)
+            return expr
+
+        # Effect name -- identifier, possibly dotted (IO.Socket, Hook.Detour)
+        if self.expect(TokenType.IDENTIFIER) or self.expect(TokenType.EFFECT):
+            name = self.current_token.value
+            self.advance()
+            while self.expect(TokenType.DOT):
+                self.advance()
+                if not self.expect(TokenType.IDENTIFIER):
+                    self.error("Expected identifier after '.' in effect name")
+                sub = self.current_token.value
+                self.advance()
+                name = name + '.' + sub
+            return EffectName(name).set_location(tok.line, tok.column)
+
+        self.error("Expected effect expression (identifier, unary operator, or grouped expression)")
+
     def interface_def(self) -> 'InterfaceDef':
         """
         interface_def -> 'interface' IDENTIFIER '(' param_list ')' '{' protocol_list '}' ';'
@@ -3252,8 +3533,33 @@ class FluxParser:
             self.consume(TokenType.SEMICOLON)
 
         self.consume(TokenType.RIGHT_BRACE)
+
+        # Parse optional # qualifier tags -- any order, any count.
+        # Syntax: interface Foo(...) { ... } # attenuate { expr } # effect { expr };
+        iface_effect_ann = None
+        iface_attenuate_ann = None
+        while self.expect(TokenType.TAG):
+            self.advance()
+            if self.expect(TokenType.EFFECT):
+                self.advance()
+                self.consume(TokenType.LEFT_BRACE)
+                eff_expr = self._parse_effect_expr()
+                self.consume(TokenType.RIGHT_BRACE)
+                iface_effect_ann = EffectAnnotation(eff_expr)
+            elif self.expect(TokenType.IDENTIFIER) and self.current_token.value == 'attenuate':
+                self.advance()
+                self.consume(TokenType.LEFT_BRACE)
+                att_expr = self._parse_effect_expr()
+                self.consume(TokenType.RIGHT_BRACE)
+                iface_attenuate_ann = AttenuateAnnotation(att_expr)
+            else:
+                self.error("Expected 'effect' or 'attenuate' after '#' in interface definition")
+
         self.consume(TokenType.SEMICOLON)
-        return InterfaceDef(name, params, protocols).set_location(tok.line, tok.column)
+        idef = InterfaceDef(name, params, protocols)
+        idef.attenuate_annotation = iface_attenuate_ann
+        idef.effect_annotation = iface_effect_ann
+        return idef.set_location(tok.line, tok.column)
 
     def _parse_interface_proto_list(self) -> list:
         """

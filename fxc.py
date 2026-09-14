@@ -104,6 +104,8 @@ def main():
             print("Basic Options:")
             print("  --borrowcheck       Run borrow checker before compiling (errors block compilation)")
             print("  --borrowcheck-warn  Run borrow checker in warning-only mode (never blocks)")
+            print("  --effects           Enforce effect annotations -- violations are errors")
+            print("  --effects-warn      Enforce effect annotations -- violations are warnings only")
             print("  --entrypoint        Set the entrypoint (default FRTStartup)")
             print("  -o <output>         Output binary name")
             print("  -v <level>          Legacy verbosity level (0-5)")
@@ -154,6 +156,8 @@ def main():
     
         borrow_check = False
         borrow_check_warn = False
+        effects_strict = False
+        effects_warn = False
         cli_entrypoint = None
         i = 0
         while i < len(args):
@@ -216,6 +220,12 @@ def main():
                 borrow_check = True
                 borrow_check_warn = True
                 i += 1
+            elif arg == "--effects":
+                effects_strict = True
+                i += 1
+            elif arg == "--effects-warn":
+                effects_warn = True
+                i += 1
             elif arg == "--entrypoint" and i + 1 < len(args):
                 cli_entrypoint = args[i + 1]
                 i += 2
@@ -263,6 +273,12 @@ def main():
             if borrow_check:
                 compiler.borrow_check = True
                 compiler.borrow_check_warn = borrow_check_warn
+
+            # Pass effect system flags to the compiler
+            if effects_strict:
+                compiler.effects_strict = True
+            if effects_warn:
+                compiler.effects_warn = True
 
             # Override entrypoint if provided on CLI -- takes priority over flux_config.cfg
             if cli_entrypoint:

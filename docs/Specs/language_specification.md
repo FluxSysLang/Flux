@@ -101,6 +101,7 @@ If you like Flux, please consider contributing to the language or joining the [F
 - [The Ditto Operator](#the-ditto-operator)
 - [Compile Time Execution with `comptime`](#compile-time-execution-with-comptime)
 - [Emitting code back into your source file with `emitflux`](#emitflux)
+- [The Effect System - Algebraic Effect Tracking](#flux-effect-system)
 - [Keyword list](#keyword-list)
 - [Operator list](#operator-list)
 - [Operator Precedence and Associativity](#operator-precedence-and-associativity)
@@ -1841,7 +1842,7 @@ Then we can create a function pointer to that function:
 ```
 PointerMap pm;
 
-def foo() -> void = @pm.DedupSchedule;
+def foo() -> void = (@)pm.DedupSchedule; // (@) treats the value as an address
 
 foo();
 ```
@@ -3847,12 +3848,496 @@ This means emitted definitions are always available to runtime code, but are not
 
 ---
 
+<a id="flux-effect-system">
+# The Effect System - Algebraic Effect Tracking
+
+See [Flux Effect System](https://github.com/kvthweatt/FluxLang/blob/main/docs/effects_system.md) for a more thorough explanation of effects.
+
+Effects are compile-time properties of computation. They describe what a function
+does beyond its return value -- whether it allocates, touches IO, modifies memory,
+hooks into running code, or any other observable behavior. The compiler tracks these
+properties statically, enforces constraints across call chains, and erases them
+entirely before codegen. Zero runtime cost.
+
+---
+
+## Overview
+
+An effect is not a label. A label is metadata the compiler carries. An effect is a
+membership in a relationship algebra the compiler reasons from. The algebra is what
+makes it programming the compiler rather than annotating for it.
+
+There are two annotation sites: origin and boundary.
+
+**Origin** (`# effect {}`) declares what effects a function introduces.
+
+**Boundary** (`# attenuate {}`) declares what effects are contained and cannot
+escape a function's interface.
+
+Everything in between is inferred. Effects propagate transitively up the call chain
+without annotation. If `a` calls `b` calls `c`, and `c` introduces `Alloc.Heap`,
+then `a`'s transitive effect set includes `Alloc.Heap` even if `b` has no annotation.
+The compiler computes this through fixed-point propagation over the full call graph.
+
+---
+
+## Syntax
+
+### Effect declaration
+
+```
+effect Name { expr };
+effect Name.Sub { expr };
+```
+
+Declares a user-defined named effect. The body is an effect algebra expression.
+Effect names may be dot-separated to express namespacing. User-defined effects
+compose on top of built-in effects.
+
+```
+effect ShadowStack { *Hook & !@Unsafe & !Alloc };
+effect RealTime    { !Alloc & !IO & !Throw };
+effect NetworkIO   { *IO.Socket & [Mem.Write | Mem.Read] };
+```
+
+### Origin annotation
+
+```
+def foo() -> void # effect { expr };
+def foo() -> void { ... };
+```
+
+Declares that `foo` introduces the effects described by `expr`. The annotation goes
+on the prototype. Definitions inherit it -- you do not repeat the tag on the
+definition site.
+
+Tags may be chained in any order after contracts:
+
+```
+def foo() -> void : SomeContract # effect {*Alloc.Heap} # attenuate {IO};
+def foo() -> void { ... };
+```
+
+Tags may also appear after the closing brace of a definition body:
+
+```
+def foo() -> void
+{
+    ...
+} # effect {*IO.Console};
+```
+
+### Boundary annotation
+
+```
+def foo() -> void # attenuate { expr };
+```
+
+Declares that the effects described by `expr` are contained within `foo` and do not
+propagate to callers. A caller with `!IO` can call a function annotated
+`# attenuate {IO}` without violation -- the effect exists internally but cannot
+cross the boundary.
+
+Interfaces may also carry attenuation:
+
+```
+interface Sandbox { ... } # attenuate {IO & Alloc};
+```
+
+---
+
+## Compiler Flags
+
+| Flag | Behavior |
+|------|----------|
+| *(default)* | Transparent -- annotations stored, no enforcement |
+| `--effects-warn` | Violations reported as warnings, compilation continues |
+| `--effects` | Violations are errors, compilation aborted |
+
+---
+
+## Operator Set
+
+All operators are only valid inside `effect {}` and `# attenuate {}` blocks.
+
+### Unary operators
+
+| Operator | Meaning |
+|----------|---------|
+| `*X` | Implies X -- X propagates upward through the call chain |
+| `!X` | Excludes X -- X must not be present |
+| `~X` | Requires X -- X must already be present |
+| `?X` | Weak propagation -- X propagates but can be suppressed |
+| `@X` | Explicitly marks X as attenuatable at a boundary |
+| `!@X` | Permanently non-attenuatable -- X can never be stripped |
+| `^X` | Suppresses X even if something else implies it |
+| `..X` | Propagates exactly one level up, then stops |
+| `...X` | Propagates indefinitely (this is the default behavior) |
+| `<*X` | Propagates to the caller only, not further up the chain |
+
+### Binary operators
+
+| Operator | Meaning |
+|----------|---------|
+| `X & Y` | Both X and Y must hold |
+| `X \| Y` | At least one of X or Y must hold |
+| `X > Y` | X takes priority over Y at conflict boundaries |
+| `X -> Y` | If X is present then Y must also be present |
+| `X ^| Y` | Exactly one of X or Y -- exclusive or |
+| `X <-> Y` | Mutual implication -- both present or neither |
+| `X <-> !Y` | If X present then Y must be absent, and vice versa |
+
+### Grouping
+
+Parentheses `()` and brackets `[]` both group subexpressions and are interchangeable.
+
+---
+
+## Propagation Rules
+
+1. Effects propagate implicitly up the call chain through fixed-point analysis.
+   No annotation is needed at intermediate functions.
+
+2. Only two annotation sites exist: origin (`# effect {}`) and boundary
+   (`# attenuate {}`).
+
+3. `*X` in an effect definition means introducing that effect also introduces X.
+
+4. `!@X` means X cannot be stripped at any boundary. The compiler rejects any
+   `# attenuate {X}` attempt on a `!@` effect.
+
+5. `?X` propagates unless explicitly suppressed with `^X` somewhere in the chain.
+
+6. `..X` stops propagating after one level up from the annotated function.
+
+7. `...X` propagates indefinitely. This is the default for unannotated effects.
+
+8. `<*X` propagates to the immediate caller only, not further up.
+
+9. Parent effects imply all children. `IO` implies `IO.Console`, `IO.File`, etc.
+
+10. Attenuating a parent blocks all children. `# attenuate {IO}` blocks all `IO.*`.
+
+11. Attenuating a child is precise. `# attenuate {IO.Socket}` only blocks network IO,
+    leaving `IO.File` and all other `IO.*` to propagate normally.
+
+12. Attenuation applies to transitive effects too. If `foo` calls `bar` which
+    introduces `IO.Console`, and `foo` declares `# attenuate {IO}`, then callers
+    of `foo` see no IO effect regardless of what `bar` does internally.
+
+---
+
+## Conflict Detection
+
+When a function's transitive effect set violates a constraint declared by a
+user-defined effect it references, the compiler reports a conflict.
+
+### Exclusive or (`^|`)
+
+`X ^| Y` means exactly one of X or Y may be present in the function's transitive
+set. If both are found, it is a conflict.
+
+```
+effect ExclusiveIO { IO.Console ^| IO.File };
+
+// Conflict: introduces both sides of the exclusive-or.
+def bad() -> void # effect {ExclusiveIO};
+def bad() -> void
+{
+    write_console("x\0");
+    read_file("y\0");
+};
+
+// OK: introduces only one side.
+def good() -> void # effect {ExclusiveIO};
+def good() -> void
+{
+    write_console("x\0");
+};
+```
+
+### Mutual implication (`<->`)
+
+`X <-> Y` means both or neither must be present. `X <-> !Y` means if X is present
+then Y must be absent.
+
+```
+effect ReadOnly { *Mem.Read <-> !Mem.Write };
+
+// Conflict: both Mem.Read and Mem.Write present, violating <-> !Mem.Write.
+def bad() -> void # effect {ReadOnly};
+def bad() -> void
+{
+    read_process_memory(addr);
+    write_exec_memory(addr, 0);
+};
+
+// OK: only Mem.Read present.
+def good() -> void # effect {ReadOnly};
+def good() -> void
+{
+    read_process_memory(addr);
+};
+```
+
+---
+
+## Pure Enforcement
+
+`Pure` is a special anchor effect. A function declaring `Pure` must not
+transitively introduce any of: `IO`, `Alloc`, `Mem.Write`, `Throw`. The compiler
+verifies this against the full transitive call graph.
+
+```
+// OK: only calls other Pure functions.
+def add(int a, int b) -> int # effect {Pure};
+def add(int a, int b) -> int { -> a + b; };
+
+// Violation: calls heap allocator, which introduces Alloc.Heap.
+def bad() -> int # effect {Pure};
+def bad() -> int
+{
+    void* p = allocate_something();
+    -> 0;
+};
+```
+
+---
+
+## Built-in Effects
+
+Built-in effects are defined by the compiler and cannot be redefined or made
+self-referential. They are namespaced with `.` -- capital letter distinguishes
+effect namespaces from code namespaces (`IO.Socket` vs `standard::io::socket`).
+
+### IO family
+
+| Effect | Description |
+|--------|-------------|
+| `IO` | Any external communication |
+| `IO.Console` | stdin / stdout / stderr |
+| `IO.File` | Filesystem read or write |
+| `IO.Socket` | Network communication |
+| `IO.Pipe` | IPC and named pipes |
+| `IO.Device` | Hardware device communication |
+| `IO.Serial` | Serial port |
+| `IO.USB` | USB device IO |
+| `IO.GPU` | GPU command submission |
+
+### Alloc family
+
+| Effect | Description |
+|--------|-------------|
+| `Alloc` | Any allocation |
+| `Alloc.Heap` | Standard heap allocation |
+| `Alloc.Pool` | Pool or arena allocator |
+| `Alloc.Stack` | Stack allocation (VLAs etc.) |
+| `Alloc.Virtual` | VirtualAlloc / mmap -- page-level |
+| `Alloc.Shared` | Shared memory allocation |
+
+### Unsafe family
+
+All `Unsafe.*` effects carry `!@` -- they are permanently non-attenuatable.
+
+| Effect | Description |
+|--------|-------------|
+| `Unsafe` | Any unsafe operation |
+| `Unsafe.Ptr` | Raw pointer dereference |
+| `Unsafe.Cast` | Unsafe type cast |
+| `Unsafe.ASM` | Inline assembly |
+| `Unsafe.FFI` | Calling foreign functions |
+| `Unsafe.Uninit` | Reading uninitialized memory |
+
+### Mem family
+
+| Effect | Description |
+|--------|-------------|
+| `Mem` | Any memory operation |
+| `Mem.Read` | Any memory read |
+| `Mem.Read.Process` | Reading another process |
+| `Mem.Read.Kernel` | Kernel memory read |
+| `Mem.Read.Mapped` | Mapped file or shared memory read |
+| `Mem.Write` | Any memory write |
+| `Mem.Write.Process` | Writing another process |
+| `Mem.Write.Kernel` | Kernel memory write |
+| `Mem.Write.Exec` | Writing executable memory |
+| `Mem.Write.Mapped` | Mapped file or shared memory write |
+| `Mem.Exec` | Executing memory directly |
+| `Mem.Exec.JIT` | JIT-compiled execution |
+| `Mem.Exec.Shellcode` | Raw shellcode execution |
+
+### Sync family
+
+| Effect | Description |
+|--------|-------------|
+| `Sync` | Any synchronization operation |
+| `Sync.Lock` | Mutex or critical section |
+| `Sync.Atomic` | Atomic operations |
+| `Sync.Signal` | Signals or events |
+| `Sync.Wait` | Blocking wait |
+
+### Crypto family
+
+| Effect | Description |
+|--------|-------------|
+| `Crypto` | Any cryptographic operation |
+| `Crypto.Hash` | Hashing |
+| `Crypto.Encrypt` | Encryption |
+| `Crypto.Decrypt` | Decryption |
+| `Crypto.Random` | Random number generation |
+| `Crypto.Key` | Key generation or management |
+
+### Process family
+
+| Effect | Description |
+|--------|-------------|
+| `Process` | Any process operation |
+| `Process.Spawn` | Creating processes |
+| `Process.Kill` | Terminating processes |
+| `Process.Inject` | Code injection |
+| `Process.Suspend` | Suspending or resuming threads |
+| `Process.Token` | Token or privilege manipulation |
+
+### Hook family
+
+| Effect | Description |
+|--------|-------------|
+| `Hook` | Any hooking operation |
+| `Hook.Detour` | Inline detour or trampoline |
+| `Hook.IAT` | Import address table hook |
+| `Hook.SSDT` | SSDT hook (kernel) |
+| `Hook.Vtable` | Vtable hook |
+| `Hook.Exception` | Exception handler hook |
+
+### Privilege family
+
+| Effect | Description |
+|--------|-------------|
+| `Privilege` | Any privilege operation |
+| `Privilege.Elevate` | Privilege escalation |
+| `Privilege.Drop` | Privilege dropping |
+| `Privilege.Check` | Privilege checking |
+
+### Time family
+
+| Effect | Description |
+|--------|-------------|
+| `Time` | Any time-sensitive operation |
+| `Time.RealTime` | Hard real-time constraint |
+| `Time.Sleep` | Thread sleep or delay |
+| `Time.Timer` | Timer creation or management |
+
+### Anchor effects
+
+| Effect | Description |
+|--------|-------------|
+| `Pure` | No side effects -- implies `!IO & !Alloc & !Mem.Write & !Throw` |
+| `Throw` | Can raise exceptions |
+
+---
+
+## Built-in Implication Rules
+
+Some effects automatically imply others when introduced. These implications are
+applied transitively by the compiler without requiring explicit annotation.
+
+| Effect | Implies |
+|--------|---------|
+| `Hook.Detour` | `Hook`, `Unsafe`, `Mem.Write.Exec` |
+| `Hook.IAT` | `Hook`, `Mem.Write` |
+| `Hook.SSDT` | `Hook`, `Privilege`, `Mem.Write.Kernel`, `Unsafe` |
+| `Hook.Vtable` | `Hook`, `Mem.Write` |
+| `Process.Inject` | `Process`, `Alloc.Virtual`, `Mem.Write.Exec`, `Hook`, `Unsafe` |
+| `Crypto.Key` | `Crypto` |
+
+---
+
+## Primitive Effect Sources
+
+Certain language constructs introduce effects implicitly without requiring
+annotation. The compiler seeds these into the call graph automatically.
+
+| Source | Effect introduced |
+|--------|------------------|
+| `heap` allocation | `Alloc.Heap` |
+| Inline `asm` block | `Unsafe.ASM` |
+| Raw pointer dereference | `Unsafe.Ptr` |
+| `throw` statement | `Throw` |
+| Unsafe cast | `Unsafe.Cast` |
+| FFI call | `Unsafe.FFI` |
+
+---
+
+## Complete Example
+
+```
+// Real-time constraint: no allocation, no IO, no exceptions.
+effect RealTime { !Alloc & !IO & !Throw };
+
+// Shadow stack: uses hooks, permanent Unsafe, no allocation.
+effect ShadowStack { *Hook & !@Unsafe & !Alloc };
+
+// Pure math -- no side effects.
+def dot_product(float* a, float* b, uint n) -> float # effect {Pure};
+def dot_product(float* a, float* b, uint n) -> float
+{
+    float acc;
+    uint  i;
+    while (i < n) { acc += a[i] * b[i]; i++; };
+    -> acc;
+};
+
+// Real-time safe: only calls Pure functions.
+def rt_update(float* state, float* input, uint n) -> void # effect {RealTime};
+def rt_update(float* state, float* input, uint n) -> void
+{
+    float v = dot_product(state, input, n);
+    state[0] = v;
+};
+
+// Attenuates its own IO -- callers see no IO effect from this function.
+def log_event(byte* msg) -> void # attenuate {IO};
+def log_event(byte* msg) -> void
+{
+    write_to_ring_buffer(msg);
+};
+
+// Shadow stack install: uses detour hook, permanent Unsafe, zero allocation.
+def install_shadow_stack(void* target) -> void # effect {ShadowStack};
+def install_shadow_stack(void* target) -> void
+{
+    hook_detour(target, (@)void);
+};
+```
+
+---
+
+## Notes
+
+Effect annotations on prototypes are inherited by definitions. You do not repeat
+the tag at the definition site.
+
+User-defined effects compose freely on top of built-ins. An effect body is
+evaluated by the same algebra engine as all other effect expressions -- there is no
+separate language for defining effects.
+
+The `>` priority operator inside an effect definition resolves conflicts at
+boundaries deterministically. Without it, two conflicting effects at a boundary
+produce a conflict diagnostic. With it, the compiler applies the declared ordering
+and proceeds.
+
+The effect system is purely compile-time. Nothing is emitted. Effects disappear
+before codegen. The binary is affected only indirectly -- through what the effect
+system proves, which feeds optimizer signals like `Pure` and `!Alloc`.
+
+---
+
 <a id="keyword-list"></a>
 # Keyword list:
 ```
 and, as, asm, assert, auto, bool, break, byte, case, catch,
 cdecl, char, comptime, const, constraint, continue, contract, data, def, default, defer,
-deprecate, do, double, elif, else, emitflux, enum, escape, export, extern,
+deprecate, dict, do, double, effect, elif, else, emitflux, enum, escape, export, extern,
 false, fastcall, float, for, from, global, goto, has, heap, if, in, inline, int, interface, is,  
 jump, label, local, long, macro, namespace, noinit, noreturn, not, object,
 operator, or, private, public, register, return, signed, singinit,

@@ -165,6 +165,10 @@ class FluxCompiler:
         self.borrow_check = False
         self.borrow_check_warn = False
 
+        # Effect system flags -- set by fxc.py or CLI
+        self.effects_strict = False   # --effects
+        self.effects_warn = False     # --effects-warn
+
         # Entrypoint for DCE and linker -- overridable via --entrypoint CLI flag
         # or 'entrypoint' key in flux_config.cfg. Default is FRTStartup.
         self.entrypoint = config.get('entrypoint', 'FRTStartup')
@@ -311,6 +315,30 @@ class FluxCompiler:
         except Exception as e:
             self.logger.warning(f"DCE error: {e}", "dce")
 
+    def _run_effect_pass(self, ast):
+        """Run the effect system pass on an already-parsed, DCE-pruned AST."""
+        import feffects as _feff
+        self.logger.step("Effect analysis", LogLevel.INFO, "effects")
+        try:
+            registry = _feff.EffectRegistry()
+            violations = _feff.run_effect_pass(
+                ast,
+                registry,
+                strict=self.effects_strict,
+                warn=self.effects_warn,
+            )
+            use_color = sys.stderr.isatty()
+            mode = 'error' if self.effects_strict else 'warning'
+            _feff.print_violations(violations, mode=mode, use_color=use_color)
+            _feff.print_summary(violations, use_color=use_color)
+            if violations and self.effects_strict:
+                self.logger.error("Effect check failed -- compilation aborted.", "effects")
+                sys.exit(1)
+        except SystemExit:
+            raise
+        except Exception as e:
+            self.logger.warning(f"Effect pass error: {e}", "effects")
+
     def compile_file(self, filename: str, output_bin: str = None, extra_libs: list = None) -> str:
         """
         Compile a Flux source file to executable binary
@@ -366,6 +394,9 @@ class FluxCompiler:
             #
             # LEFT OFF REPLACING LOG DEBUGGER WITH DEBUGGER FUNCTION
             # CONTINUE BELOW
+
+            # Effect pass -- runs before DCE so annotated functions aren't eliminated first
+            self._run_effect_pass(ast)
 
             # DCE -- runs unconditionally on the parsed AST before borrow check
             self._run_dce(ast, self.entrypoint)

@@ -938,6 +938,8 @@ class FunctionDef(ASTNode):
     is_recursive: bool = False
     is_inline: bool = False
     is_deprecated: bool = False
+    effect_annotation: Optional['EffectAnnotation'] = None      # # effect { ... }
+    attenuate_annotation: Optional['AttenuateAnnotation'] = None # # attenuate { ... }
 
     # Map Flux calling-convention keywords to LLVM CC strings
     _CALLING_CONV_MAP: ClassVar[dict] = {
@@ -1202,7 +1204,8 @@ class InterfaceDef(ASTNode):
     name: str
     params: List[Tuple[str, Optional[str]]] = field(default_factory=list)  # [("A", "Readable"), ...]
     protocols: List[InterfaceProtocol] = field(default_factory=list)
-
+    attenuate_annotation: Optional['AttenuateAnnotation'] = None  # # attenuate { ... }
+    effect_annotation: Optional['EffectAnnotation'] = None        # # effect { ... }
 
 
 # Object method
@@ -1590,6 +1593,61 @@ class DictLiteral(Expression):
     def __repr__(self) -> str:
         pairs = [f"{self.entries[i]}: {self.entries[i+1]}" for i in range(0, len(self.entries), 2)]
         return '{' + ', '.join(pairs) + '}'
+
+
+@dataclass
+class EffectName(Expression):
+    """A single effect name, possibly namespaced: IO, IO.Socket, Hook.Detour, etc."""
+    name: str
+
+    def __repr__(self) -> str:
+        return self.name
+
+
+@dataclass
+class EffectExpr(Expression):
+    """
+    An effect algebra expression node.
+    operator is one of: *, ~, !, ?, @, !@, ->, ^, <->, .., ..., ^suppress, <*, &, |, >
+    For unary operators: left holds the operand, right is None.
+    For binary operators: left and right hold the operands.
+    """
+    operator: str
+    left: Optional[Expression] = None
+    right: Optional[Expression] = None
+
+    def __repr__(self) -> str:
+        if self.right is None:
+            return f"({self.operator}{self.left})"
+        return f"({self.left} {self.operator} {self.right})"
+
+
+@dataclass
+class EffectDef(Statement):
+    """Top-level effect declaration: effect Name { expr };"""
+    name: str
+    body: Optional[Expression]  # effect algebra expression; None for opaque/builtin
+
+    def __repr__(self) -> str:
+        return f"effect {self.name} {{ {self.body} }}"
+
+
+@dataclass
+class EffectAnnotation(ASTNode):
+    """# effect { expr } qualifier on a function."""
+    effects: Expression
+
+    def __repr__(self) -> str:
+        return f"# effect {{ {self.effects} }}"
+
+
+@dataclass
+class AttenuateAnnotation(ASTNode):
+    """# attenuate { expr } qualifier on an interface."""
+    effects: Expression
+
+    def __repr__(self) -> str:
+        return f"# attenuate {{ {self.effects} }}"
 
 
 @dataclass

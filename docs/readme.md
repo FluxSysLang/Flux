@@ -9,6 +9,8 @@ The [operator reference](https://github.com/kvthweatt/FluxLang/blob/main/docs/op
 Undersanding Flux's type system will require leaving the world of C and other languages which have strict type safety.  
 It's best to [start here](https://github.com/kvthweatt/FluxLang/blob/main/docs/learn_flux_intro.md).
 
+Flux also has an [Effects System](https://github.com/kvthweatt/FluxLang/blob/main/docs/effects_system.md) which is a unique compile-time system for tracking, propagating, and constraining behavioral properties across call chains. Effects are labels. The operators applied to them are what give those labels meaning. Together they form a compiler programming interface that lets you describe and enforce what code does -- to memory, to the outside world, to other processes -- without any runtime cost. Everything is verified before the binary exists and erased before codegen.
+
 The [standard library](https://github.com/kvthweatt/FluxLang/blob/main/docs/StandardLibrary/standard_library_v1.1.md) will help walk you through what is what and where.
 
 There are setup guides for [Windows](https://github.com/kvthweatt/FluxLang/blob/main/docs/SetupGuides/windows_setup_guide.md) and [Linux](https://github.com/kvthweatt/FluxLang/blob/main/docs/SetupGuides/linux_setup_guide.md).
