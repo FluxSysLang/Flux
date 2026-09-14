@@ -76,17 +76,13 @@ def main():
         print(data)
     
     try:
-        # Create build directory if it doesn't exist
-        build_dir = FLUXC_SRCDIR / "build"
+        # Write debug.txt to /tmp so it works in read-only container environments
+        build_dir = Path("/tmp")
         build_dir.mkdir(exist_ok=True)
         
         # Open debug.txt for writing
         debug_path = build_dir / "debug.txt"
         debug_file = open(debug_path, 'w', encoding='utf-8', buffering=1)
-        
-        # Write confirmation to console before redirecting
-        original_stdout.write(f"[DEBUG] Creating debug output file at: {debug_path.absolute()}\n")
-        original_stdout.flush()
         
         # Redirect stdout to both console and file
         sys.stdout = TeeOutput(original_stdout, debug_file)
@@ -321,7 +317,6 @@ def main():
         sys.stdout = original_stdout
         if debug_file:
             debug_file.close()
-            original_stdout.write(f"[DEBUG] Debug output saved to: {debug_path.absolute()}\n")
 
 if __name__ == "__main__":
     main()
