@@ -631,8 +631,8 @@ namespace standard
                                                 .size = g_table[next].size;
                                                 .kind = g_table[next].kind;
                                                 .slab = g_table[next].slab;
-                                                .key  = 0;
                                             };
+                                            g_table[next].key = 0;
                                             hole = next;
                                         }
                                         default {};

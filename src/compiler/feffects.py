@@ -23,7 +23,6 @@ Operator semantics (inside effect {} blocks and qualifiers only):
     ..X     propagates exactly one level up, stops
     ...X    propagates indefinitely (default)
     ^X      suppresses X even if something else implies it  (operator: ^suppress)
-    <*X     propagates to caller instead of upward
     &       both must hold
     |       at least one must hold
 """
@@ -236,6 +235,29 @@ def _eval_effect_expr(node, registry: 'EffectRegistry') -> EffectSet:
     if isinstance(node, EffectName):
         es = EffectSet()
         name = node.name
+
+        # Wildcard expansion: *.*  -> all known effects
+        #                     Foo.* -> all effects whose name starts with Foo. (plus Foo itself)
+        if name == '*.*':
+            all_names = set(_ALL_BUILTINS)
+            for uname in registry._user_effects:
+                all_names.add(uname)
+            for n in all_names:
+                resolved = registry.resolve(n)
+                for e in resolved.entries():
+                    es.add(e)
+            return es
+
+        if name.endswith('.*'):
+            ns = name[:-2]  # strip .*
+            all_names = set(_ALL_BUILTINS) | set(registry._user_effects.keys())
+            matching = {n for n in all_names if n == ns or n.startswith(ns + '.')}
+            for n in matching:
+                resolved = registry.resolve(n)
+                for e in resolved.entries():
+                    es.add(e)
+            return es
+
         # Look up in registry to expand user-defined effects
         resolved = registry.resolve(name)
         for e in resolved.entries():
@@ -285,6 +307,7 @@ def _eval_effect_expr(node, registry: 'EffectRegistry') -> EffectSet:
             inner = _eval_effect_expr(node.left, registry)
             for e in inner.entries():
                 e.attenuatable = False
+                e.excludes = True
             return inner
 
         if op == '..':
@@ -429,10 +452,21 @@ class EffectRegistry:
         return es.copy()
 
     def is_child_of(self, child: str, parent: str) -> bool:
-        """True if child is a descendant of parent in the built-in hierarchy."""
+        """True if child is a descendant of parent in the built-in or dotted hierarchy."""
         current = child
+        # Walk static hierarchy first
+        visited = set()
         while current in _BUILTIN_PARENT:
+            if current in visited:
+                break
+            visited.add(current)
             current = _BUILTIN_PARENT[current]
+            if current == parent:
+                return True
+        # Walk dotted name hierarchy: IO.Console.Output -> IO.Console -> IO
+        current = child
+        while '.' in current:
+            current = current.rsplit('.', 1)[0]
             if current == parent:
                 return True
         return False
@@ -546,12 +580,14 @@ class EffectRegistry:
 # ---------------------------------------------------------------------------
 
 COLORS = {
-    'red':    '\033[91m',
-    'yellow': '\033[93m',
-    'cyan':   '\033[96m',
-    'dim':    '\033[2m',
-    'bold':   '\033[1m',
-    'reset':  '\033[0m',
+    'red':     '\033[91m',
+    'yellow':  '\033[93m',
+    'cyan':    '\033[96m',
+    'magenta': '\033[95m',
+    'orange':  '\033[38;5;214m',
+    'dim':     '\033[2m',
+    'bold':    '\033[1m',
+    'reset':   '\033[0m',
 }
 
 KIND_COLOR = {
@@ -589,32 +625,32 @@ def _violation_location(v) -> str:
     return ''
 
 
-def _violation_message(v) -> str:
+def _violation_message(v, use_color: bool = True) -> str:
     if isinstance(v, EffectExclusionViolation):
-        return (f"'{v.caller_name}' excludes effect '{v.effect_name}' "
-                f"but calls '{v.callee_name}' which introduces it")
+        return (f"Function {_c('magenta', v.caller_name, use_color)} excludes effect {_c('orange', v.effect_name, use_color)} "
+                f"but calls function {_c('magenta', v.callee_name, use_color)} which introduces it")
     if isinstance(v, EffectViolation):
-        return (f"'{v.func_name}' introduces effect '{v.effect_name}' "
-                f"which crosses boundary '{v.boundary_name}' without attenuation")
+        return (f"{_c('magenta', v.func_name, use_color)} introduces effect {_c('orange', v.effect_name, use_color)} "
+                f"which crosses boundary {_c('magenta', v.boundary_name, use_color)} without attenuation")
     if isinstance(v, AttenuationViolation):
-        return (f"Cannot attenuate permanent effect '{v.effect_name}' "
-                f"at boundary '{v.boundary_name}' -- !@ prevents attenuation")
+        return (f"Cannot attenuate permanent effect {_c('orange', v.effect_name, use_color)} "
+                f"at boundary {_c('magenta', v.boundary_name, use_color)} -- !@ prevents attenuation")
     if isinstance(v, EffectConflict):
-        return f"Effects '{v.effect_a}' and '{v.effect_b}' conflict at '{v.site}' with no priority resolution"
+        return f"Effects {_c('orange', v.effect_a, use_color)} and {_c('orange', v.effect_b, use_color)} conflict at {_c('magenta', v.site, use_color)} with no priority resolution"
     if isinstance(v, EffectWarning):
         return v.message
     return str(v)
 
 
-def _violation_detail(v) -> List[str]:
+def _violation_detail(v, use_color: bool = True) -> List[str]:
     detail = []
     if isinstance(v, EffectExclusionViolation):
-        detail.append(f"caller '{v.caller_name}' declared # effect {{!{v.effect_name}}}")
-        detail.append(f"callee '{v.callee_name}' declared # effect {{{v.effect_name}}}")
+        detail.append(f"caller {_c('magenta', v.caller_name, use_color)} declared effect !{_c('orange', v.effect_name, use_color)}")
+        detail.append(f"callee {_c('magenta', v.callee_name, use_color)} declared effect {_c('orange', v.effect_name, use_color)}")
     elif isinstance(v, EffectViolation):
-        detail.append(f"add '# attenuate {{{v.effect_name}}}' to boundary '{v.boundary_name}' to suppress")
+        detail.append(f"add `# attenuate {{v.effect_name}}` to boundary {_c('magenta', v.boundary_name, use_color)} to suppress")
     elif isinstance(v, AttenuationViolation):
-        detail.append(f"effect '{v.effect_name}' is marked !@ and can never be stripped")
+        detail.append(f"effect {_c('orange', v.effect_name, use_color)} is marked !@ and can never be stripped")
     return detail
 
 
@@ -631,13 +667,13 @@ def print_violations(violations: list, mode: str = 'error',
     for v in violations:
         kind = _violation_kind(v)
         loc  = _violation_location(v)
-        msg  = _violation_message(v)
-        detail = _violation_detail(v)
+        msg  = _violation_message(v, use_color)
+        detail = _violation_detail(v, use_color)
         color = KIND_COLOR.get(kind, 'red')
 
         loc_part = f"  {_c('cyan', loc, use_color)}  " if loc else '  '
         print(
-            f"{_c('bold', f'[FX {level_str}]', use_color)} "
+            f"{_c('bold', f'[{level_str}]', use_color)} "
             f"{_c(color, kind, use_color)}",
             file=file,
         )
@@ -654,7 +690,7 @@ def print_summary(violations: list, use_color: bool = True, file=None):
     n = len(violations)
     if n == 0:
         print(
-            _c('bold', '[FX effects] ', use_color) +
+            _c('bold', '[Effects] ', use_color) +
             _c('cyan', 'OK', use_color) +
             ' -- no violations found.',
             file=file,
@@ -666,7 +702,7 @@ def print_summary(violations: list, use_color: bool = True, file=None):
             kinds[k] = kinds.get(k, 0) + 1
         kind_str = ', '.join(f"{k}: {c}" for k, c in sorted(kinds.items()))
         print(
-            _c('bold', '[FX effects] ', use_color) +
+            _c('bold', '[Effects] ', use_color) +
             _c('red', f'{n} violation(s)', use_color) +
             f'  {kind_str}',
             file=file,
@@ -733,7 +769,7 @@ def run_effect_pass(
     """
     from fast import (FunctionDef, InterfaceDef, EffectDef,
                       EffectAnnotation, AttenuateAnnotation, NamespaceDef,
-                      EffectExpr, EffectName)
+                      EffectExpr, EffectName, InlineAsm)
 
     violations = []
 
@@ -745,7 +781,9 @@ def run_effect_pass(
             if isinstance(stmt, EffectDef):
                 registry.register_user_effect(stmt)
             elif isinstance(stmt, NamespaceDef):
-                _collect_effect_defs(stmt.body if hasattr(stmt, 'body') else [])
+                _collect_effect_defs(stmt.functions)
+                for _nested in stmt.nested_namespaces:
+                    _collect_effect_defs([_nested])
 
     _collect_effect_defs(program.statements)
 
@@ -788,9 +826,87 @@ def run_effect_pass(
                     es = _eval_effect_expr(att_ann.effects, registry)
                     registry.register_iface_attenuate(stmt.name, es)
             if isinstance(stmt, NamespaceDef):
-                _collect_annotations(stmt.body if hasattr(stmt, 'body') else [])
+                _collect_annotations(stmt.functions)
+                for nested in stmt.nested_namespaces:
+                    _collect_annotations([nested])
 
     _collect_annotations(program.statements)
+
+    # Pass 2b: infer Unsafe.ASM for any function whose body contains inline assembly.
+    # This runs after explicit annotation collection so it can merge into existing sets.
+    def _body_has_asm(node) -> bool:
+        if node is None:
+            return False
+        if isinstance(node, InlineAsm):
+            return True
+        for field in node.__dataclass_fields__ if hasattr(node, '__dataclass_fields__') else []:
+            val = getattr(node, field, None)
+            if isinstance(val, list):
+                if any(_body_has_asm(item) for item in val if hasattr(item, '__dataclass_fields__')):
+                    return True
+            elif hasattr(val, '__dataclass_fields__'):
+                if _body_has_asm(val):
+                    return True
+        return False
+
+    def _infer_asm_effects(stmts):
+        for stmt in stmts:
+            if stmt is None:
+                continue
+            if isinstance(stmt, FunctionDef) and not getattr(stmt, 'is_prototype', False):
+                body = getattr(stmt, 'body', None)
+                if body is not None and _body_has_asm(body):
+                    existing = registry._func_effects.get(stmt.name)
+                    if existing is None:
+                        existing = EffectSet()
+                    asm_entry = EffectEntry('Unsafe.ASM')
+                    asm_entry.requires = True
+                    existing.add(asm_entry)
+                    unsafe_entry = EffectEntry('Unsafe')
+                    unsafe_entry.requires = True
+                    existing.add(unsafe_entry)
+                    registry.register_func_effects(stmt.name, existing)
+            if isinstance(stmt, NamespaceDef):
+                _infer_asm_effects(stmt.functions)
+                for nested in stmt.nested_namespaces:
+                    _infer_asm_effects([nested])
+
+    _infer_asm_effects(program.statements)
+
+    # Build a bare-name -> list of EffectSet index so that calls resolved via
+    # 'using' (bare name 'println') can still find the registry entry stored
+    # under the mangled name 'standard__io__console__println'.
+    _bare_name_effects: Dict[str, List] = {}
+    for mangled, es in registry._func_effects.items():
+        bare = mangled.rsplit('__', 1)[-1]
+        _bare_name_effects.setdefault(bare, []).append(es)
+        # Also index by the full mangled name itself
+        _bare_name_effects.setdefault(mangled, []).append(es)
+
+    def _callee_requires_effects(callee_name: str) -> Set[str]:
+        """Return all effect names that callee declares it requires (~) or introduces (*).
+        A function annotated ~IO.Console is asserting it performs IO.Console."""
+        result: Set[str] = set()
+        candidates = _bare_name_effects.get(callee_name, [])
+        for es in candidates:
+            for e in es.entries():
+                # ~ (requires) means the function performs this effect
+                # * (implies) and plain introduction also count
+                if e.requires or e.implies or (not e.excludes):
+                    result.add(e.name)
+                    # Walk static parent hierarchy
+                    parent = _BUILTIN_PARENT.get(e.name)
+                    while parent:
+                        result.add(parent)
+                        parent = _BUILTIN_PARENT.get(parent)
+                    # Walk dotted name ancestors dynamically (IO.Console -> IO)
+                    parts = e.name
+                    while '.' in parts:
+                        parts = parts.rsplit('.', 1)[0]
+                        result.add(parts)
+                    for child in _BUILTIN_CHILDREN.get(e.name, set()):
+                        result.add(child)
+        return result
 
     if not (strict or warn):
         # Transparent mode -- annotations stored, no enforcement
@@ -813,7 +929,9 @@ def run_effect_pass(
                     callees = {c.name for c in _collect_calls(body)}
                     call_graph.setdefault(stmt.name, set()).update(callees)
             elif isinstance(stmt, NamespaceDef):
-                _build_call_graph(stmt.body if hasattr(stmt, 'body') else [])
+                _build_call_graph(stmt.functions)
+                for _nested in stmt.nested_namespaces:
+                    _build_call_graph([_nested])
 
     _build_call_graph(program.statements)
 
@@ -951,14 +1069,35 @@ def run_effect_pass(
         reported: Set[str] = set()
         for call in calls:
             # Use the transitive set of the callee -- this catches chains.
+            # Also fall back to the registry's declared effects for imported/external
+            # functions whose bodies are not in this compilation unit.
             callee_transitive = transitive.get(call.name, _direct_introduced(call.name))
+            if not callee_transitive:
+                # Fall back to declared effects (handles imported/external functions).
+                # Include both introduced effects and required (~) effects -- a function
+                # declaring ~IO.Console is asserting it performs IO.Console.
+                callee_transitive = _callee_requires_effects(call.name)
             # Also subtract effects that the callee attenuates at its boundary.
             callee_att = _attenuated_effects(call.name)
             visible = callee_transitive - callee_att
             for eff in callee_att:
                 for child in _BUILTIN_CHILDREN.get(eff, set()):
                     visible.discard(child)
-            matching = {eff for eff in excluded if eff in visible and eff not in reported}
+            # Match excluded effects against visible effects using hierarchy:
+            # excluded IO.Console.Output matches visible IO.Console (parent covers child)
+            # excluded IO.Console matches visible IO.Console.Output (child of excluded)
+            def _effect_matches(excl: str, vis_set: Set[str]) -> bool:
+                if excl in vis_set:
+                    return True
+                # A visible effect is a descendant of excl: excluding IO.Console catches IO.Console.Output
+                for v in vis_set:
+                    cur = v
+                    while '.' in cur:
+                        cur = cur.rsplit('.', 1)[0]
+                        if cur == excl:
+                            return True
+                return False
+            matching = {eff for eff in excluded if _effect_matches(eff, visible) and eff not in reported}
             if not matching:
                 continue
             for eff in _most_specific(matching):
@@ -982,7 +1121,9 @@ def run_effect_pass(
             if isinstance(stmt, FunctionDef):
                 _check_caller(stmt)
             elif isinstance(stmt, NamespaceDef):
-                _check_all_callers(stmt.body if hasattr(stmt, 'body') else [])
+                _check_all_callers(stmt.functions)
+                for _nested in stmt.nested_namespaces:
+                    _check_all_callers([_nested])
 
     _check_all_callers(program.statements)
 
@@ -1047,7 +1188,9 @@ def run_effect_pass(
             if isinstance(stmt, FunctionDef):
                 _check_pure(stmt)
             elif isinstance(stmt, NamespaceDef):
-                _check_pure_all(stmt.body if hasattr(stmt, 'body') else [])
+                _check_pure_all(stmt.functions)
+                for _nested in stmt.nested_namespaces:
+                    _check_pure_all([_nested])
 
     _check_pure_all(program.statements)
 
@@ -1187,7 +1330,7 @@ def run_effect_pass(
                 # Actually: violation if X present AND Y present, or X absent AND Y absent
                 # The meaningful check is: X present XOR Y present must hold
                 # i.e. exactly one of {X, Y} in transitive
-                conflict = left_present == right_present  # both present or both absent = violation
+                conflict = left_present and right_present  # both present or both absent = violation
             else:
                 # X <-> Y: both present or both absent -- violation if only one present
                 conflict = left_present != right_present
@@ -1219,7 +1362,9 @@ def run_effect_pass(
             if isinstance(stmt, FunctionDef):
                 _check_conflicts(stmt)
             elif isinstance(stmt, NamespaceDef):
-                _check_conflicts_all(stmt.body if hasattr(stmt, 'body') else [])
+                _check_conflicts_all(stmt.functions)
+                for _nested in stmt.nested_namespaces:
+                    _check_conflicts_all([_nested])
 
     _check_conflicts_all(program.statements)
 
@@ -1250,8 +1395,9 @@ def run_effect_pass(
                                 elif warn:
                                     violations.append(EffectWarning(str(v)))
             elif isinstance(stmt, NamespaceDef):
-                body = stmt.body if hasattr(stmt, 'body') else []
-                _check_boundaries(body, active_boundaries)
+                _check_boundaries(stmt.functions, active_boundaries)
+                for _nested in stmt.nested_namespaces:
+                    _check_boundaries([_nested], active_boundaries)
 
     _check_boundaries(program.statements, [])
 

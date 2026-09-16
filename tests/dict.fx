@@ -26,6 +26,11 @@ struct Account
     bool logged_in;
 };
 
+constraint myC(A, B, C, D)
+{
+    D !~= B & [A !@ A] !~= C !`< D !-= A
+};
+
 Account a;
 
 //a.logged_in = true;

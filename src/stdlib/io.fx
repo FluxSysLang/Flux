@@ -36,69 +36,69 @@ namespace standard
         {
     		// INPUT FORWARD DECLARATIONS
 #ifdef __WINDOWS__
-            def win_input(byte[] buffer, int max_len) -> int;
+            def win_input(byte[] buffer, int max_len) -> int # effect {~IO.Console.Input};
 #endif; // Windows
 #ifdef __LINUX__
-            def nix_input(byte[] buffer, int max_len) -> int;
+            def nix_input(byte[] buffer, int max_len) -> int # effect {~IO.Console.Input};
 #endif; // Linux
 #ifdef __MACOS__
-            def mac_input(byte[] buffer, int max_len) -> int;
+            def mac_input(byte[] buffer, int max_len) -> int # effect {~IO.Console.Input};
 #endif; // Mac
             // GENERIC
-            def input(byte[] buffer, int max_len) -> int;
+            def input(byte[] buffer, int max_len) -> int # effect {~IO.Console.Input};
             
 
             // OUTPUT FORWARD DECLARATIONS
 #ifdef __WINDOWS__
-            def win_print(byte* msg, int x) -> void;
+            def win_print(byte* msg, int x) -> void # effect {~IO.Console.Output};
 #endif;
 #ifdef __LINUX__
-            def nix_print(byte* msg, int x) -> void;
+            def nix_print(byte* msg, int x) -> void # effect {~IO.Console.Output};
 #endif;
 #ifdef __MACOS__
-            def mac_print(byte* msg, int x) -> void;
+            def mac_print(byte* msg, int x) -> void # effect {~IO.Console.Output};
 #endif;
             // GENERIC
-            def print() -> void, // no param = newline
-                print(noopstr, int) -> void,
-                print(noopstr) -> void,
-                print(bool) -> void,
-                printchar(noopstr) -> void,
-                print(char) -> void,
-                print(byte) -> void,
-                print(i8) -> void,
-                print(i16) -> void,
-                print(u16) -> void,
-                print(int) -> void,
-                print(i32) -> void,
-                print(uint) -> void,
-                print(u32) -> void,
-                print_hex_byte(byte) -> void,
-                print_hex_u32(u32) -> void,
-                print(i64) -> void,
-                print(u64) -> void,
-                print(long) -> void,
-                print(ulong) -> void,
-                print(float) -> void,
-                print(float,int) -> void,
-                print(double) -> void,
-                print(double,int) -> void,
-                println(noopstr) -> void,   // newline print overloads
-                println(byte) -> void,
-                println(char) -> void,
-                println(bool) -> void,
-                println(i8) -> void,
-                println(i16) -> void,
-                println(u16) -> void,
-                println(int) -> void,
-                println(uint) -> void,
-                printhbline(byte) -> void,
-                println(long) -> void,
-                println(ulong) -> void,
-                println(float) -> void,
-                println(float,int) -> void,
-                println(double) -> void,
-                println(double,int) -> void;
+            def print() -> void # effect {~IO.Console}, // no param = newline
+                print(noopstr, int) -> void # effect {~IO.Console.Output},
+                print(noopstr) -> void # effect {~IO.Console.Output},
+                print(bool) -> void # effect {~IO.Console.Output},
+                printchar(noopstr) -> void # effect {~IO.Console.Output},
+                print(char) -> void # effect {~IO.Console.Output},
+                print(byte) -> void # effect {~IO.Console.Output},
+                print(i8) -> void # effect {~IO.Console.Output},
+                print(i16) -> void # effect {~IO.Console.Output},
+                print(u16) -> void # effect {~IO.Console.Output},
+                print(int) -> void # effect {~IO.Console.Output},
+                print(i32) -> void # effect {~IO.Console.Output}, // Holy shit ditto would be nice here
+                print(uint) -> void # effect {~IO.Console.Output},
+                print(u32) -> void # effect {~IO.Console.Output},
+                print_hex_byte(byte) -> void # effect {~IO.Console.Output},
+                print_hex_u32(u32) -> void # effect {~IO.Console.Output},
+                print(i64) -> void # effect {~IO.Console.Output},
+                print(u64) -> void # effect {~IO.Console.Output},
+                print(long) -> void # effect {~IO.Console.Output},
+                print(ulong) -> void # effect {~IO.Console.Output},
+                print(float) -> void # effect {~IO.Console.Output},
+                print(float,int) -> void # effect {~IO.Console.Output},
+                print(double) -> void # effect {~IO.Console.Output},
+                print(double,int) -> void # effect {~IO.Console.Output},
+                println(noopstr) -> void # effect {~IO.Console.Output},   // newline print overloads
+                println(byte) -> void # effect {~IO.Console.Output},
+                println(char) -> void # effect {~IO.Console.Output},
+                println(bool) -> void # effect {~IO.Console.Output},
+                println(i8) -> void # effect {~IO.Console.Output},
+                println(i16) -> void # effect {~IO.Console.Output},
+                println(u16) -> void # effect {~IO.Console.Output},
+                println(int) -> void # effect {~IO.Console.Output},
+                println(uint) -> void # effect {~IO.Console.Output},
+                printhbline(byte) -> void # effect {~IO.Console.Output},
+                println(long) -> void # effect {~IO.Console.Output},
+                println(ulong) -> void # effect {~IO.Console.Output},
+                println(float) -> void # effect {~IO.Console.Output},
+                println(float,int) -> void # effect {~IO.Console.Output},
+                println(double) -> void # effect {~IO.Console.Output},
+                println(double,int) -> void # effect {~IO.Console.Output};
 
 #ifdef __WINDOWS__
             // INPUT DEFINITIONS

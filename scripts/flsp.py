@@ -95,7 +95,8 @@ try:
     from fast import (
         Program, StructDefStatement, ObjectDefStatement,
         FunctionDefStatement, EnumDefStatement, UnionDefStatement,
-        UsingStatement, NamespaceDefStatement, VariableDeclaration,
+        UsingStatement, NamespaceDefStatement, NamespaceDef, VariableDeclaration,
+        ConstraDef, EffectDef,
     )
     from ftypesys import SymbolKind, SymbolTable
 except Exception as exc:
@@ -466,6 +467,12 @@ def _parse_text(text: str, original_path: str) -> _ParseResult:
                 tmp_path = f.name
             parser  = FluxParser.from_file(tmp_path, compiler_macros=build_compiler_macros())
             program = parser.parse()
+            program._line_map  = parser._line_map
+            program._constras  = dict(getattr(parser, '_constras', {}))
+            log.debug("_constras stored: %r parser_has=%r stmt_types=%r",
+                      list(program._constras.keys()),
+                      hasattr(parser, '_constras'),
+                      [type(s).__name__ for s in program.statements[:5]])
             return _ParseResult(program=program, diags=captured_warnings)
         except Exception as exc:
             cause = exc
@@ -483,6 +490,42 @@ def _parse_text(text: str, original_path: str) -> _ParseResult:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
+
+
+def _register_toplevel_symbols(program: Program) -> None:
+    """
+    Register top-level definitions into _global_symbols directly,
+    bypassing scope_level checks which may be non-zero after parse.
+    """
+    gs = program.symbol_table._global_symbols
+    _KIND_MAP = {
+        'FunctionDefStatement': (SymbolKind.FUNCTION, 'function_def'),
+        'FunctionDef':          (SymbolKind.FUNCTION, None),
+        'StructDefStatement':   (SymbolKind.STRUCT,   'struct_def'),
+        'StructDef':            (SymbolKind.STRUCT,   None),
+        'ObjectDefStatement':   (SymbolKind.OBJECT,   'object_def'),
+        'ObjectDef':            (SymbolKind.OBJECT,   None),
+        'EnumDefStatement':     (SymbolKind.ENUM,     'enum_def'),
+        'EnumDef':              (SymbolKind.ENUM,     None),
+        'UnionDefStatement':    (SymbolKind.UNION,    'union_def'),
+        'UnionDef':             (SymbolKind.UNION,    None),
+    }
+    for stmt in program.statements:
+        cls = type(stmt).__name__
+        if cls not in _KIND_MAP:
+            continue
+        kind, attr = _KIND_MAP[cls]
+        # Raw node (attr=None): the stmt itself is the def
+        defn = getattr(stmt, attr, None) if attr else stmt
+        if defn is None:
+            continue
+        name = getattr(defn, 'name', None)
+        if not name or name in gs:
+            continue
+        type_spec = getattr(defn, 'return_type', None)
+        from ftypesys import SymbolEntry
+        entry = SymbolEntry(kind=kind, name=name, namespace='', type_spec=type_spec)
+        gs[name] = entry
 
 
 async def _validate_async(ls: LanguageServer, uri: str) -> None:
@@ -503,7 +546,20 @@ async def _validate_async(ls: LanguageServer, uri: str) -> None:
             result.program._lsp_uri = uri
         except Exception:
             pass
+        # Register top-level definitions that the parser doesn't put in the symbol table
+        _register_toplevel_symbols(result.program)
+        log.debug("toplevel registered: main=%r stmt_type_counts=%r",
+                  'main' in result.program.symbol_table._global_symbols,
+                  {t: sum(1 for s in result.program.statements if type(s).__name__ == t)
+                   for t in set(type(s).__name__ for s in result.program.statements)})
+        # Invalidate the function index cache so it rebuilds with new symbols
+        try:
+            del result.program._lsp_func_index
+        except AttributeError:
+            pass
         log.debug("Parse succeeded, cache updated for %s", path)
+        # Notify IDE that parse succeeded so hover can be enabled
+        ls.show_message_log(f"fx:parse-ok:{uri}", lsp.MessageType.Log)
     else:
         log.debug("Parse failed for %s, keeping stale cache", path)
 
@@ -604,8 +660,8 @@ def _build_location_index(program: Program) -> Dict[str, tuple]:
                 _record(stmt.union_def.name, stmt.union_def)
             elif isinstance(stmt, VariableDeclaration):
                 _record(stmt.name, stmt)
-            elif isinstance(stmt, NamespaceDefStatement):
-                ns = stmt.namespace_def
+            elif isinstance(stmt, (NamespaceDefStatement, NamespaceDef)):
+                ns = stmt.namespace_def if isinstance(stmt, NamespaceDefStatement) else stmt
                 for fn in ns.functions:
                     _record(fn.name, fn)
                 for s in ns.structs:
@@ -619,7 +675,7 @@ def _build_location_index(program: Program) -> Dict[str, tuple]:
                 for v in ns.variables:
                     _record(v.name, v)
                 for nested in ns.nested_namespaces:
-                    _index_stmts([NamespaceDefStatement(nested)])
+                    _index_stmts([nested])
 
     _index_stmts(program.statements)
 
@@ -965,6 +1021,278 @@ def completion(ls: LanguageServer, params: lsp.CompletionParams):
 # Hover
 # ---------------------------------------------------------------------------
 
+def _effect_expr_str(annotation) -> str:
+    """Extract the effect expression string from an EffectAnnotation or AttenuateAnnotation."""
+    if annotation is None:
+        return ''
+    try:
+        expr = annotation.effects
+        s = str(expr).strip()
+        if s.startswith('(') and s.endswith(')'):
+            s = s[1:-1].strip()
+        return s
+    except Exception:
+        return ''
+
+
+def _hover_effect_lines(func_def) -> str:
+    """Build markdown lines for effect/attenuate annotations on a function def."""
+    lines = []
+    if func_def is None:
+        return ''
+    ea = getattr(func_def, 'effect_annotation', None)
+    if ea:
+        expr = _effect_expr_str(ea)
+        if expr:
+            lines.append(f'\n\n`# effect {{` `{expr}` `}}`')
+    aa = getattr(func_def, 'attenuate_annotation', None)
+    if aa:
+        expr = _effect_expr_str(aa)
+        if expr:
+            lines.append(f'\n\n`# attenuate {{` `{expr}` `}}`')
+    return ''.join(lines)
+
+
+_BUILTIN_EFFECT_ROOTS = {
+    'IO', 'Alloc', 'Unsafe', 'Mem', 'Sync', 'Crypto',
+    'Process', 'Hook', 'Privilege', 'Time', 'Pure', 'Throw',
+    'IO.Console', 'IO.File', 'IO.Socket', 'IO.Pipe', 'IO.Device',
+    'IO.Serial', 'IO.USB', 'IO.GPU',
+    'Alloc.Heap', 'Alloc.Pool', 'Alloc.Stack', 'Alloc.Virtual', 'Alloc.Shared',
+    'Unsafe.Ptr', 'Unsafe.Cast', 'Unsafe.ASM', 'Unsafe.FFI', 'Unsafe.Uninit',
+    'Mem.Read', 'Mem.Write', 'Mem.Exec',
+    'Mem.Read.Process', 'Mem.Read.Kernel', 'Mem.Read.Mapped',
+    'Mem.Write.Process', 'Mem.Write.Kernel', 'Mem.Write.Exec', 'Mem.Write.Mapped',
+    'Mem.Exec.JIT', 'Mem.Exec.Shellcode',
+    'Sync.Lock', 'Sync.Atomic', 'Sync.Signal', 'Sync.Wait',
+    'Crypto.Hash', 'Crypto.Encrypt', 'Crypto.Decrypt', 'Crypto.Random', 'Crypto.Key',
+    'Process.Spawn', 'Process.Kill', 'Process.Inject', 'Process.Suspend', 'Process.Token',
+    'Hook.Detour', 'Hook.IAT', 'Hook.SSDT', 'Hook.Vtable', 'Hook.Exception',
+    'Privilege.Elevate', 'Privilege.Drop', 'Privilege.Check',
+    'Time.RealTime', 'Time.Sleep', 'Time.Timer',
+}
+
+
+def _hover_effect_name(program, word: str, text: str, position, uri: str):
+    """Return a Hover for an effect name (built-in or user-defined EffectDef)."""
+    # Check built-in effects
+    is_builtin = word in _BUILTIN_EFFECT_ROOTS
+    # Check user-defined effect declarations
+    user_def = None
+    for stmt in program.statements:
+        if isinstance(stmt, EffectDef) and stmt.name == word:
+            user_def = stmt
+            break
+
+    if not is_builtin and user_def is None:
+        return None
+
+    if user_def is not None:
+        expr_str = str(user_def.body).strip() if user_def.body else word
+        # Strip outer parens if present
+        if expr_str.startswith('(') and expr_str.endswith(')'):
+            expr_str = expr_str[1:-1].strip()
+        md = f'**effect** `{word}`\n\n`{expr_str}`'
+        eg_expr = expr_str
+    else:
+        md = f'**effect** `{word}`'
+        eg_expr = word
+
+    md += f'\n\n<!-- fx:effect:{eg_expr} -->'
+
+    # Source location
+    current_path = _uri_to_path(uri)
+    if user_def is not None:
+        line_map = getattr(program, '_line_map', None)
+        src_line = getattr(user_def, 'source_line', None)
+        if line_map and src_line and src_line > 0 and src_line <= len(line_map):
+            origin, _ = line_map[src_line - 1]
+            current_path = str(Path(origin).resolve()) if origin else current_path
+    md += f'\n\n*{current_path}*'
+
+    return lsp.Hover(
+        contents=lsp.MarkupContent(kind=lsp.MarkupKind.Markdown, value=md),
+        range=_word_range_at_position(text, position),
+    )
+    """
+    Convert a ConstraDef's relations into a type geometry expression string
+    that tg.py / vizcore.py can parse.
+    e.g. relations = [(['A'], '~=', ['B']), (['A'], '!~=', ['C'])]
+      -> "A ~= B & A !~= C"
+    """
+    parts = []
+    for lhs_names, op, rhs_names in getattr(constra_def, 'relations', []):
+        lhs = ' & '.join(lhs_names) if isinstance(lhs_names, list) else str(lhs_names)
+        rhs = ' & '.join(rhs_names) if isinstance(rhs_names, list) else str(rhs_names)
+        parts.append(f'{lhs} {op} {rhs}')
+    return ' & '.join(parts)
+
+
+def _hover_constraint(program, word: str, text: str, position, uri: str):
+    """
+    Return a Hover for a constraint name, including:
+    - kind label + name
+    - parameter list
+    - relation expression (for TG visualizer)
+    - source file
+    - <!-- fx:constraint:EXPR --> marker for the IDE
+    """
+    constras = getattr(program, '_constras', {})
+    if word not in constras:
+        return None
+
+    params, relations = constras[word]
+    params_str = f'({", ".join(params)})' if params else ''
+    md = f'**constraint** `{word}{params_str}`'
+
+    # Extract raw body directly from source text
+    raw_body = None
+    try:
+        # Find "constraint word" then extract between { and }
+        import re as _re
+        m = _re.search(r'\bconstraint\s+' + _re.escape(word) + r'\s*(?:\([^)]*\))?\s*\{([^}]*)\}', text, _re.DOTALL)
+        if m:
+            body = m.group(1)
+            # Strip comments and collapse whitespace
+            body = _re.sub(r'//[^\n]*', '', body)
+            raw_body = ' '.join(body.split()).strip()
+    except Exception:
+        pass
+
+    tg_expr = raw_body or _constra_tg_expr(type('_CD', (), {'relations': relations})())
+    if tg_expr:
+        md += f'\n\n`{tg_expr}`'
+        md += f'\n\n<!-- fx:constraint:{tg_expr} -->'
+
+    # Source file location
+    line_map = getattr(program, '_line_map', None)
+    src_line = None
+    for stmt in program.statements:
+        if isinstance(stmt, ConstraDef) and stmt.name == word:
+            src_line = getattr(stmt, 'source_line', None)
+            break
+
+    current_path = _uri_to_path(uri)
+    if line_map and src_line and src_line > 0 and src_line <= len(line_map):
+        origin, _ = line_map[src_line - 1]
+        source_path = str(Path(origin).resolve()) if origin else current_path
+    else:
+        source_path = current_path
+    md += f'\n\n*{source_path}*'
+
+    return lsp.Hover(
+        contents=lsp.MarkupContent(kind=lsp.MarkupKind.Markdown, value=md),
+        range=_word_range_at_position(text, position),
+    )
+
+
+def _effect_expr_to_exclusions(expr_str: str) -> List[str]:
+    """Extract excluded effect names from an effect expression string.
+    e.g. '!IO & !Alloc' -> ['IO', 'Alloc']
+    '!IO.Console' -> ['IO.Console']
+    """
+    import re as _re
+    return _re.findall(r'!([A-Z][A-Za-z0-9]*(?:\.[A-Za-z0-9]+)*)', expr_str)
+
+
+def _effect_name_matches(required: str, excluded: str) -> bool:
+    """True if required effect is covered by excluded effect.
+    e.g. required='IO.Console', excluded='IO' -> True (child of excluded)
+    required='IO', excluded='IO.Console' -> False
+    """
+    return required == excluded or required.startswith(excluded + '.')
+
+
+def _analyze_function_body(func_def, program=None) -> dict:
+    """Walk a FunctionDef's body collecting calls, return sites, and effect violations."""
+    from fast import FunctionCall, ReturnStatement
+    calls = []
+    returns = 0
+    violations = []
+    visited = set()
+
+    # Get caller's exclusions from its effect annotation
+    caller_exclusions = []
+    ea = getattr(func_def, 'effect_annotation', None)
+    if ea:
+        caller_exclusions = _effect_expr_to_exclusions(_effect_expr_str(ea))
+    # Also resolve named effects (e.g. NoIO -> !IO)
+    if caller_exclusions == [] and ea and program:
+        raw = _effect_expr_str(ea)
+        # Look up named effect definitions
+        for stmt in program.statements:
+            if type(stmt).__name__ == 'EffectDef' and getattr(stmt, 'name', None) == raw.strip():
+                body_str = str(getattr(stmt, 'body', '') or '')
+                caller_exclusions = _effect_expr_to_exclusions(body_str)
+                break
+
+    def _walk(node):
+        nonlocal returns
+        if node is None or id(node) in visited:
+            return
+        visited.add(id(node))
+        if isinstance(node, FunctionCall):
+            calls.append(node.name)
+            # Check for effect violations
+            if caller_exclusions and program:
+                func_index = _build_func_index(program)
+                called_def = func_index.get(node.name)
+                if called_def:
+                    cea = getattr(called_def, 'effect_annotation', None)
+                    if cea:
+                        callee_effects = _effect_expr_str(cea)
+                        # Find required effects (non-excluded ones, e.g. *IO.Console)
+                        import re as _re
+                        required = _re.findall(r'\*?([A-Z][A-Za-z0-9]*(?:\.[A-Za-z0-9]+)*)', callee_effects)
+                        for req in required:
+                            for excl in caller_exclusions:
+                                if _effect_name_matches(req, excl):
+                                    bare_callee = node.name.split('__')[-1] if '__' in node.name else node.name
+                                    violations.append(
+                                        f"Call to `{bare_callee}` violates effect: "
+                                        f"caller forbids `{excl}` but callee requires `{req}`"
+                                    )
+        if isinstance(node, ReturnStatement):
+            returns += 1
+        if not hasattr(node, '__dict__'):
+            return
+        for attr in vars(node).values():
+            if isinstance(attr, list):
+                for item in attr:
+                    if hasattr(item, '__dict__'):
+                        _walk(item)
+            elif hasattr(attr, '__dict__') and not isinstance(attr, type):
+                _walk(attr)
+
+    body = getattr(func_def, 'body', None)
+    if body:
+        _walk(body)
+    return {'calls': calls, 'returns': returns, 'violations': violations}
+    """
+    Return the source file where a symbol is defined using the line map.
+    Falls back to current_uri_path if unavailable.
+    """
+    line_map = getattr(program, '_line_map', None)
+    if line_map is None:
+        return current_uri_path
+    src_line = getattr(func_def, 'source_line', None) if func_def else None
+    if src_line and src_line > 0 and 1 <= src_line <= len(line_map):
+        origin, _ = line_map[src_line - 1]
+        return str(Path(origin).resolve()) if origin else current_uri_path
+    return current_uri_path
+
+def _symbol_origin_file(program, func_def, current_uri_path: str) -> str:
+    """Return the source file where a symbol is defined using the line map."""
+    line_map = getattr(program, '_line_map', None)
+    if line_map is None:
+        return current_uri_path
+    src_line = getattr(func_def, 'source_line', None) if func_def else None
+    if src_line and src_line > 0 and src_line <= len(line_map):
+        origin, _ = line_map[src_line - 1]
+        return str(Path(origin).resolve()) if origin else current_uri_path
+    return current_uri_path
+
+
 @flux_server.feature(lsp.TEXT_DOCUMENT_HOVER)
 def hover(ls: LanguageServer, params: lsp.HoverParams):
     uri     = params.text_document.uri
@@ -972,10 +1300,28 @@ def hover(ls: LanguageServer, params: lsp.HoverParams):
     if program is None:
         return None
 
+    # Ensure top-level symbols registered (stale cache may predate this fix)
+    if not getattr(program, '_toplevel_registered', False):
+        _register_toplevel_symbols(program)
+        try:
+            program._toplevel_registered = True
+        except Exception:
+            pass
+
     text = _doc_store.get(uri, "")
     word = _qualified_word_at_position(text, params.position)
     if not word:
         return None
+
+    # Check for constraint first
+    constr_hover = _hover_constraint(program, word, text, params.position, uri)
+    if constr_hover is not None:
+        return constr_hover
+
+    # Check for effect name
+    effect_hover = _hover_effect_name(program, word, text, params.position, uri)
+    if effect_hover is not None:
+        return effect_hover
 
     entry = _resolve_qualified(program, word)
     if entry is None:
@@ -1013,6 +1359,88 @@ def hover(ls: LanguageServer, params: lsp.HoverParams):
             md = f"**function** `{full}`"
             if type_str:
                 md += f"\n\nReturns: `{type_str}`"
+        md += _hover_effect_lines(func_def)
+
+        # Body summary
+        if func_def and not getattr(func_def, 'is_prototype', False):
+            analysis = _analyze_function_body(func_def, program)
+            summary_parts = []
+            calls = analysis['calls']
+            if calls:
+                from collections import Counter
+                call_counts = Counter(calls)
+                func_index = _build_func_index(program)
+                call_strs = []
+                for name, count in call_counts.most_common(5):
+                    display_name = name.replace('__', '::')
+                    label = f"{display_name} ×{count}" if count > 1 else display_name
+                    called_def = func_index.get(name) or func_index.get(display_name.split('::')[-1])
+                    effect_label = None
+                    if called_def:
+                        ea = getattr(called_def, 'effect_annotation', None)
+                        if ea:
+                            effect_label = _effect_expr_str(ea)
+                    if not effect_label:
+                        ns_parts = name.split('__')
+                        _NS_EFFECT_MAP = {
+                            'io': 'IO', 'console': 'IO.Console', 'file': 'IO.File',
+                            'socket': 'IO.Socket', 'alloc': 'Alloc', 'heap': 'Alloc.Heap',
+                            'crypto': 'Crypto', 'process': 'Process', 'hook': 'Hook',
+                            'sync': 'Sync', 'mem': 'Mem',
+                        }
+                        for part in reversed(ns_parts[:-1]):
+                            inferred = _NS_EFFECT_MAP.get(part.lower())
+                            if inferred:
+                                effect_label = inferred
+                                break
+                    if effect_label:
+                        label += f" `({effect_label})`"
+                    call_strs.append(label)
+                if len(call_counts) > 5:
+                    call_strs.append(f"…+{len(call_counts)-5} more")
+                summary_parts.append(f"{len(calls)} call(s): {', '.join(call_strs)}")
+            if analysis['returns']:
+                summary_parts.append(f"{analysis['returns']} return site(s)")
+            if summary_parts:
+                md += '\n\n' + '\n\n'.join(summary_parts)
+
+            # Effect violations
+            for v in analysis.get('violations', []):
+                md += f'\n\n<!-- fx:violation:{v} -->'
+
+        # Effect annotation -- check definition and fall back to any prototype
+        func_def_for_effect = func_def
+        if not getattr(func_def_for_effect, 'effect_annotation', None):
+            # Search all statements recursively for any FunctionDef with this name and an annotation
+            def _find_with_effect(stmts, name):
+                for s in stmts:
+                    if type(s).__name__ == 'FunctionDef' and getattr(s, 'name', None) == name:
+                        if getattr(s, 'effect_annotation', None):
+                            return s
+                    ns = None
+                    if isinstance(s, NamespaceDefStatement): ns = s.namespace_def
+                    elif isinstance(s, NamespaceDef): ns = s
+                    elif hasattr(s, 'namespace_def'): ns = s.namespace_def
+                    if ns:
+                        for fn in getattr(ns, 'functions', []):
+                            if getattr(fn, 'name', None) == bare_name and getattr(fn, 'effect_annotation', None):
+                                return fn
+                        result = _find_with_effect(getattr(ns, 'nested_namespaces', []), name)
+                        if result:
+                            return result
+                return None
+            found = _find_with_effect(program.statements, bare_name)
+            if found:
+                func_def_for_effect = found
+
+        ea = getattr(func_def_for_effect, 'effect_annotation', None) if func_def_for_effect else None
+        if not ea:
+            ea = getattr(func_def, 'effect_annotation', None) if func_def else None
+        if ea:
+            expr = _effect_expr_str(ea)
+            if expr:
+                md += f"\n\neffect: `{expr}`"
+                md += f"\n\n<!-- fx:effect:{expr} -->"
     elif entry.kind in (SymbolKind.STRUCT, SymbolKind.OBJECT):
         md = f"**{kind_label}** `{full}`"
         for stmt in program.statements:
@@ -1043,10 +1471,23 @@ def hover(ls: LanguageServer, params: lsp.HoverParams):
         if type_str:
             md += f": `{type_str}`"
 
+    # File of origin
+    current_path = _uri_to_path(uri)
+    if entry.kind == SymbolKind.FUNCTION:
+        func_def_node = _find_function_def(program, bare_name, entry.name)
+        src_line = getattr(func_def_node, 'source_line', None) if func_def_node else None
+        line_map = getattr(program, '_line_map', None)
+        origin = _symbol_origin_file(program, func_def_node, current_path)
+    else:
+        origin = current_path
+    md += f'\n\n*{origin}*'
+
     return lsp.Hover(
         contents=lsp.MarkupContent(kind=lsp.MarkupKind.Markdown, value=md),
         range=_word_range_at_position(text, params.position),
     )
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -1128,20 +1569,31 @@ def _build_func_index(program: Program) -> Dict[str, "FunctionDef"]:
         for stmt in stmts:
             if isinstance(stmt, FunctionDefStatement):
                 defn = stmt.function_def
-                index[defn.name] = defn
-                # Also index by bare name (last segment)
-                bare = defn.name.split('__')[-1]
-                if bare not in index:
-                    index[bare] = defn
-            elif isinstance(stmt, NamespaceDefStatement):
+                # Prefer definitions over prototypes
+                if defn.name not in index or getattr(index[defn.name], 'is_prototype', True):
+                    index[defn.name] = defn
+            elif hasattr(stmt, 'function_def'):
+                defn = stmt.function_def
+                if defn.name not in index or getattr(index[defn.name], 'is_prototype', True):
+                    index[defn.name] = defn
+            elif type(stmt).__name__ == 'FunctionDef' and hasattr(stmt, 'name'):
+                if stmt.name not in index or getattr(index[stmt.name], 'is_prototype', True):
+                    index[stmt.name] = stmt
+
+            ns = None
+            if isinstance(stmt, NamespaceDefStatement):
                 ns = stmt.namespace_def
-                for fn in ns.functions:
-                    index[fn.name] = fn
-                    bare = fn.name.split('__')[-1]
-                    if bare not in index:
-                        index[bare] = fn
-                for nested in ns.nested_namespaces:
-                    _index_stmts([NamespaceDefStatement(nested)])
+            elif isinstance(stmt, NamespaceDef):
+                ns = stmt
+            elif hasattr(stmt, 'namespace_def'):
+                ns = stmt.namespace_def
+
+            if ns is not None:
+                for fn in getattr(ns, 'functions', []):
+                    if fn.name not in index or getattr(index[fn.name], 'is_prototype', True):
+                        index[fn.name] = fn
+                for nested in getattr(ns, 'nested_namespaces', []):
+                    _index_stmts([nested])
 
     _index_stmts(program.statements)
     try:

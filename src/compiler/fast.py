@@ -1439,13 +1439,27 @@ class ContractDef(Statement):
     The parser expands the contract body statements into the top of the
     function body at parse time. Contract->nodes are stored in the
     parser's _contracts table and never reach codegen directly.
+
+    Optional binding annotation (parsed after the semicolon):
+        contract MyC(a,b)
+        {
+        } # binding { this : OtherContract };
+
+    binding is None when not specified, otherwise a dict:
+        {
+            'pre':  list of str -- the pre-contract names that must appear (or ['!'] for none allowed)
+            'post': list of ContractBindingRef -- post requirements (or [ContractBindingRef('!', None, False)])
+        }
+    Each ContractBindingRef is a 3-tuple: (name, arity_or_None, negated)
+    The operator between post entries is stored in 'post_op': ',' (ordered-all), '|' (ordered-any/all), '&' (all required).
     """
     name: str
     body: Block  # statements to inject at the top of the function body
     params: List[str] = field(default_factory=list)  # param names for parameterized contracts
+    binding: object = field(default=None)  # None or dict with 'pre', 'post', 'post_op'
 
     def __repr__(self) -> str:
-        params_str = '(' + ', '.join(params) + ')' if params else ''
+        params_str = '(' + ', '.join(self.params) + ')' if self.params else ''
         return f"contract {self.name}{params_str} {{ {self.body} }}"
 
 

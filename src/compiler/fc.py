@@ -49,12 +49,11 @@ def get_debug_level(level: str):
 
 def set_debug_level():
     tmp_debug_levels = []
-    debug_level = config['debug_level']
+    debug_level = config.get('debug_level', 'none')
     debug_level = debug_level.split(" | ")
     if len(debug_level) == 1:
         debug_level = debug_level[0]
         return [get_debug_level(debug_level)]
-        return
     for level in debug_level:
         tmp_debug_levels.append(get_debug_level(level))
     return tmp_debug_levels
@@ -395,8 +394,9 @@ class FluxCompiler:
             # LEFT OFF REPLACING LOG DEBUGGER WITH DEBUGGER FUNCTION
             # CONTINUE BELOW
 
-            # Effect pass -- runs before DCE so annotated functions aren't eliminated first
-            self._run_effect_pass(ast)
+            # Effect pass -- only runs when --effects or --effects-warn is specified
+            if self.effects_strict or self.effects_warn:
+                self._run_effect_pass(ast)
 
             # DCE -- runs unconditionally on the parsed AST before borrow check
             self._run_dce(ast, self.entrypoint)

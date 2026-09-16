@@ -60,7 +60,10 @@ class FluxLogger:
         self.log_file_path = log_file
         self.log_file_handle: Optional[TextIO] = None
         self.timestamp = timestamp
-        self.colors = colors and hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()
+        self.colors = colors and (
+            os.environ.get('FORCE_COLOR', '0') == '1' or
+            (hasattr(sys.stdout, 'isatty') and sys.stdout.isatty())
+        )
         self.component_filter = set(component_filter) if component_filter else None
         
         # Color codes for different log levels

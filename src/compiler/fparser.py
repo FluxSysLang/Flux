@@ -472,6 +472,7 @@ class FluxParser:
         self._custom_operators: Dict[str, str] = {}  # symbol string -> base function name
         self._active_template_params: set = set()  # template param names in scope during current def/struct parse
         self._contracts: Dict[str, Block] = {}  # name -> Block of statements to inject
+        self._contract_bindings: Dict[str, dict] = {}  # name -> binding spec dict from # binding { ... }
         self._constras: dict = {}  # name -> (params: List[str], relations: list)
         self._function_depth = 0  # Tracks nesting depth; nested function defs are illegal
         self._loop_depth = 0      # Tracks nesting depth of for/while/do-while loops
@@ -623,6 +624,8 @@ class FluxParser:
                 return True
             if p1.type == TokenType.ADDRESS_OF:
                 return True
+            if p1.type == TokenType.MINUS_ASSIGN:
+                return True
             if p1.type == TokenType.BACKTICK:
                 p2 = self.peek(2)
                 if p2 and p2.type in (TokenType.LESS_THAN, TokenType.LESS_EQUAL,
@@ -644,6 +647,9 @@ class FluxParser:
         if self.expect(TokenType.ADDRESS_OF):
             self.advance()
             return "!@"
+        if self.expect(TokenType.MINUS_ASSIGN):
+            self.advance()
+            return "!-="
         # BACKTICK branch - !`< !`<= !`> !`>=
         self.consume(TokenType.BACKTICK)
         if self.expect(TokenType.LESS_EQUAL):
@@ -870,18 +876,24 @@ class FluxParser:
 
         # Pre-contracts: -> rtype : Contract1, Contract2 { ... }
         contract_stmts = []
+        _pre_contract_names = []
+        _pre_contract_arities = []
         if self.expect(TokenType.COLON):
             self.advance()
             contract_name, call_args = self._parse_contract_ref()
             if contract_name not in self._contracts:
                 self.error(f"Undefined contract '{contract_name}'")
             contract_stmts.extend(self._resolve_contract(contract_name, params, call_args))
+            _pre_contract_names.append(contract_name)
+            _pre_contract_arities.append(len(call_args) if call_args is not None else None)
             while self.expect(TokenType.COMMA):
                 self.advance()
                 contract_name, call_args = self._parse_contract_ref()
                 if contract_name not in self._contracts:
                     self.error(f"Undefined contract '{contract_name}'")
                 contract_stmts.extend(self._resolve_contract(contract_name, params, call_args))
+                _pre_contract_names.append(contract_name)
+                _pre_contract_arities.append(len(call_args) if call_args is not None else None)
 
         if self.expect(TokenType.SEMICOLON):
             self.advance()
@@ -893,20 +905,29 @@ class FluxParser:
                 body.statements = contract_stmts + body.statements
             # Post-contracts: } : Post1, Post2;
             post_contract_stmts = []
+            _post_contract_names = []
+            _post_contract_arities = []
             if self.expect(TokenType.COLON):
                 self.advance()
                 post_name, post_call_args = self._parse_contract_ref()
                 if post_name not in self._contracts:
                     self.error(f"Undefined post-contract '{post_name}'")
                 post_contract_stmts.extend(self._resolve_contract(post_name, params, post_call_args))
+                _post_contract_names.append(post_name)
+                _post_contract_arities.append(len(post_call_args) if post_call_args is not None else None)
                 while self.expect(TokenType.COMMA):
                     self.advance()
                     post_name, post_call_args = self._parse_contract_ref()
                     if post_name not in self._contracts:
                         self.error(f"Undefined post-contract '{post_name}'")
                     post_contract_stmts.extend(self._resolve_contract(post_name, params, post_call_args))
+                    _post_contract_names.append(post_name)
+                    _post_contract_arities.append(len(post_call_args) if post_call_args is not None else None)
             if post_contract_stmts:
                 body = self._apply_post_contracts(body, return_type, post_contract_stmts)
+            if _pre_contract_names or _post_contract_names:
+                self._validate_contract_binding(func_name, _pre_contract_names, _pre_contract_arities,
+                                                _post_contract_names, _post_contract_arities)
             self.consume(TokenType.SEMICOLON)
             is_prototype = False
 
@@ -1521,6 +1542,172 @@ class FluxParser:
             self.consume(TokenType.RIGHT_PAREN)
         return name, call_args
 
+    def _validate_contract_binding(self, func_name: str,
+                                    pre_contract_names: list,
+                                    pre_contract_arities: list,
+                                    post_contract_names: list,
+                                    post_contract_arities: list):
+        """
+        Validate that a function's pre/post contracts satisfy all active # binding
+        constraints declared on those contracts.
+
+        For every contract (pre or post) that has a # binding, we check:
+          - pre_side: required names must appear as pre-contracts on the function.
+            'this' on pre-side = the contract itself must be a pre-contract.
+            '!' = no pre-contracts allowed.
+          - post_side: required names must appear as post-contracts on the function.
+            'this' on post-side = the contract itself must be a post-contract.
+            '!' = no post-contracts allowed.
+            ',' = all required present in that order, forbidden absent.
+            '|' = any subset present in that order, forbidden absent.
+            '&' = all required present, forbidden absent.
+        """
+        def _matches_ref(name, arity_or_none, names, arities):
+            for n, a in zip(names, arities):
+                if n == name and (arity_or_none is None or arity_or_none == a):
+                    return True
+            return False
+
+        # Unified loop: check every contract that has a binding, whether it appears
+        # as a pre-contract, a post-contract, or both.
+        # 'this' always means the contract itself.
+        # is_pre / is_post indicate which position(s) the contract occupies on this function.
+        all_bound = set(pre_contract_names + post_contract_names) & set(self._contract_bindings.keys())
+        for cname in list(dict.fromkeys(pre_contract_names + post_contract_names)):
+            if cname not in self._contract_bindings:
+                continue
+            binding = self._contract_bindings[cname]
+            pre_spec = binding['pre']
+            post_spec = binding['post']
+            post_op = binding['post_op']
+            is_pre = cname in pre_contract_names
+            is_post = cname in post_contract_names
+
+            # --- validate pre_side ---
+            # pre_spec names (other than 'this') must appear as pre-contracts on the function.
+            # 'this' on the pre-side means the contract itself must be a pre-contract.
+            if pre_spec == ['!']:
+                if pre_contract_names:
+                    self.error(
+                        f"Contract '{cname}' binding declares no pre-contract is allowed "
+                        f"on function '{func_name}', but pre-contracts are present: {pre_contract_names}"
+                    )
+            else:
+                for required_pre in pre_spec:
+                    if required_pre == 'this':
+                        if not is_pre:
+                            self.error(
+                                f"Contract '{cname}' binding requires itself as a pre-contract "
+                                f"on function '{func_name}', but it is only used as a post-contract"
+                            )
+                    elif required_pre not in pre_contract_names:
+                        if required_pre in post_contract_names:
+                            self.error(
+                                f"Contract '{cname}' binding requires '{required_pre}' as a "
+                                f"pre-contract on function '{func_name}', but it is inverted "
+                                f"(used as a post-contract instead)"
+                            )
+                        else:
+                            self.error(
+                                f"Contract '{cname}' binding requires pre-contract '{required_pre}' "
+                                f"on function '{func_name}', but it is not present"
+                            )
+
+            # --- validate post_side ---
+            if not post_spec:
+                continue
+
+            # 'this' on post-side means the contract itself must be a post-contract.
+            if post_spec == [('!', None, False)]:
+                if post_contract_names:
+                    self.error(
+                        f"Contract '{cname}' binding declares no post-contract is allowed "
+                        f"on function '{func_name}', but post-contracts are present: {post_contract_names}"
+                    )
+                continue
+
+            # Resolve 'this' to the contract's own name throughout post_spec.
+            resolved = [(cname if n == 'this' else n, a, neg) for n, a, neg in post_spec]
+
+            if post_op is None or post_op == ',':
+                required_order = [(n, a) for n, a, neg in resolved if not neg]
+                forbidden      = [(n, a) for n, a, neg in resolved if neg]
+                for fn, fa in forbidden:
+                    if _matches_ref(fn, fa, post_contract_names, post_contract_arities):
+                        self.error(
+                            f"Contract '{cname}' binding forbids post-contract '{fn}' "
+                            f"on function '{func_name}'"
+                        )
+                indices = []
+                for rn, ra in required_order:
+                    found_idx = None
+                    for i, (pn, pa) in enumerate(zip(post_contract_names, post_contract_arities)):
+                        if pn == rn and (ra is None or ra == pa):
+                            found_idx = i
+                            break
+                    if found_idx is None:
+                        if _matches_ref(rn, ra, pre_contract_names, pre_contract_arities):
+                            self.error(
+                                f"Contract '{cname}' binding requires '{rn}' as a "
+                                f"post-contract on function '{func_name}', but it is inverted "
+                                f"(used as a pre-contract instead)"
+                            )
+                        else:
+                            self.error(
+                                f"Contract '{cname}' binding requires post-contract '{rn}' "
+                                f"on function '{func_name}'"
+                            )
+                    indices.append(found_idx)
+                for i in range(1, len(indices)):
+                    if indices[i] <= indices[i - 1]:
+                        self.error(
+                            f"Contract '{cname}' binding requires post-contracts "
+                            f"{[n for n, _ in required_order]} in that order on function '{func_name}'"
+                        )
+
+            elif post_op == '|':
+                required_order = [(n, a) for n, a, neg in resolved if not neg]
+                forbidden      = [(n, a) for n, a, neg in resolved if neg]
+                for fn, fa in forbidden:
+                    if _matches_ref(fn, fa, post_contract_names, post_contract_arities):
+                        self.error(
+                            f"Contract '{cname}' binding forbids post-contract '{fn}' "
+                            f"on function '{func_name}'"
+                        )
+                present = []
+                for rn, ra in required_order:
+                    for i, (pn, pa) in enumerate(zip(post_contract_names, post_contract_arities)):
+                        if pn == rn and (ra is None or ra == pa):
+                            present.append((rn, i))
+                            break
+                for i in range(1, len(present)):
+                    if present[i][1] <= present[i - 1][1]:
+                        self.error(
+                            f"Contract '{cname}' binding requires post-contracts "
+                            f"{[n for n, _ in required_order]} in that order on function '{func_name}'"
+                        )
+
+            elif post_op == '&':
+                for rn, ra, neg in resolved:
+                    matched = _matches_ref(rn, ra, post_contract_names, post_contract_arities)
+                    if not neg and not matched:
+                        if _matches_ref(rn, ra, pre_contract_names, pre_contract_arities):
+                            self.error(
+                                f"Contract '{cname}' binding requires '{rn}' as a "
+                                f"post-contract on function '{func_name}', but it is inverted "
+                                f"(used as a pre-contract instead)"
+                            )
+                        else:
+                            self.error(
+                                f"Contract '{cname}' binding requires post-contract '{rn}' "
+                                f"on function '{func_name}'"
+                            )
+                    elif neg and matched:
+                        self.error(
+                            f"Contract '{cname}' binding forbids post-contract '{rn}' "
+                            f"on function '{func_name}'"
+                        )
+
     def _resolve_contract(self, contract_name: str, func_params: list,
                           call_site_args: list = None) -> list:
         """
@@ -1784,7 +1971,8 @@ class FluxParser:
 
     def contract_def(self) -> ContractDef:
         """
-        contract_def -> 'contract' IDENTIFIER block ';'
+        contract_def -> 'contract' IDENTIFIER ('(' param_list ')')? block ';'
+                        ('# binding' '{' binding_spec '}' ';')?
 
         Parses a contract definition and registers its statement block in
         self._contracts so function_def() can inject it at parse time.
@@ -1792,6 +1980,15 @@ class FluxParser:
         list (for diagnostics / future tooling); codegen ignores it.
         Supports multiple comma-separated contracts on one function:
             def foo(int x) -> int : NonZero, Positive { ... };
+
+        Optional binding syntax (after the ';'):
+            contract MyC(a,b) { } # binding { this : OtherContract };
+            contract MyC(a,b) { } # binding { this : OtherContract(3) };
+            contract MyC(a,b) { } # binding { this : C1, C2 };
+            contract MyC(a,b) { } # binding { this : C1 | C2 };
+            contract MyC(a,b) { } # binding { this : C1 & !C2 };
+            contract MyC(a,b) { } # binding { this, C1 :! };
+            contract MyC(a,b) { } # binding { this :! };
         """
         tok = self.current_token
         self.consume(TokenType.CONTRACT)
@@ -1806,10 +2003,192 @@ class FluxParser:
                     self.advance()
                     params.append(self.consume(TokenType.IDENTIFIER).value)
             self.consume(TokenType.RIGHT_PAREN)
+        # Forward declaration: contract Foo; or contract Foo(a,b); or comma list
+        if self.expect(TokenType.SEMICOLON) or self.expect(TokenType.COMMA):
+            # Collect all names in the declaration list
+            entries = [(name, params)]
+            while self.expect(TokenType.COMMA):
+                self.advance()
+                n = self.consume(TokenType.IDENTIFIER).value
+                p = []
+                if self.expect(TokenType.LEFT_PAREN):
+                    self.advance()
+                    if not self.expect(TokenType.RIGHT_PAREN):
+                        p.append(self.consume(TokenType.IDENTIFIER).value)
+                        while self.expect(TokenType.COMMA):
+                            self.advance()
+                            p.append(self.consume(TokenType.IDENTIFIER).value)
+                    self.consume(TokenType.RIGHT_PAREN)
+                entries.append((n, p))
+            self.consume(TokenType.SEMICOLON)
+            nodes = []
+            for n, p in entries:
+                if n not in self._contracts:
+                    self._contracts[n] = (p, Block([]))
+                nodes.append(ContractDef(n, Block([]), p, None).set_location(tok.line, tok.column))
+            return nodes
         body = self.block()
+        # Optional # binding { ... };
+        # Syntax: contract MyC(a,b) { } # binding { pre : post };
+        # The single trailing ';' follows the binding when present, or follows '}' directly.
+        binding = None
+        if self.expect(TokenType.TAG):
+            # peek ahead: token after TAG should be identifier 'binding'
+            next_tok = self.tokens[self.position + 1] if self.position + 1 < len(self.tokens) else None
+            if next_tok and next_tok.type == TokenType.IDENTIFIER and next_tok.value == 'binding':
+                self.advance()  # consume TAG
+                self.advance()  # consume 'binding' identifier
+                self.consume(TokenType.LEFT_BRACE)
+                binding = self._parse_binding_spec()
+                self.consume(TokenType.RIGHT_BRACE)
         self.consume(TokenType.SEMICOLON)
         self._contracts[name] = (params, body)
-        return ContractDef(name, body, params).set_location(tok.line, tok.column)
+        # Store binding keyed by contract name for validation at function sites
+        if binding is not None:
+            self._contract_bindings[name] = binding
+        return ContractDef(name, body, params, binding).set_location(tok.line, tok.column)
+
+    def _parse_binding_spec(self) -> dict:
+        """
+        Parse the interior of a # binding { ... } annotation.
+
+        Grammar:
+            binding_spec = pre_side ':' post_side
+
+            pre_side  = '!'                          # no pre-contract allowed
+                      | pre_name (',' pre_name)*     # named pre-contracts (first = 'this')
+
+            pre_name  = 'this' | IDENTIFIER
+
+            post_side = '!'                          # no post-contract allowed
+                      | binding_ref (op binding_ref)*
+
+            op        = ',' | '|' | '&'
+
+            binding_ref = '!'? IDENTIFIER ('(' INT ')')?
+
+        Returns a dict:
+            {
+                'pre':    list of str  ('!' for no-contract, or names including 'this'),
+                'post':   list of (name, arity_or_None, negated),
+                'post_op': ',' | '|' | '&' | None
+            }
+        """
+        # Parse pre-side
+        pre = []
+        if self.expect(TokenType.NOT):
+            # '!' alone = no-contract on pre side
+            self.advance()
+            pre = ['!']
+        else:
+            # Expect 'this' (THIS token) or IDENTIFIER
+            if self.expect(TokenType.THIS):
+                pre.append('this')
+                self.advance()
+            else:
+                pre.append(self.consume(TokenType.IDENTIFIER).value)
+            while self.expect(TokenType.COMMA):
+                self.advance()  # consume comma
+                if self.expect(TokenType.THIS):
+                    pre.append('this')
+                    self.advance()
+                else:
+                    pre.append(self.consume(TokenType.IDENTIFIER).value)
+
+        self.consume(TokenType.COLON)
+
+        # Parse post-side
+        # Helper: consume a contract name on the post-side (IDENTIFIER or 'this' keyword)
+        def _consume_binding_name():
+            if self.expect(TokenType.THIS):
+                self.advance()
+                return 'this'
+            return self.consume(TokenType.IDENTIFIER).value
+
+        post = []
+        post_op = None
+        if self.expect(TokenType.NOT):
+            # Check if next is a RIGHT_BRACE (bare '!' = no-contract) or a name (negated ref)
+            next_pos = self.position + 1
+            next_tok = self.tokens[next_pos] if next_pos < len(self.tokens) else None
+            if next_tok and next_tok.type == TokenType.RIGHT_BRACE:
+                self.advance()  # consume '!'
+                post = [('!', None, False)]
+            else:
+                # '!Name' -- a negated contract ref
+                self.advance()  # consume '!'
+                ref_name = _consume_binding_name()
+                arity = None
+                if self.expect(TokenType.LEFT_PAREN):
+                    self.advance()
+                    arity = int(self.consume(TokenType.SINT_LITERAL).value)
+                    self.consume(TokenType.RIGHT_PAREN)
+                post.append((ref_name, arity, True))
+                # Continue with operator chain
+                while self.expect(TokenType.COMMA) or self.expect(TokenType.LOGICAL_OR) or self.expect(TokenType.LOGICAL_AND):
+                    op = self.current_token
+                    if op.type == TokenType.COMMA:
+                        cur_op = ','
+                    elif op.type == TokenType.LOGICAL_OR:
+                        cur_op = '|'
+                    else:
+                        cur_op = '&'
+                    if post_op is None:
+                        post_op = cur_op
+                    elif post_op != cur_op:
+                        self.error("Mixed operators in # binding post-side are not allowed; use the same operator throughout")
+                    self.advance()
+                    negated = False
+                    if self.expect(TokenType.NOT):
+                        self.advance()
+                        negated = True
+                    ref_name = _consume_binding_name()
+                    arity = None
+                    if self.expect(TokenType.LEFT_PAREN):
+                        self.advance()
+                        arity = int(self.consume(TokenType.SINT_LITERAL).value)
+                        self.consume(TokenType.RIGHT_PAREN)
+                    post.append((ref_name, arity, negated))
+        else:
+            # Named contract ref (possibly negated, possibly with arity)
+            negated = False
+            if self.expect(TokenType.NOT):
+                self.advance()
+                negated = True
+            ref_name = _consume_binding_name()
+            arity = None
+            if self.expect(TokenType.LEFT_PAREN):
+                self.advance()
+                arity = int(self.consume(TokenType.SINT_LITERAL).value)
+                self.consume(TokenType.RIGHT_PAREN)
+            post.append((ref_name, arity, negated))
+            # Operator chain
+            while self.expect(TokenType.COMMA) or self.expect(TokenType.LOGICAL_OR) or self.expect(TokenType.LOGICAL_AND):
+                op = self.current_token
+                if op.type == TokenType.COMMA:
+                    cur_op = ','
+                elif op.type == TokenType.LOGICAL_OR:
+                    cur_op = '|'
+                else:
+                    cur_op = '&'
+                if post_op is None:
+                    post_op = cur_op
+                elif post_op != cur_op:
+                    self.error("Mixed operators in # binding post-side are not allowed; use the same operator throughout")
+                self.advance()
+                negated = False
+                if self.expect(TokenType.NOT):
+                    self.advance()
+                    negated = True
+                ref_name = _consume_binding_name()
+                arity = None
+                if self.expect(TokenType.LEFT_PAREN):
+                    self.advance()
+                    arity = int(self.consume(TokenType.SINT_LITERAL).value)
+                    self.consume(TokenType.RIGHT_PAREN)
+                post.append((ref_name, arity, negated))
+
+        return {'pre': pre, 'post': post, 'post_op': post_op}
 
     def constra_def(self) -> 'ConstraDef':
         """
@@ -1946,12 +2325,52 @@ class FluxParser:
                     params.append(self.consume(TokenType.IDENTIFIER).value)
             self.consume(TokenType.RIGHT_PAREN)
         self.consume(TokenType.LEFT_BRACE)
+        # Record the source position of the body start for raw text extraction
+        _body_start_line = self.current_token.line if self.current_token else 0
         relations = []
         def _parse_id_list_cs():
-            names = [self.consume(TokenType.IDENTIFIER).value]
+            # Parse a list of names joined by &.
+            # Each element is a bare IDENTIFIER or a bracket group [A & B & ...].
+            # e.g: B & [A !@ A]  or  D & E & [F & G]
+            def _one_element():
+                if self.expect(TokenType.LEFT_BRACKET):
+                    self.advance()
+                    # Inside brackets is a full relation: A !@ A, or A & B ~= C etc.
+                    # Parse the id list, operator, and rhs, emit as a relation,
+                    # and return the combined names for chaining.
+                    ns = [self.consume(TokenType.IDENTIFIER).value]
+                    while self.expect(TokenType.LOGICAL_AND):
+                        nxt = self.peek(1)
+                        if nxt and nxt.type == TokenType.IDENTIFIER:
+                            self.advance()
+                            ns.extend([self.consume(TokenType.IDENTIFIER).value])
+                        else:
+                            break
+                    if self._is_relconstraint_op():
+                        op = self._consume_relconstraint_op()
+                        rhs_ns = [self.consume(TokenType.IDENTIFIER).value]
+                        while self.expect(TokenType.LOGICAL_AND):
+                            nxt = self.peek(1)
+                            if nxt and nxt.type == TokenType.IDENTIFIER:
+                                self.advance()
+                                rhs_ns.append(self.consume(TokenType.IDENTIFIER).value)
+                            else:
+                                break
+                        relations.append((ns, op, rhs_ns))
+                        ns = rhs_ns
+                    self.consume(TokenType.RIGHT_BRACKET)
+                    return ns
+                return [self.consume(TokenType.IDENTIFIER).value]
+
+            names = _one_element()
+            # Keep consuming & elements as long as next is [ or IDENTIFIER
             while self.expect(TokenType.LOGICAL_AND):
-                self.advance()
-                names.append(self.consume(TokenType.IDENTIFIER).value)
+                next_tok = self.peek(1)
+                if next_tok and next_tok.type in (TokenType.IDENTIFIER, TokenType.LEFT_BRACKET):
+                    self.advance()  # consume &
+                    names.extend(_one_element())
+                else:
+                    break
             return names
         def _is_constraint_op():
             return self._is_relconstraint_op()
@@ -1966,13 +2385,17 @@ class FluxParser:
                 # rhs becomes lhs for next chained op
                 lhs = rhs
         _parse_rel_expr()
-        while self.expect(TokenType.COMMA):
-            self.advance()
+        while not self.expect(TokenType.RIGHT_BRACE):
+            if self.expect(TokenType.COMMA):
+                self.advance()
             _parse_rel_expr()
         self.consume(TokenType.RIGHT_BRACE)
         self.consume(TokenType.SEMICOLON)
         self._constras[name] = (params, relations)
-        return ConstraDef(name, params, relations).set_location(tok.line, tok.column)
+        cd = ConstraDef(name, params, relations).set_location(tok.line, tok.column)
+        cd._body_start_line = _body_start_line
+        cd._body_end_line   = self.current_token.line if self.current_token else _body_start_line
+        return cd
 
     def function_def(self, calling_conv: Optional[str] = None) -> Union[FunctionDef, List[FunctionDef]]:
         """
@@ -2429,12 +2852,16 @@ class FluxParser:
             attenuate_ann = _first_attenuate_ann
         # Resolve contract(s): def foo(int x) -> int : NonZero, LessThan(y,x) { ... }
         contract_stmts = []
+        _pre_contract_names = []
+        _pre_contract_arities = []
         if self.expect(TokenType.COLON):
             self.advance()
             contract_name, call_args = self._parse_contract_ref()
             if contract_name not in self._contracts:
                 self.error(f"Undefined contract '{contract_name}'")
             contract_stmts.extend(self._resolve_contract(contract_name, parameters, call_args))
+            _pre_contract_names.append(contract_name)
+            _pre_contract_arities.append(len(call_args) if call_args is not None else None)
             # Support multiple contracts: : NonZero, Positive
             while self.expect(TokenType.COMMA):
                 self.advance()
@@ -2442,6 +2869,8 @@ class FluxParser:
                 if contract_name not in self._contracts:
                     self.error(f"Undefined contract '{contract_name}'")
                 contract_stmts.extend(self._resolve_contract(contract_name, parameters, call_args))
+                _pre_contract_names.append(contract_name)
+                _pre_contract_arities.append(len(call_args) if call_args is not None else None)
 
         is_prototype = False
         body = None
@@ -2526,20 +2955,29 @@ class FluxParser:
             # The contract body sees 'r' as the return value.
             # Each return expr is rewritten to: r = expr; <asserts>; return r;
             post_contract_stmts = []
+            _post_contract_names = []
+            _post_contract_arities = []
             if self.expect(TokenType.COLON):
                 self.advance()
                 post_name, post_call_args = self._parse_contract_ref()
                 if post_name not in self._contracts:
                     self.error(f"Undefined post-contract '{post_name}'")
                 post_contract_stmts.extend(self._resolve_contract(post_name, parameters, post_call_args))
+                _post_contract_names.append(post_name)
+                _post_contract_arities.append(len(post_call_args) if post_call_args is not None else None)
                 while self.expect(TokenType.COMMA):
                     self.advance()
                     post_name, post_call_args = self._parse_contract_ref()
                     if post_name not in self._contracts:
                         self.error(f"Undefined post-contract '{post_name}'")
                     post_contract_stmts.extend(self._resolve_contract(post_name, parameters, post_call_args))
+                    _post_contract_names.append(post_name)
+                    _post_contract_arities.append(len(post_call_args) if post_call_args is not None else None)
             if post_contract_stmts:
                 body = self._apply_post_contracts(body, return_type, post_contract_stmts)
+            if _pre_contract_names or _post_contract_names:
+                self._validate_contract_binding(name, _pre_contract_names, _pre_contract_arities,
+                                                _post_contract_names, _post_contract_arities)
             # Parse optional # qualifier tags after the closing brace -- any order, any count.
             # Syntax: def foo() -> void { ... } # effect { expr } # attenuate { expr };
             while self.expect(TokenType.TAG):
@@ -3361,11 +3799,15 @@ class FluxParser:
             operand = self._effect_unary()
             return EffectExpr('!', operand)
 
-        # * (implies/propagates)
+        # * (implies/propagates) -- but *. is the global wildcard primary, not a unary op
         if self.expect(TokenType.MULTIPLY):
-            self.advance()
-            operand = self._effect_unary()
-            return EffectExpr('*', operand)
+            if self.peek() and self.peek().type == TokenType.DOT:
+                # *. -- fall through to _effect_primary to handle *.*
+                pass
+            else:
+                self.advance()
+                operand = self._effect_unary()
+                return EffectExpr('*', operand)
 
         # ~ (requires)
         if self.expect(TokenType.TIE):
@@ -3431,14 +3873,29 @@ class FluxParser:
             self.consume(TokenType.RIGHT_BRACKET)
             return expr
 
+        # Global wildcard *.*
+        if self.expect(TokenType.MULTIPLY):
+            self.advance()  # consume '*'
+            self.consume(TokenType.DOT)
+            if not self.expect(TokenType.MULTIPLY):
+                self.error("Expected '*' after '*.' in wildcard effect expression")
+            self.advance()  # consume second '*'
+            return EffectName('*.*').set_location(tok.line, tok.column)
+
         # Effect name -- identifier, possibly dotted (IO.Socket, Hook.Detour)
+        # Supports namespace wildcard: IO.* means all effects in IO namespace.
         if self.expect(TokenType.IDENTIFIER) or self.expect(TokenType.EFFECT):
             name = self.current_token.value
             self.advance()
             while self.expect(TokenType.DOT):
                 self.advance()
+                if self.expect(TokenType.MULTIPLY):
+                    # Namespace wildcard: IO.*
+                    self.advance()
+                    name = name + '.*'
+                    break
                 if not self.expect(TokenType.IDENTIFIER):
-                    self.error("Expected identifier after '.' in effect name")
+                    self.error("Expected identifier or '*' after '.' in effect name")
                 sub = self.current_token.value
                 self.advance()
                 name = name + '.' + sub

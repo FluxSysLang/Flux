@@ -299,7 +299,7 @@ contract FSS_Protect_Frame
         __fss_frame_slot = fss_push(__fss_frame_canary, __fss_frame_canary);
         __fss_frame_active = true;
     };
-} # binding {this : FSS_Cleanup_Frame};
+};
 
 contract FSS_Cleanup_Frame
 {
@@ -314,7 +314,7 @@ contract FSS_Cleanup_Frame
             fss_abort();
         };
     };
-} # binding {FSS_Protect_Frame : this};
+};
 
 #endif; // __WINDOWS__
 

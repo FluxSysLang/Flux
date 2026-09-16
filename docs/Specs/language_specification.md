@@ -64,6 +64,7 @@ If you like Flux, please consider contributing to the language or joining the [F
   - [Freeing from the heap](#freeing-from-the-heap)
   - [Custom infix operators and overloading](#custom-infix-operators-and-overloading)
   - [Functions and `contract`](#functions-and-contract)
+  - [Contract `# binding`](#contract-binding)
   - [Contracts on operators](#contracts-on-operators)
   - [Type Functions](#defining-type-functions)
   - [Functionless Types](#functionless-types)
@@ -2391,6 +2392,133 @@ def foo(int x) -> int : NonZero
 };
 ```
 The contracts disappear from the compilation unit after transformation.
+
+---
+
+<a id="contract-binding"></a>
+## Contract `# binding`
+
+A contract may declare a **binding** that the compiler enforces at every function that attaches it.
+The binding specifies which other contracts must (or must not) appear as pre- or post-contracts on
+the same function, and in what order. This lets a contract author express relationships between
+contracts and catch misuse at compile time rather than at runtime.
+
+### Syntax
+
+```
+contract Name(params)
+{
+    // body
+} # binding { pre_side : post_side };
+```
+
+The binding block is written after the contract body, before the terminating `;`.
+
+**`pre_side`** describes what must or must not appear as a pre-contract on any function that
+attaches `Name`:
+
+| Form | Meaning |
+|---|---|
+| `!` | No pre-contracts are allowed on that function. |
+| `this` | `Name` itself must be used as a pre-contract (not post). |
+| `OtherContract` | `OtherContract` must also be a pre-contract on the function. |
+| `this, OtherContract` | Both requirements apply, in that order. |
+
+**`post_side`** describes what must or must not appear as a post-contract:
+
+| Form | Meaning |
+|---|---|
+| `!` | No post-contracts are allowed on that function. |
+| `this` | `Name` itself must be used as a post-contract (not pre). |
+| `A, B` | Both `A` and `B` must be post-contracts, in that order (`,`). |
+| `A \| B` | Any subset of `A`, `B` that is present must appear in that order (`\|`). |
+| `A & B` | Both `A` and `B` must be post-contracts, in any order (`&`). |
+| `!A` | `A` must **not** be a post-contract on the function. |
+| `A(2)` | Specifically the two-parameter overload of `A` is required. |
+
+The pre and post sides are separated by `:`.
+
+### Examples
+
+**Require the contract itself to be a pre-contract only (never post):**
+```
+contract Validated(x)
+{
+    assert(x != 0, "x must not be zero");
+} # binding { this : ! };
+
+// OK -- Validated is pre
+def foo(int x) -> int : Validated(x) { return x * 2; };
+
+// ERROR -- Validated is post, binding requires it to be pre
+def bar(int x) -> int { return x; } : Validated(x);
+```
+
+**Require a companion post-contract whenever this contract is used as pre:**
+```
+contract CheckInput(x)
+{
+    assert(x > 0, "input must be positive");
+} # binding { this : CheckOutput };
+
+contract CheckOutput
+{
+    assert(rval > 0, "output must be positive");
+};
+
+// OK
+def process(int x) -> int : CheckInput(x) { return x + 1; } : CheckOutput;
+
+// ERROR -- CheckOutput is missing
+def process2(int x) -> int : CheckInput(x) { return x + 1; };
+```
+
+**Forbid any pre-contracts when this contract is used as post:**
+```
+contract Finalize
+{
+    cleanup();
+} # binding { ! : this };
+
+// OK -- no pre-contracts, Finalize is post
+def shutdown() -> void { do_work(); } : Finalize;
+
+// ERROR -- SomeSetup is a pre-contract, binding forbids pre-contracts
+def shutdown2() -> void : SomeSetup { do_work(); } : Finalize;
+```
+
+**Require two post-contracts in order:**
+```
+contract Stage1
+{
+    log("stage 1");
+} # binding { this : Stage2, Stage3 };
+
+contract Stage2 { log("stage 2"); };
+contract Stage3 { log("stage 3"); };
+
+// OK
+def pipeline() -> void : Stage1 { work(); } : Stage2 : Stage3;
+
+// ERROR -- wrong order
+def pipeline2() -> void : Stage1 { work(); } : Stage3 : Stage2;
+```
+
+### Forward declarations
+
+Contracts may be forward-declared before their body is defined, including in comma-separated lists:
+
+```
+contract A, B(x, y), C;
+```
+
+A binding may only be placed on the definition, not the forward declaration.
+
+### Compiler errors
+
+When a function violates a binding, the compiler emits an error at the function definition naming
+the contract whose binding was violated, which side (`pre` or `post`) was violated, and what was
+required vs. what was found.
 
 ---
 
